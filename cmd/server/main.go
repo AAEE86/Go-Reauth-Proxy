@@ -49,6 +49,11 @@ type proxyStack struct {
 	rebindCh chan struct{}
 }
 
+const (
+	cmuxReadTimeout             = 2 * time.Second
+	proxyProtoReadHeaderTimeout = 2 * time.Second
+)
+
 func newProxyStack(proxyPort int, handler *proxy.Handler, httpServer *http.Server, httpsServer *http.Server) *proxyStack {
 	return &proxyStack{
 		proxyPort:   proxyPort,
@@ -176,13 +181,20 @@ func startProxyServers(host string, proxyPort int, proxyHandler *proxy.Handler, 
 	}
 
 	var wg sync.WaitGroup
+	useProxyProto := proxyHandler.GetProxyProtocolForce()
 	for _, tcpListener := range listeners {
-		proxyListener := &proxyproto.Listener{
-			Listener: tcpListener,
+		var listenerForMux net.Listener = tcpListener
+		if useProxyProto {
+			proxyListener := &proxyproto.Listener{
+				Listener:          tcpListener,
+				ReadHeaderTimeout: proxyProtoReadHeaderTimeout,
+			}
+			listenerForMux = proxyListener
 		}
-		listenerClosers = append(listenerClosers, proxyListener)
+		listenerClosers = append(listenerClosers, listenerForMux)
 
-		m := cmux.New(proxyListener)
+		m := cmux.New(listenerForMux)
+		m.SetReadTimeout(cmuxReadTimeout)
 		tlsL := m.Match(cmux.TLS())
 		httpL := m.Match(cmux.HTTP1Fast(), cmux.HTTP2())
 

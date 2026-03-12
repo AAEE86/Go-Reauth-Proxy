@@ -48,7 +48,11 @@ type Handler struct {
 	trafficActive   int64
 	trafficError5xx uint64
 
-	loggedInActive sync.Map
+	loggedInActive             sync.Map
+	preflightClient            *http.Client
+	authClient                 *http.Client
+	proxyTransport             *http.Transport
+	preflightSkipUntilUnixNano int64
 }
 
 type requestSnapshot struct {
@@ -157,12 +161,40 @@ func shouldPreserveAuthOrigin(pathValue string) bool {
 		strings.HasPrefix(cleanPath, "/auth/api/auth/")
 }
 
+func shouldSkipPreflightPath(pathValue string) bool {
+	cleanPath := path.Clean(ensureLeadingSlash(pathValue))
+	if shouldPreserveAuthOrigin(cleanPath) {
+		return true
+	}
+	return cleanPath == "/__auth__" || strings.HasPrefix(cleanPath, "/__auth__/")
+}
+
+const (
+	internalPreflightHeader  = "X-Reauth-Internal-Preflight"
+	preflightTimeout         = 1200 * time.Millisecond
+	preflightFailureCooldown = 3 * time.Second
+)
+
 func localServiceURL(port int, urlPath string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d%s", port, ensureLeadingSlash(urlPath))
 }
 
 func (h *Handler) shouldDenyByPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool) bool {
+	// Skip preflight deny checks for auth service APIs themselves.
+	// Otherwise auth endpoints (e.g. passkey bind flow) can be denied by their own scanner policy,
+	// which appears as a hanging request on the client side.
+	if shouldSkipPreflightPath(r.URL.Path) {
+		return false
+	}
+	// Prevent recursion if preflight traffic is accidentally routed back to this proxy.
+	if r.Header.Get(internalPreflightHeader) == "1" {
+		return false
+	}
+
 	if authConfig.AuthPort <= 0 {
+		return false
+	}
+	if skipUntil := atomic.LoadInt64(&h.preflightSkipUntilUnixNano); skipUntil > time.Now().UnixNano() {
 		return false
 	}
 
@@ -182,6 +214,7 @@ func (h *Handler) shouldDenyByPreflight(r *http.Request, authConfig models.AuthC
 	preflightReq.Header.Set("X-Forwarded-For", clientIP)
 	preflightReq.Header.Set("X-Forwarded-Path", r.URL.RequestURI())
 	preflightReq.Header.Set("X-Match", strconv.FormatBool(isMatch))
+	preflightReq.Header.Set(internalPreflightHeader, "1")
 
 	if cookie := r.Header.Get("Cookie"); cookie != "" {
 		preflightReq.Header.Set("Cookie", cookie)
@@ -190,17 +223,23 @@ func (h *Handler) shouldDenyByPreflight(r *http.Request, authConfig models.AuthC
 		preflightReq.Header.Set("Authorization", auth)
 	}
 
-	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: newInternalTransport(),
+	client := h.preflightClient
+	if client == nil {
+		client = &http.Client{
+			Timeout:   preflightTimeout,
+			Transport: newInternalTransport(),
+		}
 	}
 
 	resp, err := client.Do(preflightReq)
 	if err != nil {
-		log.Printf("Preflight request failed: %v", err)
+		cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
+		atomic.StoreInt64(&h.preflightSkipUntilUnixNano, cooldownUntil)
+		log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
 		return false
 	}
 	resp.Body.Close()
+	atomic.StoreInt64(&h.preflightSkipUntilUnixNano, 0)
 
 	return strings.EqualFold(resp.Header.Get("X-Option"), "deny")
 }
@@ -225,6 +264,15 @@ func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.Ap
 		configManager:      cfgManager,
 		certPEM:            initialCfg.SSLCert,
 		keyPEM:             initialCfg.SSLKey,
+		preflightClient: &http.Client{
+			Timeout:   preflightTimeout,
+			Transport: newInternalTransport(),
+		},
+		authClient: &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: newInternalTransport(),
+		},
+		proxyTransport: newProxyTransport(),
 	}
 
 	var emptyHook func()
@@ -814,7 +862,11 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 	targetURL.Path = singleJoiningSlash(targetURL.Path, proxyPath)
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = newProxyTransport()
+	if h.proxyTransport != nil {
+		proxy.Transport = h.proxyTransport
+	} else {
+		proxy.Transport = newProxyTransport()
+	}
 
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
@@ -921,7 +973,10 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		targetURL.Scheme = "https"
 	}
 
-	transport := newProxyTransport()
+	transport := h.proxyTransport
+	if transport == nil {
+		transport = newProxyTransport()
+	}
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -1048,9 +1103,12 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 }
 
 func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string) bool {
-	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: newInternalTransport(),
+	client := h.authClient
+	if client == nil {
+		client = &http.Client{
+			Timeout:   5 * time.Second,
+			Transport: newInternalTransport(),
+		}
 	}
 
 	if authConfig.AuthPort <= 0 {
