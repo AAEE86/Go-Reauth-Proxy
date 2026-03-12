@@ -103,7 +103,8 @@ func newInternalTransport() *http.Transport {
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 100
 	transport.IdleConnTimeout = 90 * time.Second
-	transport.ForceAttemptHTTP2 = true
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	return transport
 }
 
@@ -126,6 +127,35 @@ func ensureLeadingSlash(p string) string {
 		return p
 	}
 	return "/" + p
+}
+
+func firstForwardedValue(v string) string {
+	if v == "" {
+		return ""
+	}
+	parts := strings.Split(v, ",")
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(parts[0])
+}
+
+func requestScheme(r *http.Request) string {
+	if proto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+		return proto
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func shouldPreserveAuthOrigin(pathValue string) bool {
+	cleanPath := path.Clean(ensureLeadingSlash(pathValue))
+	return cleanPath == "/api/auth" ||
+		strings.HasPrefix(cleanPath, "/api/auth/") ||
+		cleanPath == "/auth/api/auth" ||
+		strings.HasPrefix(cleanPath, "/auth/api/auth/")
 }
 
 func localServiceURL(port int, urlPath string) string {
@@ -795,6 +825,8 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 
 		req.Header.Set("X-Real-IP", clientIP)
 		req.Header.Set("X-Forwarded-For", clientIP)
+		req.Header.Set("X-Forwarded-Host", r.Host)
+		req.Header.Set("X-Forwarded-Proto", requestScheme(r))
 		// Prevent X-Forwarded-Path and X-Match from being passed to the backend
 		req.Header.Del("X-Forwarded-Path")
 		req.Header.Del("X-Match")
@@ -896,6 +928,8 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetXForwarded()
 			pr.Out.Header.Set("X-Forwarded-For", clientIP)
+			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
+			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
 			pr.Out.Header.Set("X-Real-IP", clientIP)
 			pr.SetURL(targetURL)
 			pr.Out.Host = targetURL.Host
@@ -908,25 +942,27 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				pr.Out.URL.RawPath = ""
 			}
 
-			if origin := pr.In.Header.Get("Origin"); origin != "" {
-				pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
-			}
-			if referer := pr.In.Header.Get("Referer"); referer != "" {
-				ref, err := url.Parse(referer)
-				if err == nil {
-					ref.Scheme = targetURL.Scheme
-					ref.Host = targetURL.Host
-					ref.Path = path.Clean(ref.Path)
+			if !shouldPreserveAuthOrigin(pr.In.URL.Path) {
+				if origin := pr.In.Header.Get("Origin"); origin != "" {
+					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+				}
+				if referer := pr.In.Header.Get("Referer"); referer != "" {
+					ref, err := url.Parse(referer)
+					if err == nil {
+						ref.Scheme = targetURL.Scheme
+						ref.Host = targetURL.Host
+						ref.Path = path.Clean(ref.Path)
 
-					if matchedRule.StripPath {
-						ref.Path = strings.TrimPrefix(ref.Path, matchedRule.Path)
-						if !strings.HasPrefix(ref.Path, "/") {
-							ref.Path = "/" + ref.Path
+						if matchedRule.StripPath {
+							ref.Path = strings.TrimPrefix(ref.Path, matchedRule.Path)
+							if !strings.HasPrefix(ref.Path, "/") {
+								ref.Path = "/" + ref.Path
+							}
 						}
-					}
-					ref.RawPath = ""
+						ref.RawPath = ""
 
-					pr.Out.Header.Set("Referer", ref.String())
+						pr.Out.Header.Set("Referer", ref.String())
+					}
 				}
 			}
 
