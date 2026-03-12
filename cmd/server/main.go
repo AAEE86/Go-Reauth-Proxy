@@ -302,7 +302,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		TLSConfig: &tls.Config{
-			NextProtos:             []string{"http/1.1"},
+			NextProtos:             []string{"h2", "http/1.1"},
 			SessionTicketsDisabled: true,
 			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 				cert := proxyHandler.GetSSLCertificate()

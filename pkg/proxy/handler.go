@@ -103,8 +103,7 @@ func newInternalTransport() *http.Transport {
 	transport.MaxIdleConns = 100
 	transport.MaxIdleConnsPerHost = 100
 	transport.IdleConnTimeout = 90 * time.Second
-	transport.ForceAttemptHTTP2 = false
-	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	transport.ForceAttemptHTTP2 = true
 	return transport
 }
 

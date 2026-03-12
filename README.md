@@ -55,10 +55,6 @@
 - 明文 HTTP
 - TLS(HTTPS)
 
-协议约束：
-- 入口 TLS ALPN 仅协商 `http/1.1`（不启用 `h2`）
-- 转发到上游服务时同样固定使用 `HTTP/1.1`
-
 当配置了证书后，明文 HTTP 请求会被 `307` 重定向到 HTTPS。
 
 `proxy_protocol_force=true` 时，代理监听地址会从 `0.0.0.0/::` 切换为 `127.0.0.1/::1`，并优先从 `X-Forwarded-For` / `X-Real-IP` 获取客户端 IP。
@@ -334,7 +330,6 @@ task docs
 - 代理目标必须是内网/本地地址，禁止外网目标
 - `POST /api/rules` 是全量覆盖，不是增量追加
 - SSL 证书与私钥会写入 `config.json` 明文保存，请注意文件权限
-- 当前不使用 HTTP/2（包含客户端到代理、代理到上游两个方向）
 - 仓库中的 `example/auth-server` 当前实现返回的是纯文本鉴权结果；若直接联调，请将鉴权接口改为返回 JSON `{"success":...}` 以满足代理解析逻辑
 
 ## License
