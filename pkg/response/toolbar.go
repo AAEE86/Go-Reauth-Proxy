@@ -10,6 +10,7 @@ import (
 const toolbarTemplate = `
 <script>
 (function(window, document) {
+    if (window.self !== window.top) return;
     if (document.getElementById('reauth-proxy-toolbar')) return;
 
     var container = document.createElement('div');

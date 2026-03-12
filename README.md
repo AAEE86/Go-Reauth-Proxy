@@ -283,8 +283,9 @@ curl -X POST http://127.0.0.1:7996/api/ssl \
 1. 放行 `lo`
 2. 放行 `ESTABLISHED,RELATED`
 3. 放行本地网段（v4/v6）
-4. 放行 `exempt_ports`
-5. 默认 `DROP`
+4. 放行 ICMP（IPv4 `icmp` / IPv6 `ipv6-icmp`）
+5. 放行 `exempt_ports`
+6. 默认 `DROP`
 
 说明：
 - 默认链名：`REAUTH_FW`

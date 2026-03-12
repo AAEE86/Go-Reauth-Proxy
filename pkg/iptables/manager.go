@@ -232,6 +232,7 @@ func (m *Manager) localCIDRsForTable(table string) []string {
 func (m *Manager) baseRuleCountForTable(table string) int {
 	count := 2
 	count += len(m.localCIDRsForTable(table))
+	count++
 	if len(m.ExemptPorts) > 0 {
 		chunks := (len(m.ExemptPorts) + 14) / 15
 		count += chunks * 2
@@ -251,6 +252,14 @@ func (m *Manager) applyBaseRules(table string) error {
 		if err := m.runTable(table, "-A", m.Chain, "-s", cidr, "-j", "ACCEPT"); err != nil {
 			return err
 		}
+	}
+
+	protocol := "icmp"
+	if table == "ip6tables" {
+		protocol = "ipv6-icmp"
+	}
+	if err := m.runTable(table, "-A", m.Chain, "-p", protocol, "-j", "ACCEPT"); err != nil {
+		return err
 	}
 
 	if len(m.ExemptPorts) > 0 {
