@@ -153,22 +153,6 @@ func requestScheme(r *http.Request) string {
 	return "http"
 }
 
-func shouldPreserveAuthOrigin(pathValue string) bool {
-	cleanPath := path.Clean(ensureLeadingSlash(pathValue))
-	return cleanPath == "/api/auth" ||
-		strings.HasPrefix(cleanPath, "/api/auth/") ||
-		cleanPath == "/auth/api/auth" ||
-		strings.HasPrefix(cleanPath, "/auth/api/auth/")
-}
-
-func shouldSkipPreflightPath(pathValue string) bool {
-	cleanPath := path.Clean(ensureLeadingSlash(pathValue))
-	if shouldPreserveAuthOrigin(cleanPath) {
-		return true
-	}
-	return cleanPath == "/__auth__" || strings.HasPrefix(cleanPath, "/__auth__/")
-}
-
 const (
 	internalPreflightHeader  = "X-Reauth-Internal-Preflight"
 	preflightTimeout         = 1200 * time.Millisecond
@@ -179,14 +163,18 @@ func localServiceURL(port int, urlPath string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d%s", port, ensureLeadingSlash(urlPath))
 }
 
-func (h *Handler) shouldDenyByPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool) bool {
-	// Skip preflight deny checks for auth service APIs themselves.
-	// Otherwise auth endpoints (e.g. passkey bind flow) can be denied by their own scanner policy,
-	// which appears as a hanging request on the client side.
-	if shouldSkipPreflightPath(r.URL.Path) {
-		return false
+func copyUserAgentHeader(dst, src *http.Request) {
+	if ua := src.Header.Get("User-Agent"); ua != "" {
+		dst.Header.Set("User-Agent", ua)
+		return
 	}
-	// Prevent recursion if preflight traffic is accidentally routed back to this proxy.
+
+	// Prevent Go's default client UA from leaking into upstream requests
+	// when the original client did not send one.
+	dst.Header.Set("User-Agent", "")
+}
+
+func (h *Handler) shouldDenyByPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool) bool {
 	if r.Header.Get(internalPreflightHeader) == "1" {
 		return false
 	}
@@ -222,6 +210,7 @@ func (h *Handler) shouldDenyByPreflight(r *http.Request, authConfig models.AuthC
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		preflightReq.Header.Set("Authorization", auth)
 	}
+	copyUserAgentHeader(preflightReq, r)
 
 	client := h.preflightClient
 	if client == nil {
@@ -881,16 +870,39 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 		// Prevent X-Forwarded-Path and X-Match from being passed to the backend
 		req.Header.Del("X-Forwarded-Path")
 		req.Header.Del("X-Match")
+		copyUserAgentHeader(req, r)
 	}
 
 	proxy.ServeHTTP(w, r)
 	return true
 }
 
+func matchRuleFromProxyPathCookie(r *http.Request, rules []models.Rule) *models.Rule {
+	cookie, err := r.Cookie("__proxy_path")
+	if err != nil || cookie.Value == "" {
+		return nil
+	}
+
+	for _, rule := range rules {
+		if cookie.Value == rule.Path {
+			return copyRule(rule)
+		}
+	}
+
+	return nil
+}
+
 func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
 	var matchedRule *models.Rule
 	var longestMatch int
 	var needsSlashRedirect string
+	var rootPathCookieRule *models.Rule
+
+	// When the user returns to "/", prefer the last root-mode selection
+	// before falling back to a catch-all "/" rule or the configured default route.
+	if r.URL.Path == "/" {
+		rootPathCookieRule = matchRuleFromProxyPathCookie(r, rules)
+	}
 
 	for _, rule := range rules {
 		if strings.HasPrefix(r.URL.Path, rule.Path) && len(rule.Path) > longestMatch {
@@ -913,18 +925,15 @@ func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
 		matchedRule = nil
 	}
 
+	if rootPathCookieRule != nil && needsSlashRedirect == "" {
+		matchedRule = rootPathCookieRule
+	}
+
 	if matchedRule == nil && needsSlashRedirect == "" {
 		isWebSocket := strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
 		canUseCookie := r.URL.Path == "/" || r.Header.Get("Referer") != "" || r.Header.Get("Origin") != "" || isWebSocket
 		if canUseCookie {
-			if cookie, err := r.Cookie("__proxy_path"); err == nil && cookie.Value != "" {
-				for _, rule := range rules {
-					if cookie.Value == rule.Path {
-						matchedRule = copyRule(rule)
-						break
-					}
-				}
-			}
+			matchedRule = matchRuleFromProxyPathCookie(r, rules)
 		}
 
 		if matchedRule == nil {
@@ -985,6 +994,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
 			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
 			pr.Out.Header.Set("X-Real-IP", clientIP)
+			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
 			pr.Out.Host = targetURL.Host
 
@@ -996,27 +1006,25 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				pr.Out.URL.RawPath = ""
 			}
 
-			if !shouldPreserveAuthOrigin(pr.In.URL.Path) {
-				if origin := pr.In.Header.Get("Origin"); origin != "" {
-					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
-				}
-				if referer := pr.In.Header.Get("Referer"); referer != "" {
-					ref, err := url.Parse(referer)
-					if err == nil {
-						ref.Scheme = targetURL.Scheme
-						ref.Host = targetURL.Host
-						ref.Path = path.Clean(ref.Path)
+			if origin := pr.In.Header.Get("Origin"); origin != "" {
+				pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+			}
+			if referer := pr.In.Header.Get("Referer"); referer != "" {
+				ref, err := url.Parse(referer)
+				if err == nil {
+					ref.Scheme = targetURL.Scheme
+					ref.Host = targetURL.Host
+					ref.Path = path.Clean(ref.Path)
 
-						if matchedRule.StripPath {
-							ref.Path = strings.TrimPrefix(ref.Path, matchedRule.Path)
-							if !strings.HasPrefix(ref.Path, "/") {
-								ref.Path = "/" + ref.Path
-							}
+					if matchedRule.StripPath {
+						ref.Path = strings.TrimPrefix(ref.Path, matchedRule.Path)
+						if !strings.HasPrefix(ref.Path, "/") {
+							ref.Path = "/" + ref.Path
 						}
-						ref.RawPath = ""
-
-						pr.Out.Header.Set("Referer", ref.String())
 					}
+					ref.RawPath = ""
+
+					pr.Out.Header.Set("Referer", ref.String())
 				}
 			}
 
@@ -1141,6 +1149,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	}
 
 	authReq.Header.Set("X-Forwarded-Path", r.URL.RequestURI())
+	copyUserAgentHeader(authReq, r)
 
 	resp, err := client.Do(authReq)
 	if err != nil {

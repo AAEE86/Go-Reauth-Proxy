@@ -154,6 +154,7 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 未命中时：
 - 请求 `/` 且无规则：返回 Welcome 页面
 - 请求 `/` 且有规则：
+  - 若 `__proxy_path` cookie 对应到某条规则，则优先按该规则转发
   - 若 `default_route` 对应到某条规则，则按该规则转发
   - 否则跳转到 `/__select__`
 - 其他路径：返回 404 页面
