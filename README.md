@@ -317,9 +317,10 @@ example/auth-server/  # Bun 示例认证服务
 ## 开发命令
 
 ```bash
-task build            # 构建 macOS ARM64 + Linux AMD64
+task build            # 构建 macOS ARM64 + Linux AMD64/ARM64
 task build:mac
 task build:linux
+task build:linux-arm64
 task run
 task run:auth-server
 task test
