@@ -269,7 +269,7 @@ const toolbarTemplate = `
                     <span><i class="dot"></i> Go Reauth Proxy</span>
                 </div>
                 {{range .Rules}}
-                <a href="{{ensureSlash .Path}}" class="menu-item{{if isActive .Path $.CurrentPath}} active{{end}}">
+                <a href="{{ensureSlash .Path}}" class="menu-item rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
                     <span class="menu-item-path">{{.Path}}</span>
                     <span class="menu-item-right-content">
                         {{if isActive .Path $.CurrentPath}}
@@ -299,6 +299,15 @@ const toolbarTemplate = `
 
     var fab = shadow.getElementById('fab');
     var menu = shadow.getElementById('menu');
+
+    var ruleLinks = shadow.querySelectorAll('.rule-link');
+    for (var i = 0; i < ruleLinks.length; i++) {
+        ruleLinks[i].addEventListener('click', function(e) {
+            e.preventDefault(); 
+            e.stopPropagation(); 
+            window.location.href = this.getAttribute('href'); 
+        });
+    }
 
     var isDragging = false;
     var startX, startY, initialLeft, initialTop;
@@ -473,6 +482,7 @@ const toolbarTemplate = `
     if (logoutBtn) {
         logoutBtn.addEventListener('click', function(e) {
             e.preventDefault();
+            e.stopPropagation(); 
             var href = this.getAttribute('href');
             
             var overlay = document.createElement('div');
