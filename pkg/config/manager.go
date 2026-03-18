@@ -5,16 +5,19 @@ import (
 	"go-reauth-proxy/pkg/models"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
 type AppConfig struct {
 	Rules              []models.Rule     `json:"rules"`
+	HostRules          []models.HostRule `json:"host_rules,omitempty"`
 	DefaultRoute       string            `json:"default_route"`
 	AuthConfig         models.AuthConfig `json:"auth_config"`
 	AdminPort          int               `json:"admin_port,omitempty"`
 	ProxyProtocolForce bool              `json:"proxy_protocol_force,omitempty"`
 	IptablesChainName  string            `json:"iptables_chain_name,omitempty"`
+	SSL                models.SSLConfig  `json:"ssl,omitempty"`
 	SSLCert            string            `json:"ssl_cert,omitempty"`
 	SSLKey             string            `json:"ssl_key,omitempty"`
 }
@@ -33,22 +36,56 @@ func NewManager(filePath string) *Manager {
 func defaultConfig() *AppConfig {
 	return &AppConfig{
 		Rules:        []models.Rule{},
+		HostRules:    []models.HostRule{},
 		DefaultRoute: "/__select__",
 		AuthConfig: models.AuthConfig{
-			AuthPort:     7997,
-			AuthURL:      "/api/auth/verify",
-			LoginURL:     "/login",
-			LogoutURL:    "/api/auth/logout",
-			PreflightURL: "/api/auth/preflight",
+			AuthPort:          7997,
+			AuthURL:           "/api/auth/verify",
+			LoginURL:          "/login",
+			LogoutURL:         "/api/auth/logout",
+			PreflightURL:      "/api/auth/preflight",
+			PublicAuthBaseURL: "",
+			AuthHost:          "",
 		},
 		AdminPort:          7996,
 		ProxyProtocolForce: false,
+		SSL: models.SSLConfig{
+			DeploymentMode: models.SSLDeploymentModeSingleActive,
+			Certificates:   []models.SSLDeployedCertificate{},
+		},
 	}
 }
 
 func applyDefaults(cfg *AppConfig) {
 	if cfg.Rules == nil {
 		cfg.Rules = []models.Rule{}
+	}
+	if cfg.HostRules == nil {
+		cfg.HostRules = []models.HostRule{}
+	}
+	if cfg.SSL.Certificates == nil {
+		cfg.SSL.Certificates = []models.SSLDeployedCertificate{}
+	}
+	if cfg.SSL.DeploymentMode != models.SSLDeploymentModeMultiSNI {
+		cfg.SSL.DeploymentMode = models.SSLDeploymentModeSingleActive
+	}
+	if len(cfg.SSL.Certificates) == 0 {
+		legacyCert := strings.TrimSpace(cfg.SSLCert)
+		legacyKey := strings.TrimSpace(cfg.SSLKey)
+		if legacyCert != "" && legacyKey != "" {
+			cfg.SSL = models.SSLConfig{
+				DeploymentMode: models.SSLDeploymentModeSingleActive,
+				Certificates: []models.SSLDeployedCertificate{
+					{
+						ID:        "legacy-default",
+						Label:     "Legacy SSL",
+						Cert:      legacyCert,
+						Key:       legacyKey,
+						IsDefault: true,
+					},
+				},
+			}
+		}
 	}
 
 	if cfg.DefaultRoute == "" {
@@ -68,6 +105,12 @@ func applyDefaults(cfg *AppConfig) {
 	}
 	if cfg.AuthConfig.PreflightURL == "" {
 		cfg.AuthConfig.PreflightURL = "/api/auth/preflight"
+	}
+	if cfg.AuthConfig.PublicAuthBaseURL == "" {
+		cfg.AuthConfig.PublicAuthBaseURL = ""
+	}
+	if cfg.AuthConfig.AuthHost == "" {
+		cfg.AuthConfig.AuthHost = ""
 	}
 
 	if cfg.AdminPort <= 0 {

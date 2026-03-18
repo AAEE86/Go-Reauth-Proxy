@@ -31,17 +31,17 @@ import (
 type Handler struct {
 	mu                    sync.RWMutex
 	Rules                 []models.Rule
+	HostRules             []models.HostRule
 	DefaultRoute          string
 	AuthConfig            models.AuthConfig
 	AdminPort             int
 	ProxyProtocolForce    bool
-	sslCert               atomic.Value
+	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
 
 	configManager *config.Manager
-	certPEM       string
-	keyPEM        string
+	sslConfig     models.SSLConfig
 
 	trafficTotalIn  uint64
 	trafficTotalOut uint64
@@ -57,6 +57,7 @@ type Handler struct {
 
 type requestSnapshot struct {
 	rules              []models.Rule
+	hostRules          []models.HostRule
 	defaultRoute       string
 	authConfig         models.AuthConfig
 	proxyProtocolForce bool
@@ -76,8 +77,11 @@ func (h *Handler) snapshotForRequest() requestSnapshot {
 	h.mu.RLock()
 	rules := make([]models.Rule, len(h.Rules))
 	copy(rules, h.Rules)
+	hostRules := make([]models.HostRule, len(h.HostRules))
+	copy(hostRules, h.HostRules)
 	s := requestSnapshot{
 		rules:              rules,
+		hostRules:          hostRules,
 		defaultRoute:       h.DefaultRoute,
 		authConfig:         h.AuthConfig,
 		proxyProtocolForce: h.ProxyProtocolForce,
@@ -110,6 +114,30 @@ func resolveClientIP(r *http.Request, proxyProtocolForce bool) string {
 func copyRule(rule models.Rule) *models.Rule {
 	r := rule
 	return &r
+}
+
+func copyHostRule(rule models.HostRule) *models.HostRule {
+	r := rule
+	return &r
+}
+
+func normalizeRequestHost(host string) string {
+	value := strings.TrimSpace(strings.ToLower(host))
+	if value == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(value, "[") {
+		if idx := strings.LastIndex(value, "]"); idx != -1 {
+			return value[:idx+1]
+		}
+	}
+
+	if parsedHost, _, err := net.SplitHostPort(value); err == nil {
+		return strings.TrimSpace(strings.ToLower(parsedHost))
+	}
+
+	return value
 }
 
 func newInternalTransport() *http.Transport {
@@ -184,7 +212,7 @@ func copyUserAgentHeader(dst, src *http.Request) {
 	dst.Header.Set("User-Agent", "")
 }
 
-func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool) preflightDecision {
+func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string) preflightDecision {
 	if r.Header.Get(internalPreflightHeader) == "1" {
 		return preflightDecision{}
 	}
@@ -211,8 +239,13 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	preflightReq.Header.Set("X-Real-IP", clientIP)
 	preflightReq.Header.Set("X-Forwarded-For", clientIP)
 	preflightReq.Header.Set("X-Forwarded-Path", r.URL.RequestURI())
+	preflightReq.Header.Set("X-Forwarded-Host", r.Host)
+	preflightReq.Header.Set("X-Forwarded-Proto", requestScheme(r))
 	preflightReq.Header.Set("X-Match", strconv.FormatBool(isMatch))
 	preflightReq.Header.Set(internalPreflightHeader, "1")
+	if accessMode != "" {
+		preflightReq.Header.Set("X-Reauth-Access-Mode", accessMode)
+	}
 
 	if cookie := r.Header.Get("Cookie"); cookie != "" {
 		preflightReq.Header.Set("Cookie", cookie)
@@ -243,8 +276,10 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	decision := preflightDecision{
 		deny: strings.EqualFold(resp.Header.Get("X-Option"), "deny"),
 	}
-	if location := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); strings.HasPrefix(location, "/") {
-		decision.redirectLocation = location
+	if location := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); location != "" {
+		if strings.HasPrefix(location, "/") || strings.HasPrefix(location, "http://") || strings.HasPrefix(location, "https://") {
+			decision.redirectLocation = location
+		}
 	}
 	return decision
 }
@@ -262,13 +297,13 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.AppConfig) *Handler {
 	h := &Handler{
 		Rules:              initialCfg.Rules,
+		HostRules:          initialCfg.HostRules,
 		DefaultRoute:       initialCfg.DefaultRoute,
 		AuthConfig:         initialCfg.AuthConfig,
 		AdminPort:          adminPort,
 		ProxyProtocolForce: initialCfg.ProxyProtocolForce,
 		configManager:      cfgManager,
-		certPEM:            initialCfg.SSLCert,
-		keyPEM:             initialCfg.SSLKey,
+		sslConfig:          copySSLConfig(initialCfg.SSL),
 		preflightClient: &http.Client{
 			Timeout:   preflightTimeout,
 			Transport: newInternalTransport(),
@@ -284,19 +319,24 @@ func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.Ap
 	h.sslOnChange.Store(emptyHook)
 	h.proxyProtocolOnChange.Store(emptyHook)
 
-	if h.certPEM != "" && h.keyPEM != "" {
-		cert, err := tls.X509KeyPair([]byte(h.certPEM), []byte(h.keyPEM))
-		if err == nil {
-			h.sslCert.Store(&cert)
-		} else {
-			log.Printf("Failed to load initial SSL cert: %v", err)
-			var empty *tls.Certificate
-			h.sslCert.Store(empty)
-		}
-	} else {
-		var empty *tls.Certificate
-		h.sslCert.Store(empty)
+	if len(h.sslConfig.Certificates) == 0 && initialCfg.SSLCert != "" && initialCfg.SSLKey != "" {
+		h.sslConfig = buildLegacySSLConfig(initialCfg.SSLCert, initialCfg.SSLKey)
 	}
+	normalizedSSL, err := normalizeSSLConfig(h.sslConfig)
+	if err != nil {
+		log.Printf("Failed to normalize initial SSL deployment: %v", err)
+		normalizedSSL = models.SSLConfig{
+			DeploymentMode: models.SSLDeploymentModeSingleActive,
+			Certificates:   []models.SSLDeployedCertificate{},
+		}
+	}
+	h.sslConfig = normalizedSSL
+	bundle, err := newSSLRuntimeBundle(h.sslConfig)
+	if err != nil {
+		log.Printf("Failed to load initial SSL deployment: %v", err)
+		bundle = newEmptySSLRuntimeBundle(h.sslConfig.DeploymentMode)
+	}
+	h.sslBundle.Store(bundle)
 	return h
 }
 
@@ -333,14 +373,17 @@ func (h *Handler) saveConfigLocked() {
 
 	rulesCopy := make([]models.Rule, len(h.Rules))
 	copy(rulesCopy, h.Rules)
+	hostRulesCopy := make([]models.HostRule, len(h.HostRules))
+	copy(hostRulesCopy, h.HostRules)
 
 	if err := h.configManager.Update(func(conf *config.AppConfig) error {
 		conf.Rules = rulesCopy
+		conf.HostRules = hostRulesCopy
 		conf.DefaultRoute = h.DefaultRoute
 		conf.AuthConfig = h.AuthConfig
 		conf.ProxyProtocolForce = h.ProxyProtocolForce
-		conf.SSLCert = h.certPEM
-		conf.SSLKey = h.keyPEM
+		conf.SSL = copySSLConfig(h.sslConfig)
+		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
 		return nil
 	}); err != nil {
 		log.Printf("Failed to save config: %v", err)
@@ -365,47 +408,95 @@ func (h *Handler) SetProxyProtocolForce(force bool) {
 	}
 }
 
-func (h *Handler) SetSSLCertificate(cert *tls.Certificate, certPEM, keyPEM string) {
-	h.mu.Lock()
-	if cert == nil {
-		var empty *tls.Certificate
-		h.sslCert.Store(empty)
-		h.certPEM = ""
-		h.keyPEM = ""
-	} else {
-		h.sslCert.Store(cert)
-		h.certPEM = certPEM
-		h.keyPEM = keyPEM
+func (h *Handler) SetSSLDeployment(config models.SSLConfig) error {
+	normalized, err := normalizeSSLConfig(config)
+	if err != nil {
+		return err
 	}
+	bundle, err := newSSLRuntimeBundle(normalized)
+	if err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	h.sslBundle.Store(bundle)
+	h.sslConfig = normalized
 	h.saveConfigLocked()
 	hook := h.getSSLChangeHook()
 	h.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
+	return nil
+}
+
+func (h *Handler) SetSSLCertificate(cert *tls.Certificate, certPEM, keyPEM string) {
+	if cert == nil {
+		_ = h.SetSSLDeployment(models.SSLConfig{})
+		return
+	}
+	normalizedCertPEM, normalizedKeyPEM, err := validateLegacySSLPair(certPEM, keyPEM)
+	if err != nil {
+		log.Printf("Failed to set legacy SSL certificate: %v", err)
+		return
+	}
+	if err := h.SetSSLDeployment(buildLegacySSLConfig(normalizedCertPEM, normalizedKeyPEM)); err != nil {
+		log.Printf("Failed to set legacy SSL certificate: %v", err)
+	}
+}
+
+func (h *Handler) SetSSLCertificatePEM(certPEM, keyPEM string) error {
+	normalizedCertPEM, normalizedKeyPEM, err := validateLegacySSLPair(certPEM, keyPEM)
+	if err != nil {
+		return err
+	}
+	return h.SetSSLDeployment(buildLegacySSLConfig(normalizedCertPEM, normalizedKeyPEM))
+}
+
+func (h *Handler) getSSLBundle() *sslRuntimeBundle {
+	val := h.sslBundle.Load()
+	if val == nil {
+		return newEmptySSLRuntimeBundle(models.SSLDeploymentModeSingleActive)
+	}
+	bundle, _ := val.(*sslRuntimeBundle)
+	if bundle == nil {
+		return newEmptySSLRuntimeBundle(models.SSLDeploymentModeSingleActive)
+	}
+	return bundle
 }
 
 func (h *Handler) GetSSLCertificate() *tls.Certificate {
-	val := h.sslCert.Load()
-	if val == nil {
-		return nil
+	return h.getSSLBundle().certificateForServerName("")
+}
+
+func (h *Handler) GetCertificate(info *tls.ClientHelloInfo) *tls.Certificate {
+	if info == nil {
+		return h.GetSSLCertificate()
 	}
-	cert, _ := val.(*tls.Certificate)
-	return cert
+	return h.getSSLBundle().certificateForServerName(info.ServerName)
+}
+
+func (h *Handler) HasSSLCertificates() bool {
+	return h.getSSLBundle().hasCertificates()
+}
+
+func (h *Handler) GetSSLDeployment() models.SSLConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return copySSLConfig(h.sslConfig)
+}
+
+func (h *Handler) GetSSLInfo() models.SSLInfo {
+	bundle := h.getSSLBundle()
+	return copySSLInfo(models.SSLInfo{
+		Enabled:        bundle.hasCertificates(),
+		DeploymentMode: bundle.mode,
+		Certificates:   bundle.certificates,
+	})
 }
 
 func (h *Handler) ClearSSLCertificate() {
-	h.mu.Lock()
-	var empty *tls.Certificate
-	h.sslCert.Store(empty)
-	h.certPEM = ""
-	h.keyPEM = ""
-	h.saveConfigLocked()
-	hook := h.getSSLChangeHook()
-	h.mu.Unlock()
-	if hook != nil {
-		hook()
-	}
+	_ = h.SetSSLDeployment(models.SSLConfig{})
 }
 
 func (h *Handler) AddRule(newRule models.Rule) error {
@@ -521,6 +612,59 @@ func (h *Handler) GetRules() []models.Rule {
 	return rules
 }
 
+func (h *Handler) AddHostRule(newRule models.HostRule) error {
+	newRule.Host = normalizeRequestHost(newRule.Host)
+	if newRule.Host == "" {
+		return fmt.Errorf("cannot add host rule with empty host")
+	}
+	if strings.Contains(newRule.Host, "/") || strings.Contains(newRule.Host, "*") {
+		return fmt.Errorf("host rule must be an exact host without path or wildcard")
+	}
+	if newRule.Target == "" {
+		return fmt.Errorf("cannot add host rule with empty target")
+	}
+	if err := h.checkSafeTarget(newRule.Target); err != nil {
+		return fmt.Errorf("invalid target: %v", err)
+	}
+	if newRule.AccessMode == "" {
+		newRule.AccessMode = "login_first"
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	updated := false
+	for i, rule := range h.HostRules {
+		if normalizeRequestHost(rule.Host) == newRule.Host {
+			h.HostRules[i] = newRule
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		h.HostRules = append(h.HostRules, newRule)
+	}
+	h.saveConfigLocked()
+	return nil
+}
+
+func (h *Handler) FlushHostRules() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.HostRules = make([]models.HostRule, 0)
+	h.saveConfigLocked()
+}
+
+func (h *Handler) GetHostRules() []models.HostRule {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	rules := make([]models.HostRule, len(h.HostRules))
+	copy(rules, h.HostRules)
+	return rules
+}
+
 func (h *Handler) GetDefaultRoute() string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -560,6 +704,8 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	if config.PreflightURL == "" {
 		config.PreflightURL = "/api/auth/preflight"
 	}
+	config.PublicAuthBaseURL = strings.TrimSpace(strings.TrimRight(config.PublicAuthBaseURL, "/"))
+	config.AuthHost = normalizeRequestHost(config.AuthHost)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -773,8 +919,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	isSelectRoute := r.URL.Path == "/__select__"
 	isAuthRoute := strings.HasPrefix(r.URL.Path, "/__auth__/")
+	matchedHostRule := matchHostRule(r, snapshot.hostRules)
+	accessMode := ""
+	if matchedHostRule != nil {
+		accessMode = matchedHostRule.AccessMode
+	}
 
 	matchedRule, needsSlashRedirect := matchRule(r, snapshot.rules)
+	if matchedHostRule != nil {
+		matchedRule = nil
+		needsSlashRedirect = ""
+	}
 
 	if matchedRule == nil && snapshot.defaultRoute != "" && snapshot.defaultRoute != "/__select__" {
 		for _, rule := range snapshot.rules {
@@ -784,8 +939,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	isMatch := isSelectRoute || isAuthRoute || matchedRule != nil || r.URL.Path == "/"
-	preflight := h.runPreflight(r, snapshot.authConfig, clientIP, isMatch)
+	isMatch := isSelectRoute || isAuthRoute || matchedHostRule != nil || matchedRule != nil || r.URL.Path == "/"
+	preflight := h.runPreflight(r, snapshot.authConfig, clientIP, isMatch, accessMode)
 	if preflight.deny {
 		h.abortConnection(w)
 		return
@@ -810,6 +965,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAuthProxyRoute(w, r, snapshot, clientIP)
 		return
 	}
+	if matchedHostRule != nil {
+		authResult := authCheckResult{allowed: true}
+		if matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != "" {
+			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode)
+			if !authResult.allowed {
+				return
+			}
+		}
+		h.proxyToHostTarget(w, r, snapshot, *matchedHostRule, clientIP, authResult)
+		return
+	}
 	if matchedRule == nil {
 		h.handleNoMatchRoute(w, r, snapshot, clientIP)
 		return
@@ -825,7 +991,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	authResult := authCheckResult{allowed: true}
 	if matchedRule.UseAuth && snapshot.authConfig.AuthURL != "" {
-		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP)
+		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "")
 		if !authResult.allowed {
 			return
 		}
@@ -838,7 +1004,7 @@ func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snap
 		return false
 	}
 	if snapshot.authConfig.AuthURL != "" {
-		if !h.checkAuth(w, r, snapshot.authConfig, clientIP).allowed {
+		if !h.checkAuth(w, r, snapshot.authConfig, clientIP, "").allowed {
 			return true
 		}
 	}
@@ -863,6 +1029,10 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 		proxyPath = snapshot.authConfig.LoginURL
 		if proxyPath == "" {
 			proxyPath = "/login"
+		}
+		if redirectTarget := buildInternalAuthLoginRedirect(proxyPath, r.URL.RawQuery); redirectTarget != "" {
+			http.Redirect(w, r, redirectTarget, http.StatusFound)
+			return true
 		}
 	case "/__auth__/api/auth/logout":
 		proxyPath = snapshot.authConfig.LogoutURL
@@ -912,6 +1082,28 @@ func matchRuleFromProxyPathCookie(r *http.Request, rules []models.Rule) *models.
 	for _, rule := range rules {
 		if cookie.Value == rule.Path {
 			return copyRule(rule)
+		}
+	}
+
+	return nil
+}
+
+func matchHostRule(r *http.Request, rules []models.HostRule) *models.HostRule {
+	if len(rules) == 0 {
+		return nil
+	}
+
+	host := normalizeRequestHost(r.Host)
+	if forwardedHost := normalizeRequestHost(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+		host = forwardedHost
+	}
+	if host == "" {
+		return nil
+	}
+
+	for _, rule := range rules {
+		if normalizeRequestHost(rule.Host) == host {
+			return copyHostRule(rule)
 		}
 	}
 
@@ -992,6 +1184,103 @@ func (h *Handler) handleNoMatchRoute(w http.ResponseWriter, r *http.Request, sna
 		return
 	}
 	response.HTML(w, errors.CodeNotFound, "Not Found", snapshot.rules)
+}
+
+func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult) {
+	targetURL, err := url.Parse(matchedRule.Target)
+	if err != nil {
+		response.HTML(w, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
+		return
+	}
+
+	switch targetURL.Scheme {
+	case "ws":
+		targetURL.Scheme = "http"
+	case "wss":
+		targetURL.Scheme = "https"
+	}
+
+	transport := h.proxyTransport
+	if transport == nil {
+		transport = newProxyTransport()
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetXForwarded()
+			pr.Out.Header.Set("X-Forwarded-For", clientIP)
+			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
+			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
+			pr.Out.Header.Set("X-Real-IP", clientIP)
+			copyUserAgentHeader(pr.Out, pr.In)
+			pr.SetURL(targetURL)
+			if matchedRule.PreserveHost {
+				pr.Out.Host = pr.In.Host
+			} else {
+				pr.Out.Host = targetURL.Host
+			}
+
+			if !matchedRule.PreserveHost {
+				if origin := pr.In.Header.Get("Origin"); origin != "" {
+					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+				}
+				if referer := pr.In.Header.Get("Referer"); referer != "" {
+					ref, err := url.Parse(referer)
+					if err == nil {
+						ref.Scheme = targetURL.Scheme
+						ref.Host = targetURL.Host
+						pr.Out.Header.Set("Referer", ref.String())
+					}
+				}
+			}
+
+			if matchedRule.UseAuth && !authResult.suppressToolbar {
+				pr.Out.Header.Del("Accept-Encoding")
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("Host proxy error: %v", err)
+			response.HTML(w, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
+		},
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		needsToolbar := matchedRule.UseAuth && !authResult.suppressToolbar
+		if !needsToolbar {
+			return nil
+		}
+
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(contentType, "text/html") {
+			return nil
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+
+		bodyStr := injectToolbarIntoHTML(
+			string(bodyBytes),
+			response.GenerateToolbarWithHosts(
+				snapshot.rules,
+				snapshot.hostRules,
+				r.URL.Path,
+				matchedRule.Host,
+				snapshot.authConfig.AuthHost,
+			),
+		)
+
+		newBody := []byte(bodyStr)
+		resp.Body = io.NopCloser(bytes.NewReader(newBody))
+		resp.ContentLength = int64(len(newBody))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+		return nil
+	}
+
+	proxy.ServeHTTP(w, r)
 }
 
 func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.Rule, clientIP string, authResult authCheckResult) {
@@ -1117,13 +1406,10 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 
 		if needsToolbar {
-			toolbarHTML := response.GenerateToolbar(snapshot.rules, matchedRule.Path)
-			lowerBody := strings.ToLower(bodyStr)
-			if idx := strings.LastIndex(lowerBody, "</body>"); idx != -1 {
-				bodyStr = bodyStr[:idx] + toolbarHTML + bodyStr[idx:]
-			} else if strings.Contains(lowerBody, "<html") || strings.Contains(lowerBody, "<head") || strings.Contains(lowerBody, "<body") || strings.Contains(lowerBody, "<!doctype") {
-				bodyStr += toolbarHTML
-			}
+			bodyStr = injectToolbarIntoHTML(
+				bodyStr,
+				response.GenerateToolbar(snapshot.rules, matchedRule.Path),
+			)
 		}
 
 		newBody := []byte(bodyStr)
@@ -1136,7 +1422,27 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	proxy.ServeHTTP(w, r)
 }
 
-func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string) authCheckResult {
+func injectToolbarIntoHTML(bodyStr string, toolbarHTML string) string {
+	if toolbarHTML == "" || bodyStr == "" {
+		return bodyStr
+	}
+
+	lowerBody := strings.ToLower(bodyStr)
+	if idx := strings.LastIndex(lowerBody, "</body>"); idx != -1 {
+		return bodyStr[:idx] + toolbarHTML + bodyStr[idx:]
+	}
+
+	if strings.Contains(lowerBody, "<html") ||
+		strings.Contains(lowerBody, "<head") ||
+		strings.Contains(lowerBody, "<body") ||
+		strings.Contains(lowerBody, "<!doctype") {
+		return bodyStr + toolbarHTML
+	}
+
+	return bodyStr
+}
+
+func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string) authCheckResult {
 	client := h.authClient
 	if client == nil {
 		client = &http.Client{
@@ -1166,6 +1472,11 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	authReq.Header.Set("X-Real-IP", clientIP)
 	authReq.Header.Set("X-Forwarded-For", clientIP)
+	authReq.Header.Set("X-Forwarded-Host", r.Host)
+	authReq.Header.Set("X-Forwarded-Proto", requestScheme(r))
+	if accessMode != "" {
+		authReq.Header.Set("X-Reauth-Access-Mode", accessMode)
+	}
 
 	if cookie := r.Header.Get("Cookie"); cookie != "" {
 		authReq.Header.Set("Cookie", cookie)
@@ -1206,9 +1517,15 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 		}
 	}
 	log.Printf("Auth failed: %s", authResponse.Message)
-	if redirectLocation := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); strings.HasPrefix(redirectLocation, "/") {
-		http.Redirect(w, r, redirectLocation, http.StatusFound)
+	if accessMode == "strict_whitelist" {
+		h.abortConnection(w)
 		return authCheckResult{}
+	}
+	if redirectLocation := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); redirectLocation != "" {
+		if strings.HasPrefix(redirectLocation, "/") || strings.HasPrefix(redirectLocation, "http://") || strings.HasPrefix(redirectLocation, "https://") {
+			http.Redirect(w, r, redirectLocation, http.StatusFound)
+			return authCheckResult{}
+		}
 	}
 
 	scheme := "http"
@@ -1227,10 +1544,13 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 		RawQuery: r.URL.RawQuery,
 	}
 
-	loginURL, _ := url.Parse("/__auth__/login")
-	q := loginURL.Query()
-	q.Set("redirect_uri", originalURL.String())
-	loginURL.RawQuery = q.Encode()
+	loginURL := buildPublicAuthLoginURL(authConfig, host, &originalURL)
+	if loginURL == nil {
+		loginURL, _ = url.Parse("/__auth__/login")
+		q := loginURL.Query()
+		q.Set("redirect_uri", originalURL.String())
+		loginURL.RawQuery = q.Encode()
+	}
 
 	http.Redirect(w, r, loginURL.String(), http.StatusFound)
 	return authCheckResult{}
@@ -1246,4 +1566,118 @@ func singleJoiningSlash(a, b string) string {
 		return a + "/" + b
 	}
 	return a + b
+}
+
+func mergeQueryValues(dst url.Values, src url.Values) {
+	for key, values := range src {
+		dst.Del(key)
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func requestPortFromHost(host string) string {
+	if strings.TrimSpace(host) == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse("//" + host)
+	if err != nil {
+		return ""
+	}
+
+	return parsed.Port()
+}
+
+func applyRequestPortToPublicAuthBase(baseURL *url.URL, requestHost string) {
+	if baseURL == nil || baseURL.Host == "" || baseURL.Port() != "" {
+		return
+	}
+
+	requestPort := requestPortFromHost(requestHost)
+	if requestPort == "" {
+		return
+	}
+
+	switch strings.ToLower(baseURL.Scheme) {
+	case "https":
+		if requestPort == "443" {
+			return
+		}
+	case "http":
+		if requestPort == "80" {
+			return
+		}
+	}
+
+	hostname := baseURL.Hostname()
+	if hostname == "" {
+		return
+	}
+
+	baseURL.Host = net.JoinHostPort(hostname, requestPort)
+}
+
+func buildPublicAuthLoginURL(authConfig models.AuthConfig, requestHost string, originalURL *url.URL) *url.URL {
+	if strings.TrimSpace(authConfig.PublicAuthBaseURL) == "" {
+		return nil
+	}
+
+	baseURL, err := url.Parse(authConfig.PublicAuthBaseURL)
+	if err != nil {
+		return nil
+	}
+	applyRequestPortToPublicAuthBase(baseURL, requestHost)
+
+	loginPath := strings.TrimSpace(authConfig.LoginURL)
+	if loginPath == "" {
+		loginPath = "/login"
+	}
+
+	var loginURL *url.URL
+	if strings.HasPrefix(loginPath, "/#") || strings.HasPrefix(loginPath, "#") {
+		loginURL = baseURL.ResolveReference(&url.URL{})
+		if loginURL.Path == "" {
+			loginURL.Path = "/"
+		}
+		loginURL.Fragment = strings.TrimPrefix(strings.TrimPrefix(loginPath, "/"), "#")
+	} else {
+		loginURL, err = baseURL.Parse(loginPath)
+		if err != nil {
+			return nil
+		}
+	}
+
+	q := loginURL.Query()
+	q.Set("redirect_uri", originalURL.String())
+	loginURL.RawQuery = q.Encode()
+	return loginURL
+}
+
+func buildInternalAuthLoginRedirect(loginPath string, rawQuery string) string {
+	parsedLoginPath, err := url.Parse(strings.TrimSpace(loginPath))
+	if err != nil {
+		return ""
+	}
+	if parsedLoginPath.Fragment == "" && parsedLoginPath.RawQuery == "" {
+		return ""
+	}
+
+	redirectPath := parsedLoginPath.Path
+	if redirectPath == "" {
+		redirectPath = "/"
+	}
+
+	redirectURL := &url.URL{
+		Path: singleJoiningSlash("/__auth__", ensureLeadingSlash(redirectPath)),
+	}
+	query := redirectURL.Query()
+	mergeQueryValues(query, parsedLoginPath.Query())
+	if requestQuery, err := url.ParseQuery(rawQuery); err == nil {
+		mergeQueryValues(query, requestQuery)
+	}
+	redirectURL.RawQuery = query.Encode()
+	redirectURL.Fragment = parsedLoginPath.Fragment
+	return redirectURL.String()
 }

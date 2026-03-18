@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"go-reauth-proxy/pkg/config"
@@ -14,6 +13,7 @@ import (
 	"go-reauth-proxy/pkg/version"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -57,6 +57,9 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/rules", s.handleGetRules).Methods("GET")
 	r.HandleFunc("/api/rules", s.handleAddRule).Methods("POST")
 	r.HandleFunc("/api/rules", s.handleFlushRules).Methods("DELETE")
+	r.HandleFunc("/api/host-rules", s.handleGetHostRules).Methods("GET")
+	r.HandleFunc("/api/host-rules", s.handleAddHostRule).Methods("POST")
+	r.HandleFunc("/api/host-rules", s.handleFlushHostRules).Methods("DELETE")
 	r.HandleFunc("/api/info", s.handleInfo).Methods("GET")
 	r.HandleFunc("/api/traffic", s.handleTraffic).Methods("GET")
 	r.HandleFunc("/api/config/default-route", s.handleGetDefaultRoute).Methods("GET")
@@ -191,6 +194,60 @@ func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
 // @Router /api/rules [delete]
 func (s *Server) handleFlushRules(w http.ResponseWriter, r *http.Request) {
 	s.ProxyHandler.FlushRules()
+	response.Success(w, nil)
+}
+
+func (s *Server) handleGetHostRules(w http.ResponseWriter, r *http.Request) {
+	rules := s.ProxyHandler.GetHostRules()
+	response.Success(w, rules)
+}
+
+func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		response.Error(w, errors.CodeReadBodyFailed, "Failed to read request body")
+		return
+	}
+	r.Body.Close()
+
+	type hostRuleRequest struct {
+		Host         string `json:"host"`
+		Target       string `json:"target"`
+		UseAuth      *bool  `json:"use_auth"`
+		AccessMode   string `json:"access_mode"`
+		PreserveHost *bool  `json:"preserve_host"`
+	}
+
+	var reqs []hostRuleRequest
+	if err := json.Unmarshal(bodyBytes, &reqs); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON array: "+err.Error())
+		return
+	}
+
+	s.ProxyHandler.FlushHostRules()
+
+	var addedRules []models.HostRule
+	for _, req := range reqs {
+		rule := models.HostRule{
+			Host:         req.Host,
+			Target:       req.Target,
+			UseAuth:      req.UseAuth == nil || *req.UseAuth,
+			AccessMode:   req.AccessMode,
+			PreserveHost: req.PreserveHost == nil || *req.PreserveHost,
+		}
+
+		if err := s.ProxyHandler.AddHostRule(rule); err != nil {
+			response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to add host rule: %v", err))
+			return
+		}
+		addedRules = append(addedRules, rule)
+	}
+
+	response.Success(w, addedRules)
+}
+
+func (s *Server) handleFlushHostRules(w http.ResponseWriter, r *http.Request) {
+	s.ProxyHandler.FlushHostRules()
 	response.Success(w, nil)
 }
 
@@ -357,34 +414,46 @@ func (s *Server) handleSetAuth(w http.ResponseWriter, r *http.Request) {
 // @Success 200 {object} response.Response{data=models.SSLInfo}
 // @Router /api/ssl [get]
 func (s *Server) handleGetSSL(w http.ResponseWriter, r *http.Request) {
-	cert := s.ProxyHandler.GetSSLCertificate()
-	response.Success(w, models.SSLInfo{Enabled: cert != nil})
+	response.Success(w, s.ProxyHandler.GetSSLInfo())
 }
 
 // handleSetSSL sets the dynamic SSL certificate
 // @Summary Set SSL certificate
-// @Description Upload a PEM encoded certificate and private key to enable HTTPS on the proxy port
+// @Description Upload a legacy PEM certificate/key pair or a deployed SSL bundle to enable HTTPS on the proxy port
 // @Tags ssl
 // @Accept  json
 // @Produce  json
-// @Param ssl body models.SSLRequest true "SSL Certificate and Key"
+// @Param ssl body models.SSLDeploymentRequest true "SSL deployment payload"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Router /api/ssl [post]
 func (s *Server) handleSetSSL(w http.ResponseWriter, r *http.Request) {
-	var req models.SSLRequest
+	var req models.SSLDeploymentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
 		return
 	}
 
-	cert, err := tls.X509KeyPair([]byte(req.Cert), []byte(req.Key))
-	if err != nil {
-		response.Error(w, errors.CodeBadRequest, fmt.Sprintf("Invalid certificate or key: %v", err))
+	if strings.TrimSpace(req.Cert) != "" || strings.TrimSpace(req.Key) != "" {
+		if len(req.Certificates) > 0 || req.DeploymentMode != "" {
+			response.Error(w, errors.CodeBadRequest, "cert/key mode cannot be mixed with deployment_mode/certificates")
+			return
+		}
+		if err := s.ProxyHandler.SetSSLCertificatePEM(req.Cert, req.Key); err != nil {
+			response.Error(w, errors.CodeBadRequest, fmt.Sprintf("Invalid certificate or key: %v", err))
+			return
+		}
+		response.Success(w, nil)
 		return
 	}
 
-	s.ProxyHandler.SetSSLCertificate(&cert, req.Cert, req.Key)
+	if err := s.ProxyHandler.SetSSLDeployment(models.SSLConfig{
+		DeploymentMode: req.DeploymentMode,
+		Certificates:   req.Certificates,
+	}); err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
 	response.Success(w, nil)
 }
 

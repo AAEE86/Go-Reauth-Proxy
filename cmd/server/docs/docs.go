@@ -736,7 +736,7 @@ const docTemplate = `{
                 }
             },
             "post": {
-                "description": "Upload a PEM encoded certificate and private key to enable HTTPS on the proxy port",
+                "description": "Upload a legacy PEM certificate/key pair or a deployed SSL bundle to enable HTTPS on the proxy port",
                 "consumes": [
                     "application/json"
                 ],
@@ -749,12 +749,12 @@ const docTemplate = `{
                 "summary": "Set SSL certificate",
                 "parameters": [
                     {
-                        "description": "SSL Certificate and Key",
+                        "description": "SSL deployment payload",
                         "name": "ssl",
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/models.SSLRequest"
+                            "$ref": "#/definitions/models.SSLDeploymentRequest"
                         }
                     }
                 ],
@@ -895,6 +895,10 @@ const docTemplate = `{
         "models.AuthConfig": {
             "type": "object",
             "properties": {
+                "auth_host": {
+                    "type": "string",
+                    "example": "auth.example.com"
+                },
                 "auth_port": {
                     "description": "Local Auth Service Port",
                     "type": "integer",
@@ -919,6 +923,10 @@ const docTemplate = `{
                     "description": "Relative Preflight URL (default /api/auth/preflight)",
                     "type": "string",
                     "example": "/api/auth/preflight"
+                },
+                "public_auth_base_url": {
+                    "type": "string",
+                    "example": "https://auth.example.com"
                 }
             }
         },
@@ -957,24 +965,100 @@ const docTemplate = `{
                 }
             }
         },
-        "models.SSLInfo": {
-            "type": "object",
-            "properties": {
-                "enabled": {
-                    "type": "boolean"
-                }
-            }
-        },
-        "models.SSLRequest": {
+        "models.SSLDeployedCertificate": {
             "type": "object",
             "properties": {
                 "cert": {
                     "type": "string",
                     "example": "-----BEGIN CERTIFICATE-----\n..."
                 },
+                "id": {
+                    "type": "string"
+                },
+                "is_default": {
+                    "type": "boolean"
+                },
                 "key": {
                     "type": "string",
                     "example": "-----BEGIN RSA PRIVATE KEY-----\n..."
+                },
+                "label": {
+                    "type": "string"
+                }
+            }
+        },
+        "models.SSLDeployedCertificateInfo": {
+            "type": "object",
+            "properties": {
+                "domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "id": {
+                    "type": "string"
+                },
+                "is_default": {
+                    "type": "boolean"
+                },
+                "label": {
+                    "type": "string"
+                }
+            }
+        },
+        "models.SSLDeploymentMode": {
+            "type": "string",
+            "enum": [
+                "single_active",
+                "multi_sni"
+            ],
+            "x-enum-varnames": [
+                "SSLDeploymentModeSingleActive",
+                "SSLDeploymentModeMultiSNI"
+            ]
+        },
+        "models.SSLDeploymentRequest": {
+            "type": "object",
+            "properties": {
+                "cert": {
+                    "type": "string",
+                    "example": "-----BEGIN CERTIFICATE-----\n..."
+                },
+                "certificates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/models.SSLDeployedCertificate"
+                    }
+                },
+                "deployment_mode": {
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/models.SSLDeploymentMode"
+                        }
+                    ],
+                    "example": "single_active"
+                },
+                "key": {
+                    "type": "string",
+                    "example": "-----BEGIN RSA PRIVATE KEY-----\n..."
+                }
+            }
+        },
+        "models.SSLInfo": {
+            "type": "object",
+            "properties": {
+                "certificates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/models.SSLDeployedCertificateInfo"
+                    }
+                },
+                "deployment_mode": {
+                    "$ref": "#/definitions/models.SSLDeploymentMode"
+                },
+                "enabled": {
+                    "type": "boolean"
                 }
             }
         },

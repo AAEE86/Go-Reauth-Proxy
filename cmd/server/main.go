@@ -317,7 +317,7 @@ func main() {
 			NextProtos:             []string{"h2", "http/1.1"},
 			SessionTicketsDisabled: true,
 			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				cert := proxyHandler.GetSSLCertificate()
+				cert := proxyHandler.GetCertificate(info)
 				if cert == nil {
 					return nil, fmt.Errorf("SSL not enabled")
 				}
@@ -330,7 +330,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if proxyHandler.GetSSLCertificate() != nil {
+			if proxyHandler.HasSSLCertificates() {
 				target := "https://" + r.Host + r.URL.String()
 				http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 				return

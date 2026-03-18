@@ -47,6 +47,9 @@ definitions:
     type: object
   models.AuthConfig:
     properties:
+      auth_host:
+        example: auth.example.com
+        type: string
       auth_port:
         description: Local Auth Service Port
         example: 3000
@@ -66,6 +69,9 @@ definitions:
       preflight_url:
         description: Relative Preflight URL (default /api/auth/preflight)
         example: /api/auth/preflight
+        type: string
+      public_auth_base_url:
+        example: https://auth.example.com
         type: string
     type: object
   models.Rule:
@@ -96,23 +102,77 @@ definitions:
         example: false
         type: boolean
     type: object
-  models.SSLInfo:
-    properties:
-      enabled:
-        type: boolean
-    type: object
-  models.SSLRequest:
+  models.SSLDeployedCertificate:
     properties:
       cert:
         example: |-
           -----BEGIN CERTIFICATE-----
           ...
         type: string
+      id:
+        type: string
+      is_default:
+        type: boolean
       key:
         example: |-
           -----BEGIN RSA PRIVATE KEY-----
           ...
         type: string
+      label:
+        type: string
+    type: object
+  models.SSLDeployedCertificateInfo:
+    properties:
+      domains:
+        items:
+          type: string
+        type: array
+      id:
+        type: string
+      is_default:
+        type: boolean
+      label:
+        type: string
+    type: object
+  models.SSLDeploymentMode:
+    enum:
+    - single_active
+    - multi_sni
+    type: string
+    x-enum-varnames:
+    - SSLDeploymentModeSingleActive
+    - SSLDeploymentModeMultiSNI
+  models.SSLDeploymentRequest:
+    properties:
+      cert:
+        example: |-
+          -----BEGIN CERTIFICATE-----
+          ...
+        type: string
+      certificates:
+        items:
+          $ref: '#/definitions/models.SSLDeployedCertificate'
+        type: array
+      deployment_mode:
+        allOf:
+        - $ref: '#/definitions/models.SSLDeploymentMode'
+        example: single_active
+      key:
+        example: |-
+          -----BEGIN RSA PRIVATE KEY-----
+          ...
+        type: string
+    type: object
+  models.SSLInfo:
+    properties:
+      certificates:
+        items:
+          $ref: '#/definitions/models.SSLDeployedCertificateInfo'
+        type: array
+      deployment_mode:
+        $ref: '#/definitions/models.SSLDeploymentMode'
+      enabled:
+        type: boolean
     type: object
   proxy.TrafficStats:
     properties:
@@ -607,15 +667,15 @@ paths:
     post:
       consumes:
       - application/json
-      description: Upload a PEM encoded certificate and private key to enable HTTPS
-        on the proxy port
+      description: Upload a legacy PEM certificate/key pair or a deployed SSL bundle
+        to enable HTTPS on the proxy port
       parameters:
-      - description: SSL Certificate and Key
+      - description: SSL deployment payload
         in: body
         name: ssl
         required: true
         schema:
-          $ref: '#/definitions/models.SSLRequest'
+          $ref: '#/definitions/models.SSLDeploymentRequest'
       produces:
       - application/json
       responses:

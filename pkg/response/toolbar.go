@@ -159,6 +159,13 @@ const toolbarTemplate = `
         .menu-item.active .menu-item-right-content .dot {
             background-color: #10b981; /* 激活时的圆点颜色 */
         }
+        .menu-empty {
+            padding: 12px 16px;
+            color: #6b7280;
+            font-size: 13px;
+            background: #fff;
+            border-bottom: 1px solid #f3f4f6;
+        }
         .logout-btn {
             color: #ef4444;
             font-weight: 500;
@@ -268,8 +275,22 @@ const toolbarTemplate = `
                 <div class="menu-header">
                     <span><i class="dot"></i> Go Reauth Proxy</span>
                 </div>
+                {{if .HasHostRules}}
+                {{range .HostRules}}
+                <a href="/" data-host="{{.Host}}" class="menu-item nav-link host-link{{if isActiveHost .Host $.CurrentHost}} active{{end}}">
+                    <span class="menu-item-path">{{.Host}}</span>
+                    <span class="menu-item-right-content">
+                        {{if isActiveHost .Host $.CurrentHost}}
+                            <i class="dot"></i>
+                        {{else}}
+                            <span class="menu-item-go-text">Go</span>
+                        {{end}}
+                    </span>
+                </a>
+                {{end}}
+                {{else if .HasPathRules}}
                 {{range .Rules}}
-                <a href="{{ensureSlash .Path}}" class="menu-item rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
+                <a href="{{ensureSlash .Path}}" class="menu-item nav-link rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
                     <span class="menu-item-path">{{.Path}}</span>
                     <span class="menu-item-right-content">
                         {{if isActive .Path $.CurrentPath}}
@@ -279,6 +300,9 @@ const toolbarTemplate = `
                         {{end}}
                     </span>
                 </a>
+                {{end}}
+                {{else}}
+                <div class="menu-empty">No routes configured</div>
                 {{end}}
                 <div style="height: 4px; background: #f9fafb;"></div>
                 <a href="/__auth__/api/auth/logout" class="menu-item logout-btn">Logout</a>
@@ -300,9 +324,19 @@ const toolbarTemplate = `
     var fab = shadow.getElementById('fab');
     var menu = shadow.getElementById('menu');
 
-    var ruleLinks = shadow.querySelectorAll('.rule-link');
-    for (var i = 0; i < ruleLinks.length; i++) {
-        ruleLinks[i].addEventListener('click', function(e) {
+    function buildHostHref(host) {
+        var port = window.location.port ? ':' + window.location.port : '';
+        return window.location.protocol + '//' + host + port + '/';
+    }
+
+    var navLinks = shadow.querySelectorAll('.nav-link');
+    for (var i = 0; i < navLinks.length; i++) {
+        var host = navLinks[i].getAttribute('data-host');
+        if (host) {
+            navLinks[i].setAttribute('href', buildHostHref(host));
+        }
+
+        navLinks[i].addEventListener('click', function(e) {
             e.preventDefault(); 
             e.stopPropagation(); 
             window.location.href = this.getAttribute('href'); 
@@ -617,18 +651,57 @@ var toolbarFuncMap = template.FuncMap{
 		cp := strings.TrimSuffix(currentPath, "/")
 		return rp == cp || strings.HasPrefix(cp, rp+"/") || strings.HasPrefix(cp, rp)
 	},
+	"isActiveHost": func(ruleHost, currentHost string) bool {
+		rh := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(ruleHost)), ".")
+		ch := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(currentHost)), ".")
+		return rh != "" && rh == ch
+	},
 }
 
 var toolbarTmpl = template.Must(template.New("toolbar").Funcs(toolbarFuncMap).Parse(toolbarTemplate))
 
 func GenerateToolbar(rules []models.Rule, currentPath string) string {
+	return GenerateToolbarWithHosts(rules, nil, currentPath, "", "")
+}
+
+func normalizeToolbarHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
+func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []models.HostRule {
+	normalizedExcludedHost := normalizeToolbarHost(excludedHost)
+	if normalizedExcludedHost == "" {
+		return hostRules
+	}
+
+	filtered := make([]models.HostRule, 0, len(hostRules))
+	for _, rule := range hostRules {
+		if normalizeToolbarHost(rule.Host) == normalizedExcludedHost {
+			continue
+		}
+		filtered = append(filtered, rule)
+	}
+	return filtered
+}
+
+func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string) string {
+	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
+
 	var buf bytes.Buffer
 	data := struct {
-		Rules       []models.Rule
-		CurrentPath string
+		Rules        []models.Rule
+		HostRules    []models.HostRule
+		CurrentPath  string
+		CurrentHost  string
+		HasPathRules bool
+		HasHostRules bool
 	}{
-		Rules:       rules,
-		CurrentPath: currentPath,
+		Rules:        rules,
+		HostRules:    filteredHostRules,
+		CurrentPath:  currentPath,
+		CurrentHost:  currentHost,
+		HasPathRules: len(rules) > 0,
+		HasHostRules: len(filteredHostRules) > 0,
 	}
 	_ = toolbarTmpl.Execute(&buf, data)
 	return buf.String()
