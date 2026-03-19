@@ -12,7 +12,9 @@ import (
 	"go-reauth-proxy/pkg/response"
 	"go-reauth-proxy/pkg/version"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,6 +70,12 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/proxy-protocol", s.handleSetProxyProtocolForce).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
 	r.HandleFunc("/api/auth", s.handleSetAuth).Methods("POST")
+	r.HandleFunc("/api/logging", s.handleGetLoggingConfig).Methods("GET")
+	r.HandleFunc("/api/logging", s.handleSetLoggingConfig).Methods("POST")
+	r.HandleFunc("/api/logging/directory", s.handleGetLoggingDirectory).Methods("GET")
+	r.HandleFunc("/api/logging/dates", s.handleGetLoggingDates).Methods("GET")
+	r.HandleFunc("/api/logging/entries", s.handleGetLoggingEntries).Methods("GET")
+	r.HandleFunc("/api/logging/entries", s.handleDeleteLoggingEntries).Methods("DELETE")
 	r.HandleFunc("/api/ssl", s.handleGetSSL).Methods("GET")
 	r.HandleFunc("/api/ssl", s.handleSetSSL).Methods("POST")
 	r.HandleFunc("/api/ssl", s.handleClearSSL).Methods("DELETE")
@@ -93,7 +101,7 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/iptables/list", s.IptablesHandler.HandleList).Methods("GET")
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.Port)
-	fmt.Printf("Admin Server listening on %s\n", addr)
+	log.Printf("Admin server listening on %s", addr)
 
 	loggedRouter := middleware.Logger(middleware.CORS(r))
 
@@ -406,6 +414,88 @@ func (s *Server) handleSetAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Success(w, nil)
+}
+
+func (s *Server) handleGetLoggingConfig(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetLoggingConfig())
+}
+
+func (s *Server) handleSetLoggingConfig(w http.ResponseWriter, r *http.Request) {
+	var req models.LoggingConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+	if req.MaxDays < 0 {
+		response.Error(w, errors.CodeBadRequest, "max_days must be greater than 0")
+		return
+	}
+
+	response.Success(w, s.ProxyHandler.SetLoggingConfig(req))
+}
+
+func (s *Server) handleGetLoggingDirectory(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetLoggingDirectory())
+}
+
+func (s *Server) handleGetLoggingDates(w http.ResponseWriter, r *http.Request) {
+	result, err := s.ProxyHandler.GetLogDates()
+	if err != nil {
+		response.Error(w, errors.CodeInternal, "Failed to list log dates: "+err.Error())
+		return
+	}
+	response.Success(w, result)
+}
+
+func (s *Server) handleGetLoggingEntries(w http.ResponseWriter, r *http.Request) {
+	page := 1
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			response.Error(w, errors.CodeBadRequest, "page must be a positive integer")
+			return
+		}
+		page = value
+	}
+
+	limit := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			response.Error(w, errors.CodeBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = value
+	}
+
+	result, err := s.ProxyHandler.QueryLogEntries(
+		r.URL.Query().Get("date"),
+		page,
+		limit,
+		r.URL.Query().Get("search"),
+	)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, result)
+}
+
+func (s *Server) handleDeleteLoggingEntries(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Date string `json:"date"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	result, err := s.ProxyHandler.DeleteLogDate(req.Date)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, result)
 }
 
 // handleGetSSL gets the current SSL status

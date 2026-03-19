@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"go-reauth-proxy/pkg/config"
 	"go-reauth-proxy/pkg/errors"
+	"go-reauth-proxy/pkg/gatewaylog"
 
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/response"
@@ -34,14 +35,16 @@ type Handler struct {
 	HostRules             []models.HostRule
 	DefaultRoute          string
 	AuthConfig            models.AuthConfig
+	LoggingConfig         models.LoggingConfig
 	AdminPort             int
 	ProxyProtocolForce    bool
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
 
-	configManager *config.Manager
-	sslConfig     models.SSLConfig
+	configManager     *config.Manager
+	sslConfig         models.SSLConfig
+	gatewayLogManager *gatewaylog.Manager
 
 	trafficTotalIn  uint64
 	trafficTotalOut uint64
@@ -70,7 +73,9 @@ type preflightDecision struct {
 
 type authCheckResult struct {
 	allowed         bool
+	authenticated   bool
 	suppressToolbar bool
+	decision        string
 }
 
 func (h *Handler) snapshotForRequest() requestSnapshot {
@@ -294,16 +299,23 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 	panic(http.ErrAbortHandler)
 }
 
-func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.AppConfig) *Handler {
+func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string) *Handler {
+	logConfig := gatewaylog.NormalizeConfig(initialCfg.Logging)
+	if strings.TrimSpace(logsDir) == "" {
+		logsDir = gatewaylog.DefaultLogsDir(".")
+	}
+
 	h := &Handler{
 		Rules:              initialCfg.Rules,
 		HostRules:          initialCfg.HostRules,
 		DefaultRoute:       initialCfg.DefaultRoute,
 		AuthConfig:         initialCfg.AuthConfig,
+		LoggingConfig:      logConfig,
 		AdminPort:          adminPort,
 		ProxyProtocolForce: initialCfg.ProxyProtocolForce,
 		configManager:      cfgManager,
 		sslConfig:          copySSLConfig(initialCfg.SSL),
+		gatewayLogManager:  gatewaylog.NewManager(logsDir, logConfig),
 		preflightClient: &http.Client{
 			Timeout:   preflightTimeout,
 			Transport: newInternalTransport(),
@@ -381,6 +393,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.HostRules = hostRulesCopy
 		conf.DefaultRoute = h.DefaultRoute
 		conf.AuthConfig = h.AuthConfig
+		conf.Logging = h.LoggingConfig
 		conf.ProxyProtocolForce = h.ProxyProtocolForce
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
@@ -688,6 +701,61 @@ func (h *Handler) GetAuthConfig() models.AuthConfig {
 	return h.AuthConfig
 }
 
+func (h *Handler) GetLoggingConfig() gatewaylog.ConfigInfo {
+	if h.gatewayLogManager == nil {
+		return gatewaylog.ConfigInfo{
+			Enabled: false,
+			MaxDays: gatewaylog.DefaultMaxDays,
+		}
+	}
+	return h.gatewayLogManager.GetConfigInfo()
+}
+
+func (h *Handler) SetLoggingConfig(cfg models.LoggingConfig) gatewaylog.ConfigInfo {
+	normalized := gatewaylog.NormalizeConfig(cfg)
+
+	h.mu.Lock()
+	h.LoggingConfig = normalized
+	h.saveConfigLocked()
+	h.mu.Unlock()
+
+	if h.gatewayLogManager == nil {
+		return gatewaylog.ConfigInfo{
+			Enabled: normalized.Enabled,
+			MaxDays: normalized.MaxDays,
+		}
+	}
+	return h.gatewayLogManager.UpdateConfig(normalized)
+}
+
+func (h *Handler) GetLoggingDirectory() gatewaylog.DirectoryInfo {
+	if h.gatewayLogManager == nil {
+		return gatewaylog.DirectoryInfo{}
+	}
+	return gatewaylog.DirectoryInfo{LogsDir: h.gatewayLogManager.LogsDir()}
+}
+
+func (h *Handler) GetLogDates() (gatewaylog.DatesResult, error) {
+	if h.gatewayLogManager == nil {
+		return gatewaylog.DatesResult{}, nil
+	}
+	return h.gatewayLogManager.GetDates()
+}
+
+func (h *Handler) QueryLogEntries(date string, page int, limit int, search string) (gatewaylog.QueryResult, error) {
+	if h.gatewayLogManager == nil {
+		return gatewaylog.QueryResult{}, nil
+	}
+	return h.gatewayLogManager.Query(date, page, limit, search)
+}
+
+func (h *Handler) DeleteLogDate(date string) (gatewaylog.DeleteResult, error) {
+	if h.gatewayLogManager == nil {
+		return gatewaylog.DeleteResult{}, nil
+	}
+	return h.gatewayLogManager.DeleteDate(date)
+}
+
 func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	if config.AuthPort <= 0 {
 		config.AuthPort = 7997
@@ -886,8 +954,29 @@ func (tw *trafficResponseWriter) Push(target string, opts *http.PushOptions) err
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	atomic.AddInt64(&h.trafficActive, 1)
 	metrics := &requestTrafficMetrics{statusCode: http.StatusOK}
+	accessEntry := gatewaylog.Entry{
+		Method:        r.Method,
+		Scheme:        requestScheme(r),
+		Host:          r.Host,
+		Path:          r.URL.Path,
+		Query:         r.URL.RawQuery,
+		RequestURI:    r.URL.RequestURI(),
+		Protocol:      r.Proto,
+		Status:        http.StatusOK,
+		RemoteAddr:    r.RemoteAddr,
+		UserAgent:     r.UserAgent(),
+		Referer:       r.Referer(),
+		TLS:           r.TLS != nil,
+		WebSocket:     strings.EqualFold(r.Header.Get("Upgrade"), "websocket"),
+		XForwardedFor: firstForwardedValue(r.Header.Get("X-Forwarded-For")),
+		XRealIP:       strings.TrimSpace(r.Header.Get("X-Real-IP")),
+	}
+	var clientIP string
+	loggedStatusCode := 0
+
 	if r.Body != nil {
 		r.Body = &trafficReadCloser{ReadCloser: r.Body, handler: h, metrics: metrics}
 	}
@@ -897,6 +986,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&h.trafficActive, -1)
 		if metrics.statusCode >= 500 {
 			atomic.AddUint64(&h.trafficError5xx, 1)
+		}
+		accessEntry.Path = r.URL.Path
+		accessEntry.Query = r.URL.RawQuery
+		accessEntry.RequestURI = r.URL.RequestURI()
+		accessEntry.BytesIn = metrics.inBytes
+		accessEntry.BytesOut = metrics.outBytes
+		accessEntry.DurationMs = time.Since(start).Milliseconds()
+		if loggedStatusCode > 0 {
+			accessEntry.Status = loggedStatusCode
+		} else {
+			accessEntry.Status = metrics.statusCode
+		}
+		if clientIP != "" {
+			accessEntry.RemoteIP = clientIP
+		}
+		if h.gatewayLogManager != nil {
+			h.gatewayLogManager.Log(accessEntry)
 		}
 		if rec := recover(); rec != nil {
 			panic(rec)
@@ -911,11 +1017,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.URL.Path = cleanedPath
 
 	if response.IsFaviconPath(r.URL.Path) {
+		accessEntry.RouteType = "favicon"
+		accessEntry.RouteKey = r.URL.Path
+		accessEntry.Matched = true
 		response.ServeFavicon(w, r)
 		return
 	}
 
-	clientIP := resolveClientIP(r, snapshot.proxyProtocolForce)
+	clientIP = resolveClientIP(r, snapshot.proxyProtocolForce)
+	accessEntry.RemoteIP = clientIP
 
 	isSelectRoute := r.URL.Path == "/__select__"
 	isAuthRoute := strings.HasPrefix(r.URL.Path, "/__auth__/")
@@ -940,16 +1050,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	isMatch := isSelectRoute || isAuthRoute || matchedHostRule != nil || matchedRule != nil || r.URL.Path == "/"
+	accessEntry.Matched = isMatch
+	accessEntry.AccessMode = accessMode
 	preflight := h.runPreflight(r, snapshot.authConfig, clientIP, isMatch, accessMode)
 	if preflight.deny {
+		accessEntry.RouteType = "preflight"
+		accessEntry.AuthDecision = "denied"
+		loggedStatusCode = 499
 		h.abortConnection(w)
 		return
 	}
 	if preflight.redirectLocation != "" {
+		accessEntry.RouteType = "preflight"
+		accessEntry.AuthDecision = "redirected"
 		http.Redirect(w, r, preflight.redirectLocation, http.StatusFound)
 		return
 	}
 	if needsSlashRedirect != "" {
+		accessEntry.RouteType = "slash_redirect"
+		accessEntry.RouteKey = needsSlashRedirect
 		newPath := needsSlashRedirect
 		if r.URL.RawQuery != "" {
 			newPath += "?" + r.URL.RawQuery
@@ -958,29 +1077,60 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isSelectRoute {
-		h.handleSelectRoute(w, r, snapshot, clientIP)
+		accessEntry.RouteType = "select"
+		accessEntry.RouteKey = r.URL.Path
+		accessEntry.AuthRequired = snapshot.authConfig.AuthURL != ""
+		authResult := h.handleSelectRoute(w, r, snapshot, clientIP)
+		accessEntry.LoggedIn = authResult.authenticated
+		accessEntry.AuthDecision = authResult.decision
 		return
 	}
 	if isAuthRoute {
+		accessEntry.RouteType = "auth_proxy"
+		accessEntry.RouteKey = r.URL.Path
+		if snapshot.authConfig.AuthPort > 0 {
+			accessEntry.Upstream = fmt.Sprintf("http://127.0.0.1:%d", snapshot.authConfig.AuthPort)
+		}
+		accessEntry.AuthDecision = "proxy"
 		h.handleAuthProxyRoute(w, r, snapshot, clientIP)
 		return
 	}
 	if matchedHostRule != nil {
-		authResult := authCheckResult{allowed: true}
-		if matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != "" {
+		accessEntry.RouteType = "host_rule"
+		accessEntry.RouteKey = matchedHostRule.Host
+		accessEntry.Upstream = matchedHostRule.Target
+		accessEntry.AuthRequired = matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != ""
+		authResult := authCheckResult{allowed: true, decision: "not_required"}
+		if accessEntry.AuthRequired {
 			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode)
+			accessEntry.LoggedIn = authResult.authenticated
+			accessEntry.AuthDecision = authResult.decision
 			if !authResult.allowed {
+				if authResult.decision == "denied" {
+					loggedStatusCode = 499
+				}
 				return
 			}
+		} else {
+			accessEntry.AuthDecision = authResult.decision
 		}
+		accessEntry.LoggedIn = authResult.authenticated
 		h.proxyToHostTarget(w, r, snapshot, *matchedHostRule, clientIP, authResult)
 		return
 	}
 	if matchedRule == nil {
+		accessEntry.RouteType = "not_found"
+		accessEntry.RouteKey = r.URL.Path
+		accessEntry.AuthDecision = "not_required"
 		h.handleNoMatchRoute(w, r, snapshot, clientIP)
 		return
 	}
+	accessEntry.RouteType = "path_rule"
+	accessEntry.RouteKey = matchedRule.Path
+	accessEntry.Upstream = matchedRule.Target
+	accessEntry.AuthRequired = matchedRule.UseAuth && snapshot.authConfig.AuthURL != ""
 	if matchedRule.UseRootMode && matchedRule.Path != "/" && strings.HasPrefix(r.URL.Path, matchedRule.Path) {
+		accessEntry.AuthDecision = "root_mode_redirect"
 		http.SetCookie(w, &http.Cookie{
 			Name:  "__proxy_path",
 			Value: matchedRule.Path,
@@ -989,27 +1139,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
-	authResult := authCheckResult{allowed: true}
-	if matchedRule.UseAuth && snapshot.authConfig.AuthURL != "" {
+	authResult := authCheckResult{allowed: true, decision: "not_required"}
+	if accessEntry.AuthRequired {
 		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "")
+		accessEntry.LoggedIn = authResult.authenticated
+		accessEntry.AuthDecision = authResult.decision
 		if !authResult.allowed {
+			if authResult.decision == "denied" {
+				loggedStatusCode = 499
+			}
 			return
 		}
+	} else {
+		accessEntry.AuthDecision = authResult.decision
 	}
+	accessEntry.LoggedIn = authResult.authenticated
 	h.proxyToRuleTarget(w, r, snapshot, *matchedRule, clientIP, authResult)
 }
 
-func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) bool {
-	if r.URL.Path != "/__select__" {
-		return false
-	}
+func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) authCheckResult {
 	if snapshot.authConfig.AuthURL != "" {
-		if !h.checkAuth(w, r, snapshot.authConfig, clientIP, "").allowed {
-			return true
+		authResult := h.checkAuth(w, r, snapshot.authConfig, clientIP, "")
+		if !authResult.allowed {
+			return authResult
 		}
+		response.SelectPage(w, snapshot.rules)
+		return authResult
 	}
 	response.SelectPage(w, snapshot.rules)
-	return true
+	return authCheckResult{allowed: true, decision: "not_required"}
 }
 
 func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) bool {
@@ -1454,7 +1612,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	if authConfig.AuthPort <= 0 {
 		log.Printf("Auth check requested but AuthPort is not configured")
 		response.HTML(w, errors.CodeInternal, "Authentication Service Not Configured", nil)
-		return authCheckResult{}
+		return authCheckResult{decision: "error"}
 	}
 
 	authURLPath := authConfig.AuthURL
@@ -1467,7 +1625,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	if err != nil {
 		log.Printf("Failed to create auth request: %v", err)
 		response.HTML(w, errors.CodeInternal, "Internal Server Error during Auth", nil)
-		return authCheckResult{}
+		return authCheckResult{decision: "error"}
 	}
 
 	authReq.Header.Set("X-Real-IP", clientIP)
@@ -1492,7 +1650,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	if err != nil {
 		log.Printf("Auth request failed: %v", err)
 		response.HTML(w, errors.CodeProxyAuthFailed, "Authentication Service Unavailable", nil)
-		return authCheckResult{}
+		return authCheckResult{decision: "error"}
 	}
 	defer resp.Body.Close()
 	for _, setCookie := range resp.Header.Values("Set-Cookie") {
@@ -1507,24 +1665,26 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	if err := json.NewDecoder(resp.Body).Decode(&authResponse); err != nil {
 		log.Printf("Failed to decode auth response: %v", err)
 		response.HTML(w, errors.CodeInternal, "Invalid Auth Response Format", nil)
-		return authCheckResult{}
+		return authCheckResult{decision: "error"}
 	}
 	if authResponse.Success {
 		h.markLoggedInActive(r, clientIP, time.Now())
 		return authCheckResult{
 			allowed:         true,
+			authenticated:   true,
 			suppressToolbar: strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share"),
+			decision:        "passed",
 		}
 	}
 	log.Printf("Auth failed: %s", authResponse.Message)
 	if accessMode == "strict_whitelist" {
 		h.abortConnection(w)
-		return authCheckResult{}
+		return authCheckResult{decision: "denied"}
 	}
 	if redirectLocation := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); redirectLocation != "" {
 		if strings.HasPrefix(redirectLocation, "/") || strings.HasPrefix(redirectLocation, "http://") || strings.HasPrefix(redirectLocation, "https://") {
 			http.Redirect(w, r, redirectLocation, http.StatusFound)
-			return authCheckResult{}
+			return authCheckResult{decision: "redirected"}
 		}
 	}
 
@@ -1553,7 +1713,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	}
 
 	http.Redirect(w, r, loginURL.String(), http.StatusFound)
-	return authCheckResult{}
+	return authCheckResult{decision: "redirected"}
 }
 
 func singleJoiningSlash(a, b string) string {

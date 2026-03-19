@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"go-reauth-proxy/pkg/gatewaylog"
 	"go-reauth-proxy/pkg/models"
 	"os"
 	"path/filepath"
@@ -10,16 +11,17 @@ import (
 )
 
 type AppConfig struct {
-	Rules              []models.Rule     `json:"rules"`
-	HostRules          []models.HostRule `json:"host_rules,omitempty"`
-	DefaultRoute       string            `json:"default_route"`
-	AuthConfig         models.AuthConfig `json:"auth_config"`
-	AdminPort          int               `json:"admin_port,omitempty"`
-	ProxyProtocolForce bool              `json:"proxy_protocol_force,omitempty"`
-	IptablesChainName  string            `json:"iptables_chain_name,omitempty"`
-	SSL                models.SSLConfig  `json:"ssl,omitempty"`
-	SSLCert            string            `json:"ssl_cert,omitempty"`
-	SSLKey             string            `json:"ssl_key,omitempty"`
+	Rules              []models.Rule        `json:"rules"`
+	HostRules          []models.HostRule    `json:"host_rules,omitempty"`
+	DefaultRoute       string               `json:"default_route"`
+	AuthConfig         models.AuthConfig    `json:"auth_config"`
+	AdminPort          int                  `json:"admin_port,omitempty"`
+	ProxyProtocolForce bool                 `json:"proxy_protocol_force,omitempty"`
+	IptablesChainName  string               `json:"iptables_chain_name,omitempty"`
+	Logging            models.LoggingConfig `json:"logging,omitempty"`
+	SSL                models.SSLConfig     `json:"ssl,omitempty"`
+	SSLCert            string               `json:"ssl_cert,omitempty"`
+	SSLKey             string               `json:"ssl_key,omitempty"`
 }
 
 type Manager struct {
@@ -49,6 +51,10 @@ func defaultConfig() *AppConfig {
 		},
 		AdminPort:          7996,
 		ProxyProtocolForce: false,
+		Logging: models.LoggingConfig{
+			Enabled: false,
+			MaxDays: gatewaylog.DefaultMaxDays,
+		},
 		SSL: models.SSLConfig{
 			DeploymentMode: models.SSLDeploymentModeSingleActive,
 			Certificates:   []models.SSLDeployedCertificate{},
@@ -115,6 +121,9 @@ func applyDefaults(cfg *AppConfig) {
 
 	if cfg.AdminPort <= 0 {
 		cfg.AdminPort = 7996
+	}
+	if cfg.Logging.MaxDays <= 0 {
+		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays
 	}
 }
 

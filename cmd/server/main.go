@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"go-reauth-proxy/pkg/admin"
 	"go-reauth-proxy/pkg/config"
-	"go-reauth-proxy/pkg/middleware"
+	"go-reauth-proxy/pkg/gatewaylog"
+	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/proxy"
 	"log"
 	"net"
@@ -240,6 +241,8 @@ func startProxyServers(host string, proxyPort int, proxyHandler *proxy.Handler, 
 }
 
 func main() {
+	logger.Setup()
+
 	adminPort := flag.Int("admin-port", 7996, "Port for the Admin API (0 uses config or default 7996, binds to 127.0.0.1)")
 	proxyPort := flag.Int("proxy-port", 7999, "Port for the Reverse Proxy (binds to 0.0.0.0/:: or 127.0.0.1/::1 based on proxy_protocol_force)")
 	configFlag := flag.String("c", "", "Path to config file (default: config.json in executable directory)")
@@ -282,6 +285,7 @@ func main() {
 	if err := os.MkdirAll(configDir, 0755); err != nil {
 		log.Fatalf("Failed to create config directory %s: %v", configDir, err)
 	}
+	logsDir := gatewaylog.DefaultLogsDir(configDir)
 
 	cfgManager := config.NewManager(configPath)
 	initialCfg, err := cfgManager.Load()
@@ -297,7 +301,7 @@ func main() {
 		}
 	}
 
-	proxyHandler := proxy.NewHandler(resolvedAdminPort, cfgManager, initialCfg)
+	proxyHandler := proxy.NewHandler(resolvedAdminPort, cfgManager, initialCfg, logsDir)
 
 	currentConfig := proxyHandler.GetAuthConfig()
 	proxyHandler.SetAuthConfig(currentConfig)
@@ -310,7 +314,7 @@ func main() {
 	}()
 
 	httpsServer := &http.Server{
-		Handler:           middleware.Logger(proxyHandler),
+		Handler:           proxyHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		TLSConfig: &tls.Config{
@@ -335,7 +339,7 @@ func main() {
 				http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 				return
 			}
-			middleware.Logger(proxyHandler).ServeHTTP(w, r)
+			proxyHandler.ServeHTTP(w, r)
 		}),
 	}
 

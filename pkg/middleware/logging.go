@@ -2,11 +2,12 @@ package middleware
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"time"
+
+	zlog "github.com/rs/zerolog/log"
 )
 
 type LogEntry struct {
@@ -53,21 +54,26 @@ func Logger(next http.Handler) http.Handler {
 
 		duration := time.Since(start)
 
-		entry := LogEntry{
-			Time:      start.Format(time.RFC3339),
-			Level:     "INFO",
-			Method:    r.Method,
-			Path:      r.URL.Path,
-			Status:    rw.status,
-			Duration:  duration.String(),
-			UserAgent: r.UserAgent(),
-			RemoteIP:  r.RemoteAddr,
+		remoteIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
+			remoteIP = host
 		}
 
-		if rw.status >= 400 {
-			entry.Level = "ERROR"
+		event := zlog.Info()
+		if rw.status >= 500 {
+			event = zlog.Error()
 		}
-		jsonBytes, _ := json.Marshal(entry)
-		fmt.Println(string(jsonBytes))
+		if rw.status >= 400 && rw.status < 500 {
+			event = zlog.Warn()
+		}
+
+		event.Str("component", "admin_http").
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Int("status", rw.status).
+			Str("duration", duration.String()).
+			Str("user_agent", r.UserAgent()).
+			Str("remote_ip", remoteIP).
+			Send()
 	})
 }

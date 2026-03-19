@@ -28,6 +28,11 @@ type AuthConfig struct {
 	AuthHost          string `json:"auth_host,omitempty" example:"auth.example.com"`
 }
 
+type LoggingConfig struct {
+	Enabled bool `json:"enabled"`
+	MaxDays int  `json:"max_days,omitempty"`
+}
+
 type PortConfig struct {
 	Port  int    `json:"port"`
 	Rules []Rule `json:"rules"`
