@@ -277,7 +277,7 @@ const toolbarTemplate = `
                 </div>
                 {{if .HasHostRules}}
                 {{range .HostRules}}
-                <a href="/" data-host="{{.Host}}" class="menu-item nav-link host-link{{if isActiveHost .Host $.CurrentHost}} active{{end}}">
+                <a href="/" target="_blank" rel="noopener noreferrer" data-host="{{.Host}}" class="menu-item nav-link host-link{{if isActiveHost .Host $.CurrentHost}} active{{end}}">
                     <span class="menu-item-path">{{.Host}}</span>
                     <span class="menu-item-right-content">
                         {{if isActiveHost .Host $.CurrentHost}}
@@ -290,7 +290,7 @@ const toolbarTemplate = `
                 {{end}}
                 {{else if .HasPathRules}}
                 {{range .Rules}}
-                <a href="{{ensureSlash .Path}}" class="menu-item nav-link rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
+                <a href="{{ensureSlash .Path}}" target="_blank" rel="noopener noreferrer" class="menu-item nav-link rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
                     <span class="menu-item-path">{{.Path}}</span>
                     <span class="menu-item-right-content">
                         {{if isActive .Path $.CurrentPath}}
@@ -339,7 +339,8 @@ const toolbarTemplate = `
         navLinks[i].addEventListener('click', function(e) {
             e.preventDefault(); 
             e.stopPropagation(); 
-            window.location.href = this.getAttribute('href'); 
+            window.open(this.getAttribute('href'), '_blank', 'noopener,noreferrer');
+            menu.classList.remove('open');
         });
     }
 
