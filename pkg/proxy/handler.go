@@ -1235,7 +1235,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.UseAuth && !authResult.suppressToolbar {
+			if matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 		},
@@ -1246,7 +1246,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		needsToolbar := matchedRule.UseAuth && !authResult.suppressToolbar
+		needsToolbar := matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar
 		if !needsToolbar {
 			return nil
 		}

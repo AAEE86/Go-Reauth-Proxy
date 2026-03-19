@@ -10,11 +10,12 @@ type Rule struct {
 }
 
 type HostRule struct {
-	Host         string `json:"host" example:"redis.example.com"`
-	Target       string `json:"target" example:"http://127.0.0.1:5173"`
-	UseAuth      bool   `json:"use_auth" example:"true"`
-	AccessMode   string `json:"access_mode,omitempty" example:"login_first"`
-	PreserveHost bool   `json:"preserve_host,omitempty" example:"true"`
+	Host            string `json:"host" example:"redis.example.com"`
+	Target          string `json:"target" example:"http://127.0.0.1:5173"`
+	UseAuth         bool   `json:"use_auth" example:"true"`
+	AccessMode      string `json:"access_mode,omitempty" example:"login_first"`
+	SuppressToolbar bool   `json:"suppress_toolbar,omitempty" example:"false"`
+	PreserveHost    bool   `json:"preserve_host,omitempty" example:"true"`
 }
 
 type AuthConfig struct {

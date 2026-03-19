@@ -211,11 +211,12 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	type hostRuleRequest struct {
-		Host         string `json:"host"`
-		Target       string `json:"target"`
-		UseAuth      *bool  `json:"use_auth"`
-		AccessMode   string `json:"access_mode"`
-		PreserveHost *bool  `json:"preserve_host"`
+		Host            string `json:"host"`
+		Target          string `json:"target"`
+		UseAuth         *bool  `json:"use_auth"`
+		AccessMode      string `json:"access_mode"`
+		SuppressToolbar *bool  `json:"suppress_toolbar"`
+		PreserveHost    *bool  `json:"preserve_host"`
 	}
 
 	var reqs []hostRuleRequest
@@ -229,11 +230,12 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 	var addedRules []models.HostRule
 	for _, req := range reqs {
 		rule := models.HostRule{
-			Host:         req.Host,
-			Target:       req.Target,
-			UseAuth:      req.UseAuth == nil || *req.UseAuth,
-			AccessMode:   req.AccessMode,
-			PreserveHost: req.PreserveHost == nil || *req.PreserveHost,
+			Host:            req.Host,
+			Target:          req.Target,
+			UseAuth:         req.UseAuth == nil || *req.UseAuth,
+			AccessMode:      req.AccessMode,
+			SuppressToolbar: req.SuppressToolbar != nil && *req.SuppressToolbar,
+			PreserveHost:    req.PreserveHost == nil || *req.PreserveHost,
 		}
 
 		if err := s.ProxyHandler.AddHostRule(rule); err != nil {
