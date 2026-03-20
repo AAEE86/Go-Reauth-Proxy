@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -21,12 +23,16 @@ import (
 )
 
 const (
-	fnAppMetadataCacheTTL     = 24 * time.Hour
-	fnAppMetadataFetchTimeout = 4 * time.Second
-	fnAppPasswordErrorCode    = 84934746
-	fnAppMetadataCachePrefix  = "go_reauth_proxy:fn_app_upstream_meta:v1:"
-	fnAppRelayCookieValue     = "mode=relay"
-	fnAppDefaultUserAgent     = "Dart/3.5 (dart:io), Flutter/3.5.4"
+	fnAppMetadataCacheTTL          = 24 * time.Hour
+	fnAppMetadataFetchTimeout      = 4 * time.Second
+	fnAppPasswordErrorCode         = 84934746
+	fnAppMetadataCachePrefix       = "go_reauth_proxy:fn_app_upstream_meta:v1:"
+	fnAppRelayCookieValue          = "mode=relay"
+	fnAppDefaultUserAgent          = "Dart/3.5 (dart:io), Flutter/3.5.4"
+	fnAppUnauthorizedWSIdleTimeout = 3 * time.Second
+	fnAppUnauthorizedWSReadLimit   = 8 << 10
+	fnAppUnauthorizedWSCloseWait   = 500 * time.Millisecond
+	fnAppPasswordFailureDrainDelay = 20 * time.Millisecond
 )
 
 type fnAppUpstreamMetadata struct {
@@ -98,17 +104,23 @@ func (c *memoryFNAppMetadataCache) Set(_ context.Context, key string, value fnAp
 }
 
 type fnAppMockService struct {
-	cache        fnAppMetadataCache
-	fetchTimeout time.Duration
-	upgrader     websocket.Upgrader
-	wsDialer     websocket.Dialer
-	fetchGroup   singleflight.Group
+	cache                     fnAppMetadataCache
+	fetchTimeout              time.Duration
+	unauthorizedWSIdleTimeout time.Duration
+	unauthorizedWSReadLimit   int64
+	unauthorizedWSCloseWait   time.Duration
+	upgrader                  websocket.Upgrader
+	wsDialer                  websocket.Dialer
+	fetchGroup                singleflight.Group
 }
 
 func newFNAppMockServiceFromEnv() *fnAppMockService {
 	return &fnAppMockService{
-		cache:        newMemoryFNAppMetadataCache(),
-		fetchTimeout: fnAppMetadataFetchTimeout,
+		cache:                     newMemoryFNAppMetadataCache(),
+		fetchTimeout:              fnAppMetadataFetchTimeout,
+		unauthorizedWSIdleTimeout: fnAppUnauthorizedWSIdleTimeout,
+		unauthorizedWSReadLimit:   fnAppUnauthorizedWSReadLimit,
+		unauthorizedWSCloseWait:   fnAppUnauthorizedWSCloseWait,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true
@@ -199,74 +211,141 @@ func (s *fnAppMockService) serveUnauthorizedWebsocket(w http.ResponseWriter, r *
 	}
 	defer conn.Close()
 
-	var state struct {
-		rsaReqID string
-		failSent bool
+	if readLimit := s.resolvedUnauthorizedWSReadLimit(); readLimit > 0 {
+		conn.SetReadLimit(readLimit)
 	}
 
-	for {
-		messageType, payload, err := conn.ReadMessage()
-		if err != nil {
-			return nil
-		}
-		if messageType != websocket.TextMessage {
-			continue
-		}
-
-		var request struct {
-			Req   string `json:"req"`
-			ReqID string `json:"reqid"`
-		}
-		if err := json.Unmarshal(payload, &request); err != nil {
-			if !state.failSent {
-				if err := sendFNAppPasswordFailure(conn, nextReqID(state.rsaReqID)); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
-		switch request.Req {
-		case "util.crypto.getRSAPub":
-			state.rsaReqID = request.ReqID
-			response := struct {
-				PublicKey string `json:"pub"`
-				SI        string `json:"si"`
-				MachineID string `json:"machineId"`
-				Result    string `json:"result"`
-				ReqID     string `json:"reqid"`
-			}{
-				PublicKey: metadata.PublicKey,
-				SI:        metadata.SI,
-				MachineID: metadata.MachineID,
-				Result:    "succ",
-				ReqID:     state.rsaReqID,
-			}
-			if err := conn.WriteJSON(response); err != nil {
-				return err
-			}
-		case "encrypted":
-			if !state.failSent {
-				state.failSent = true
-				if err := sendFNAppPasswordFailure(conn, nextReqID(state.rsaReqID)); err != nil {
-					return err
-				}
-			}
-			return nil
-		default:
-			if !state.failSent {
-				state.failSent = true
-				reqID := request.ReqID
-				if reqID == "" {
-					reqID = nextReqID(state.rsaReqID)
-				}
-				if err := sendFNAppPasswordFailure(conn, reqID); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
+	if err := s.resetUnauthorizedWSReadDeadline(conn); err != nil {
+		return err
 	}
+
+	request, err := readFNAppMockRequest(conn)
+	if err != nil {
+		return s.handleUnauthorizedWSReadError(conn, "", err)
+	}
+	if request.Req != "util.crypto.getRSAPub" {
+		return s.failUnauthorizedWebsocket(conn, resolveFNAppFailureReqID(request.ReqID, ""))
+	}
+
+	response := struct {
+		PublicKey string `json:"pub"`
+		SI        string `json:"si"`
+		MachineID string `json:"machineId"`
+		Result    string `json:"result"`
+		ReqID     string `json:"reqid"`
+	}{
+		PublicKey: metadata.PublicKey,
+		SI:        metadata.SI,
+		MachineID: metadata.MachineID,
+		Result:    "succ",
+		ReqID:     request.ReqID,
+	}
+	if err := conn.WriteJSON(response); err != nil {
+		return err
+	}
+
+	if err := s.resetUnauthorizedWSReadDeadline(conn); err != nil {
+		return err
+	}
+
+	request, err = readFNAppMockRequest(conn)
+	if err != nil {
+		return s.handleUnauthorizedWSReadError(conn, response.ReqID, err)
+	}
+
+	return s.failUnauthorizedWebsocket(conn, resolveFNAppFailureReqID(request.ReqID, response.ReqID))
+}
+
+var errFNAppUnexpectedWSMessageType = errors.New("unexpected FN App websocket message type")
+
+type fnAppMockRequest struct {
+	Req   string `json:"req"`
+	ReqID string `json:"reqid"`
+}
+
+func readFNAppMockRequest(conn *websocket.Conn) (fnAppMockRequest, error) {
+	messageType, payload, err := conn.ReadMessage()
+	if err != nil {
+		return fnAppMockRequest{}, err
+	}
+	if messageType != websocket.TextMessage {
+		return fnAppMockRequest{}, errFNAppUnexpectedWSMessageType
+	}
+
+	var request fnAppMockRequest
+	if err := json.Unmarshal(payload, &request); err != nil {
+		return fnAppMockRequest{}, err
+	}
+	return request, nil
+}
+
+func (s *fnAppMockService) resolvedUnauthorizedWSIdleTimeout() time.Duration {
+	if s != nil && s.unauthorizedWSIdleTimeout > 0 {
+		return s.unauthorizedWSIdleTimeout
+	}
+	return fnAppUnauthorizedWSIdleTimeout
+}
+
+func (s *fnAppMockService) resolvedUnauthorizedWSReadLimit() int64 {
+	if s != nil && s.unauthorizedWSReadLimit > 0 {
+		return s.unauthorizedWSReadLimit
+	}
+	return fnAppUnauthorizedWSReadLimit
+}
+
+func (s *fnAppMockService) resolvedUnauthorizedWSCloseWait() time.Duration {
+	if s != nil && s.unauthorizedWSCloseWait > 0 {
+		return s.unauthorizedWSCloseWait
+	}
+	return fnAppUnauthorizedWSCloseWait
+}
+
+func (s *fnAppMockService) resetUnauthorizedWSReadDeadline(conn *websocket.Conn) error {
+	return conn.SetReadDeadline(time.Now().Add(s.resolvedUnauthorizedWSIdleTimeout()))
+}
+
+func (s *fnAppMockService) handleUnauthorizedWSReadError(conn *websocket.Conn, previousReqID string, err error) error {
+	if err == nil || isFNAppConnectionTermination(err) {
+		return nil
+	}
+	return s.failUnauthorizedWebsocket(conn, nextReqID(previousReqID))
+}
+
+func (s *fnAppMockService) failUnauthorizedWebsocket(conn *websocket.Conn, reqID string) error {
+	if err := sendFNAppPasswordFailure(conn, reqID); err != nil {
+		return err
+	}
+
+	deadline := time.Now().Add(s.resolvedUnauthorizedWSCloseWait())
+	if err := conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline); err != nil && !isFNAppConnectionTermination(err) {
+		return err
+	}
+	return nil
+}
+
+func resolveFNAppFailureReqID(requestReqID string, previousReqID string) string {
+	if strings.TrimSpace(requestReqID) != "" {
+		return requestReqID
+	}
+	return nextReqID(previousReqID)
+}
+
+func isFNAppConnectionTermination(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return true
+	}
+
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return true
+	}
+
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func sendFNAppPasswordFailure(conn *websocket.Conn, reqID string) error {
@@ -284,7 +363,7 @@ func sendFNAppPasswordFailure(conn *websocket.Conn, reqID string) error {
 		return err
 	}
 
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(fnAppPasswordFailureDrainDelay)
 	return nil
 }
 
