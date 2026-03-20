@@ -51,6 +51,7 @@ type Handler struct {
 	trafficActive   int64
 	trafficError5xx uint64
 
+	fnAppMockService           *fnAppMockService
 	loggedInActive             sync.Map
 	preflightClient            *http.Client
 	authClient                 *http.Client
@@ -316,6 +317,7 @@ func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.Ap
 		configManager:      cfgManager,
 		sslConfig:          copySSLConfig(initialCfg.SSL),
 		gatewayLogManager:  gatewaylog.NewManager(logsDir, logConfig),
+		fnAppMockService:   newFNAppMockServiceFromEnv(),
 		preflightClient: &http.Client{
 			Timeout:   preflightTimeout,
 			Transport: newInternalTransport(),
@@ -1108,7 +1110,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.AuthRequired = matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != ""
 		authResult := authCheckResult{allowed: true, decision: "not_required"}
 		if accessEntry.AuthRequired {
-			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode)
+			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode, matchedHostRule.Target)
 			accessEntry.LoggedIn = authResult.authenticated
 			accessEntry.AuthDecision = authResult.decision
 			if !authResult.allowed {
@@ -1147,7 +1149,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	authResult := authCheckResult{allowed: true, decision: "not_required"}
 	if accessEntry.AuthRequired {
-		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "")
+		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "", matchedRule.Target)
 		accessEntry.LoggedIn = authResult.authenticated
 		accessEntry.AuthDecision = authResult.decision
 		if !authResult.allowed {
@@ -1165,7 +1167,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) authCheckResult {
 	if snapshot.authConfig.AuthURL != "" {
-		authResult := h.checkAuth(w, r, snapshot.authConfig, clientIP, "")
+		authResult := h.checkAuth(w, r, snapshot.authConfig, clientIP, "", "")
 		if !authResult.allowed {
 			return authResult
 		}
@@ -1606,7 +1608,7 @@ func injectToolbarIntoHTML(bodyStr string, toolbarHTML string) string {
 	return bodyStr
 }
 
-func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string) authCheckResult {
+func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string) authCheckResult {
 	client := h.authClient
 	if client == nil {
 		client = &http.Client{
@@ -1683,6 +1685,16 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 		}
 	}
 	log.Printf("Auth failed: %s", authResponse.Message)
+	if h.fnAppMockService != nil {
+		handled, err := h.fnAppMockService.handleUnauthorizedRequest(w, r, upstreamTarget)
+		if err != nil {
+			log.Printf("Failed to serve unauthorized FN App mock response: %v", err)
+			return authCheckResult{decision: "error"}
+		}
+		if handled {
+			return authCheckResult{decision: "fn_app_prompt"}
+		}
+	}
 	if accessMode == "strict_whitelist" {
 		h.abortConnection(w)
 		return authCheckResult{decision: "denied"}
