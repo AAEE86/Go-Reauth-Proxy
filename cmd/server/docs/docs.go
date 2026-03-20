@@ -927,6 +927,14 @@ const docTemplate = `{
                 "public_auth_base_url": {
                     "type": "string",
                     "example": "https://auth.example.com"
+                },
+                "public_http_port": {
+                    "type": "integer",
+                    "example": 80
+                },
+                "public_https_port": {
+                    "type": "integer",
+                    "example": 443
                 }
             }
         },

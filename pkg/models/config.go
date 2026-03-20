@@ -25,6 +25,8 @@ type AuthConfig struct {
 	LogoutURL         string `json:"logout_url" example:"/api/auth/logout"`       // Relative Logout URL (default /api/auth/logout)
 	PreflightURL      string `json:"preflight_url" example:"/api/auth/preflight"` // Relative Preflight URL (default /api/auth/preflight)
 	PublicAuthBaseURL string `json:"public_auth_base_url,omitempty" example:"https://auth.example.com"`
+	PublicHTTPPort    int    `json:"public_http_port,omitempty" example:"80"`
+	PublicHTTPSPort   int    `json:"public_https_port,omitempty" example:"443"`
 	AuthHost          string `json:"auth_host,omitempty" example:"auth.example.com"`
 }
 

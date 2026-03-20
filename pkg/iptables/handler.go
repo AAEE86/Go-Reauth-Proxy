@@ -152,6 +152,11 @@ type ipRequest struct {
 	IP string `json:"ip" example:"192.168.1.100"`
 }
 
+type tcpRedirectRequest struct {
+	ListenPort int `json:"listen_port" example:"80"`
+	TargetPort int `json:"target_port" example:"7999"`
+}
+
 // HandleAllowIP adds an ALLOW rule for an IP
 // @Summary Allow IP
 // @Description Add an ALLOW rule for a specific IP
@@ -265,6 +270,56 @@ func (h *Handler) HandleBlockAll(w http.ResponseWriter, r *http.Request) {
 // @Router /api/iptables/allow-all [post]
 func (h *Handler) HandleAllowAll(w http.ResponseWriter, r *http.Request) {
 	if err := h.Manager.AllowAll(); err != nil {
+		handleError(w, err)
+		return
+	}
+	response.Success(w, nil)
+}
+
+// HandleEnsureTCPRedirect ensures a TCP REDIRECT rule exists in nat/PREROUTING
+// @Summary Ensure TCP redirect
+// @Description Ensure a tcp REDIRECT rule exists in nat PREROUTING for both iptables and ip6tables
+// @Tags iptables
+// @Accept  json
+// @Produce  json
+// @Param request body tcpRedirectRequest true "TCP redirect configuration"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /api/iptables/tcp-redirect [post]
+func (h *Handler) HandleEnsureTCPRedirect(w http.ResponseWriter, r *http.Request) {
+	var req tcpRedirectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON body")
+		return
+	}
+
+	if err := h.Manager.EnsureTCPRedirect(req.ListenPort, req.TargetPort); err != nil {
+		handleError(w, err)
+		return
+	}
+	response.Success(w, nil)
+}
+
+// HandleClearTCPRedirect removes a TCP REDIRECT rule from nat/PREROUTING
+// @Summary Clear TCP redirect
+// @Description Remove a tcp REDIRECT rule from nat PREROUTING for both iptables and ip6tables
+// @Tags iptables
+// @Accept  json
+// @Produce  json
+// @Param request body tcpRedirectRequest true "TCP redirect configuration"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /api/iptables/tcp-redirect [delete]
+func (h *Handler) HandleClearTCPRedirect(w http.ResponseWriter, r *http.Request) {
+	var req tcpRedirectRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON body")
+		return
+	}
+
+	if err := h.Manager.ClearTCPRedirect(req.ListenPort, req.TargetPort); err != nil {
 		handleError(w, err)
 		return
 	}

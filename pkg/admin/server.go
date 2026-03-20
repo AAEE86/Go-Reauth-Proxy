@@ -98,6 +98,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/iptables/remove", s.IptablesHandler.HandleRemoveIP).Methods("POST")
 	r.HandleFunc("/api/iptables/block-all", s.IptablesHandler.HandleBlockAll).Methods("POST")
 	r.HandleFunc("/api/iptables/allow-all", s.IptablesHandler.HandleAllowAll).Methods("POST")
+	r.HandleFunc("/api/iptables/tcp-redirect", s.IptablesHandler.HandleEnsureTCPRedirect).Methods("POST")
+	r.HandleFunc("/api/iptables/tcp-redirect", s.IptablesHandler.HandleClearTCPRedirect).Methods("DELETE")
 	r.HandleFunc("/api/iptables/list", s.IptablesHandler.HandleList).Methods("GET")
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.Port)

@@ -107,7 +107,9 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
     "auth_url": "/api/auth/verify",
     "login_url": "/login",
     "logout_url": "/api/auth/logout",
-    "preflight_url": "/api/auth/preflight"
+    "preflight_url": "/api/auth/preflight",
+    "public_http_port": 80,
+    "public_https_port": 443
   },
   "admin_port": 7996,
   "proxy_protocol_force": false,
@@ -122,10 +124,26 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 - `rules`: 路由规则数组
 - `default_route`: 根路径 `/` 的默认去向，默认 `"/__select__"`
 - `auth_config`: 全局认证配置
+- `auth_config.public_http_port`: 可选，显式指定对外暴露的 HTTP 端口
+- `auth_config.public_https_port`: 可选，显式指定对外暴露的 HTTPS 端口
 - `admin_port`: 管理端口（仅在 `-admin-port=0` 时作为回退）
 - `proxy_protocol_force`: 是否强制按 PROXY protocol 场景处理来源 IP
 - `iptables_chain_name`: iptables 链名（默认 `REAUTH_FW`）
 - `ssl_cert` / `ssl_key`: PEM 证书与私钥（由 API 写入）
+
+当网关运行在非标准本地端口上，但前面存在 NAT 或转发时，这两个字段可用于修正网关生成的公开跳转地址。
+
+例如本地监听 `7999`，并希望外部访问 `http://fnos.fnknock.xyz/` 时跳转到 `https://fnos.fnknock.xyz:7999/`，可配置：
+
+```json
+{
+  "auth_config": {
+    "public_http_port": 80,
+    "public_https_port": 7999,
+    "public_auth_base_url": "https://auth.fnknock.xyz:7999"
+  }
+}
+```
 
 ## 规则匹配与转发行为
 

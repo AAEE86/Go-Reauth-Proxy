@@ -364,6 +364,82 @@ func (m *Manager) RemoveIPRule(ip string) error {
 	return nil
 }
 
+func (m *Manager) EnsureTCPRedirect(listenPort int, targetPort int) error {
+	if err := validatePort(listenPort); err != nil {
+		return err
+	}
+	if err := validatePort(targetPort); err != nil {
+		return err
+	}
+
+	for _, table := range m.tables {
+		if err := m.clearTCPRedirectForTable(table, listenPort, targetPort); err != nil {
+			return err
+		}
+		if err := m.runTable(table, redirectInsertArgs(listenPort, targetPort)...); err != nil {
+			return errors.New(
+				errors.CodeIptablesCommandError,
+				fmt.Sprintf("Failed to add TCP redirect %d->%d (%s): %v", listenPort, targetPort, table, err),
+			)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) ClearTCPRedirect(listenPort int, targetPort int) error {
+	if err := validatePort(listenPort); err != nil {
+		return err
+	}
+	if err := validatePort(targetPort); err != nil {
+		return err
+	}
+
+	for _, table := range m.tables {
+		if err := m.clearTCPRedirectForTable(table, listenPort, targetPort); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) clearTCPRedirectForTable(table string, listenPort int, targetPort int) error {
+	for {
+		if err := m.runTable(table, redirectDeleteArgs(listenPort, targetPort)...); err != nil {
+			break
+		}
+	}
+	return nil
+}
+
+func redirectInsertArgs(listenPort int, targetPort int) []string {
+	return []string{
+		"-t", "nat",
+		"-I", "PREROUTING", "1",
+		"-p", "tcp",
+		"--dport", strconv.Itoa(listenPort),
+		"-j", "REDIRECT",
+		"--to-ports", strconv.Itoa(targetPort),
+	}
+}
+
+func redirectDeleteArgs(listenPort int, targetPort int) []string {
+	return []string{
+		"-t", "nat",
+		"-D", "PREROUTING",
+		"-p", "tcp",
+		"--dport", strconv.Itoa(listenPort),
+		"-j", "REDIRECT",
+		"--to-ports", strconv.Itoa(targetPort),
+	}
+}
+
+func validatePort(port int) error {
+	if port <= 0 || port > 65535 {
+		return errors.New(errors.CodeBadRequest, "port must be between 1 and 65535")
+	}
+	return nil
+}
+
 type Rule struct {
 	IP     string `json:"ip"`
 	Action string `json:"action"` // ACCEPT or DROP

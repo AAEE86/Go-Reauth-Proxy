@@ -47,6 +47,8 @@ func defaultConfig() *AppConfig {
 			LogoutURL:         "/api/auth/logout",
 			PreflightURL:      "/api/auth/preflight",
 			PublicAuthBaseURL: "",
+			PublicHTTPPort:    0,
+			PublicHTTPSPort:   0,
 			AuthHost:          "",
 		},
 		AdminPort:          7996,
@@ -114,6 +116,12 @@ func applyDefaults(cfg *AppConfig) {
 	}
 	if cfg.AuthConfig.PublicAuthBaseURL == "" {
 		cfg.AuthConfig.PublicAuthBaseURL = ""
+	}
+	if cfg.AuthConfig.PublicHTTPPort < 0 {
+		cfg.AuthConfig.PublicHTTPPort = 0
+	}
+	if cfg.AuthConfig.PublicHTTPSPort < 0 {
+		cfg.AuthConfig.PublicHTTPSPort = 0
 	}
 	if cfg.AuthConfig.AuthHost == "" {
 		cfg.AuthConfig.AuthHost = ""

@@ -73,6 +73,12 @@ definitions:
       public_auth_base_url:
         example: https://auth.example.com
         type: string
+      public_http_port:
+        example: 80
+        type: integer
+      public_https_port:
+        example: 443
+        type: integer
     type: object
   models.Rule:
     properties:

@@ -335,7 +335,10 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if proxyHandler.HasSSLCertificates() {
-				target := "https://" + r.Host + r.URL.String()
+				target := proxy.BuildHTTPSRedirectURL(r, proxyHandler.GetAuthConfig())
+				if target == "" {
+					target = "https://" + r.Host + r.URL.String()
+				}
 				http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 				return
 			}

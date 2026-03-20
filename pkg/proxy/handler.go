@@ -772,6 +772,12 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	if config.PreflightURL == "" {
 		config.PreflightURL = "/api/auth/preflight"
 	}
+	if config.PublicHTTPPort < 0 {
+		config.PublicHTTPPort = 0
+	}
+	if config.PublicHTTPSPort < 0 {
+		config.PublicHTTPSPort = 0
+	}
 	config.PublicAuthBaseURL = strings.TrimSpace(strings.TrimRight(config.PublicAuthBaseURL, "/"))
 	config.AuthHost = normalizeRequestHost(config.AuthHost)
 
@@ -1688,23 +1694,17 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 		}
 	}
 
-	scheme := "http"
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-		scheme = "https"
-	}
-	host := r.Host
-	if forwardedHost := r.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
-		host = forwardedHost
-	}
-
-	originalURL := url.URL{
-		Scheme:   scheme,
-		Host:     host,
-		Path:     r.URL.Path,
-		RawQuery: r.URL.RawQuery,
+	originalURL := buildPublicRequestURL(r, authConfig, "")
+	if originalURL == nil {
+		originalURL = &url.URL{
+			Scheme:   requestScheme(r),
+			Host:     r.Host,
+			Path:     r.URL.Path,
+			RawQuery: r.URL.RawQuery,
+		}
 	}
 
-	loginURL := buildPublicAuthLoginURL(authConfig, host, &originalURL)
+	loginURL := buildPublicAuthLoginURL(authConfig, r, originalURL)
 	if loginURL == nil {
 		loginURL, _ = url.Parse("/__auth__/login")
 		q := loginURL.Query()
@@ -1737,38 +1737,14 @@ func mergeQueryValues(dst url.Values, src url.Values) {
 	}
 }
 
-func requestPortFromHost(host string) string {
-	if strings.TrimSpace(host) == "" {
-		return ""
-	}
-
-	parsed, err := url.Parse("//" + host)
-	if err != nil {
-		return ""
-	}
-
-	return parsed.Port()
-}
-
-func applyRequestPortToPublicAuthBase(baseURL *url.URL, requestHost string) {
+func applyRequestPortToPublicAuthBase(baseURL *url.URL, r *http.Request, authConfig models.AuthConfig) {
 	if baseURL == nil || baseURL.Host == "" || baseURL.Port() != "" {
 		return
 	}
 
-	requestPort := requestPortFromHost(requestHost)
-	if requestPort == "" {
+	requestPort := resolvedPublicPort(r, authConfig, baseURL.Scheme, "")
+	if requestPort == "" || requestPort == defaultPortForScheme(baseURL.Scheme) {
 		return
-	}
-
-	switch strings.ToLower(baseURL.Scheme) {
-	case "https":
-		if requestPort == "443" {
-			return
-		}
-	case "http":
-		if requestPort == "80" {
-			return
-		}
 	}
 
 	hostname := baseURL.Hostname()
@@ -1779,7 +1755,7 @@ func applyRequestPortToPublicAuthBase(baseURL *url.URL, requestHost string) {
 	baseURL.Host = net.JoinHostPort(hostname, requestPort)
 }
 
-func buildPublicAuthLoginURL(authConfig models.AuthConfig, requestHost string, originalURL *url.URL) *url.URL {
+func buildPublicAuthLoginURL(authConfig models.AuthConfig, r *http.Request, originalURL *url.URL) *url.URL {
 	if strings.TrimSpace(authConfig.PublicAuthBaseURL) == "" {
 		return nil
 	}
@@ -1788,7 +1764,7 @@ func buildPublicAuthLoginURL(authConfig models.AuthConfig, requestHost string, o
 	if err != nil {
 		return nil
 	}
-	applyRequestPortToPublicAuthBase(baseURL, requestHost)
+	applyRequestPortToPublicAuthBase(baseURL, r, authConfig)
 
 	loginPath := strings.TrimSpace(authConfig.LoginURL)
 	if loginPath == "" {
