@@ -562,32 +562,8 @@ func (h *Handler) checkSafeTarget(target string) error {
 	hostname := u.Hostname()
 	port := u.Port()
 
-	isInternal := false
-	if hostname == "localhost" {
-		isInternal = true
-	} else if ip := net.ParseIP(hostname); ip != nil {
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() {
-			isInternal = true
-		}
-	} else {
-		ips, err := net.LookupIP(hostname)
-		if err != nil {
-			return fmt.Errorf("failed to resolve target hostname: %v", err)
-		}
-
-		if len(ips) > 0 {
-			isInternal = true
-			for _, ip := range ips {
-				if !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast() {
-					isInternal = false
-					break
-				}
-			}
-		}
-	}
-
-	if !isInternal {
-		return fmt.Errorf("target must be an internal network address, external address not allowed: %s", hostname)
+	if hostname == "" {
+		return fmt.Errorf("target must include a valid hostname")
 	}
 
 	if hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1" {
