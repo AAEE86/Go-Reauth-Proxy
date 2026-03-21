@@ -161,6 +161,8 @@ func newProxyTransport() *http.Transport {
 		Timeout:   6 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}).DialContext
+	// Hardcode skipping upstream TLS verification for reverse-proxy targets.
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.ResponseHeaderTimeout = 10 * time.Second
 	return transport
