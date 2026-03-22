@@ -40,6 +40,9 @@ type listenerState struct {
 	listeners []net.Listener
 	stop      chan struct{}
 	wg        sync.WaitGroup
+	mu        sync.Mutex
+	conns     map[net.Conn]struct{}
+	closing   bool
 }
 
 type authVerifyPayload struct {
@@ -220,6 +223,7 @@ func newListenerState(port int, handler func(net.Conn, int)) (*listenerState, er
 		port:      port,
 		listeners: listeners,
 		stop:      make(chan struct{}),
+		conns:     make(map[net.Conn]struct{}),
 	}
 
 	for _, ln := range listeners {
@@ -255,15 +259,50 @@ func (s *listenerState) acceptLoop(ln net.Listener, handler func(net.Conn, int))
 			return
 		}
 
-		s.wg.Add(1)
+		if !s.beginConn(conn) {
+			_ = conn.Close()
+			return
+		}
 		go func() {
-			defer s.wg.Done()
+			defer s.endConn(conn)
 			handler(conn, s.port)
 		}()
 	}
 }
 
+func (s *listenerState) beginConn(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closing {
+		return false
+	}
+
+	s.wg.Add(1)
+	s.conns[conn] = struct{}{}
+	return true
+}
+
+func (s *listenerState) endConn(conn net.Conn) {
+	s.mu.Lock()
+	delete(s.conns, conn)
+	s.mu.Unlock()
+	s.wg.Done()
+}
+
 func (s *listenerState) close() {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.closing = true
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.mu.Unlock()
+
 	select {
 	case <-s.stop:
 	default:
@@ -272,6 +311,9 @@ func (s *listenerState) close() {
 
 	for _, ln := range s.listeners {
 		_ = ln.Close()
+	}
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 	s.wg.Wait()
 }
