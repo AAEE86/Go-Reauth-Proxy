@@ -33,10 +33,12 @@ type Handler struct {
 	mu                    sync.RWMutex
 	Rules                 []models.Rule
 	HostRules             []models.HostRule
+	StreamRules           []models.StreamRule
 	DefaultRoute          string
 	AuthConfig            models.AuthConfig
 	LoggingConfig         models.LoggingConfig
 	AdminPort             int
+	ProxyPort             int
 	ProxyProtocolForce    bool
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
@@ -123,6 +125,11 @@ func copyRule(rule models.Rule) *models.Rule {
 }
 
 func copyHostRule(rule models.HostRule) *models.HostRule {
+	r := rule
+	return &r
+}
+
+func copyStreamRule(rule models.StreamRule) *models.StreamRule {
 	r := rule
 	return &r
 }
@@ -302,7 +309,7 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 	panic(http.ErrAbortHandler)
 }
 
-func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string) *Handler {
+func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string) *Handler {
 	logConfig := gatewaylog.NormalizeConfig(initialCfg.Logging)
 	if strings.TrimSpace(logsDir) == "" {
 		logsDir = gatewaylog.DefaultLogsDir(".")
@@ -311,10 +318,12 @@ func NewHandler(adminPort int, cfgManager *config.Manager, initialCfg *config.Ap
 	h := &Handler{
 		Rules:              initialCfg.Rules,
 		HostRules:          initialCfg.HostRules,
+		StreamRules:        initialCfg.StreamRules,
 		DefaultRoute:       initialCfg.DefaultRoute,
 		AuthConfig:         initialCfg.AuthConfig,
 		LoggingConfig:      logConfig,
 		AdminPort:          adminPort,
+		ProxyPort:          proxyPort,
 		ProxyProtocolForce: initialCfg.ProxyProtocolForce,
 		configManager:      cfgManager,
 		sslConfig:          copySSLConfig(initialCfg.SSL),
@@ -391,10 +400,13 @@ func (h *Handler) saveConfigLocked() {
 	copy(rulesCopy, h.Rules)
 	hostRulesCopy := make([]models.HostRule, len(h.HostRules))
 	copy(hostRulesCopy, h.HostRules)
+	streamRulesCopy := make([]models.StreamRule, len(h.StreamRules))
+	copy(streamRulesCopy, h.StreamRules)
 
 	if err := h.configManager.Update(func(conf *config.AppConfig) error {
 		conf.Rules = rulesCopy
 		conf.HostRules = hostRulesCopy
+		conf.StreamRules = streamRulesCopy
 		conf.DefaultRoute = h.DefaultRoute
 		conf.AuthConfig = h.AuthConfig
 		conf.Logging = h.LoggingConfig
@@ -574,6 +586,86 @@ func (h *Handler) checkSafeTarget(target string) error {
 	return nil
 }
 
+func parseStreamTarget(target string) (string, int, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(target))
+	if err != nil {
+		return "", 0, fmt.Errorf("target must be in host:port format")
+	}
+
+	if strings.TrimSpace(host) == "" {
+		return "", 0, fmt.Errorf("target must include a valid hostname")
+	}
+
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum <= 0 || portNum > 65535 {
+		return "", 0, fmt.Errorf("target must include a valid port")
+	}
+
+	return host, portNum, nil
+}
+
+func isLoopbackOrUnspecifiedHost(host string) bool {
+	normalizedHost := strings.TrimSpace(strings.Trim(host, "[]"))
+	if normalizedHost == "" {
+		return false
+	}
+	if strings.EqualFold(normalizedHost, "localhost") {
+		return true
+	}
+
+	parsedIP := net.ParseIP(normalizedHost)
+	return parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsUnspecified())
+}
+
+func (h *Handler) reservedStreamPortName(port int) string {
+	switch {
+	case h.AdminPort > 0 && port == h.AdminPort:
+		return "admin API"
+	case h.ProxyPort > 0 && port == h.ProxyPort:
+		return "reverse proxy"
+	default:
+		return ""
+	}
+}
+
+func (h *Handler) checkSafeStreamTarget(target string) (string, int, error) {
+	host, portNum, err := parseStreamTarget(target)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if isLoopbackOrUnspecifiedHost(host) {
+		if portNum == h.AdminPort {
+			return "", 0, fmt.Errorf("cannot target local admin port %d", h.AdminPort)
+		}
+	}
+
+	return host, portNum, nil
+}
+
+func (h *Handler) normalizeStreamRule(newRule models.StreamRule) (models.StreamRule, error) {
+	newRule.Target = strings.TrimSpace(newRule.Target)
+
+	if newRule.ListenPort <= 0 || newRule.ListenPort > 65535 {
+		return models.StreamRule{}, fmt.Errorf("listen_port must be between 1 and 65535")
+	}
+	if reservedName := h.reservedStreamPortName(newRule.ListenPort); reservedName != "" {
+		return models.StreamRule{}, fmt.Errorf("listen_port %d is reserved for the %s", newRule.ListenPort, reservedName)
+	}
+	if newRule.Target == "" {
+		return models.StreamRule{}, fmt.Errorf("cannot add stream rule with empty target")
+	}
+	targetHost, targetPort, err := h.checkSafeStreamTarget(newRule.Target)
+	if err != nil {
+		return models.StreamRule{}, fmt.Errorf("invalid target: %v", err)
+	}
+	if newRule.ListenPort == targetPort && isLoopbackOrUnspecifiedHost(targetHost) {
+		return models.StreamRule{}, fmt.Errorf("cannot target the same local listen_port %d", newRule.ListenPort)
+	}
+
+	return newRule, nil
+}
+
 func (h *Handler) RemoveRule(path string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -655,6 +747,56 @@ func (h *Handler) GetHostRules() []models.HostRule {
 
 	rules := make([]models.HostRule, len(h.HostRules))
 	copy(rules, h.HostRules)
+	return rules
+}
+
+func (h *Handler) ValidateStreamRules(rules []models.StreamRule) ([]models.StreamRule, error) {
+	normalized := make([]models.StreamRule, 0, len(rules))
+	seenPorts := make(map[int]struct{}, len(rules))
+
+	for _, rule := range rules {
+		nextRule, err := h.normalizeStreamRule(rule)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seenPorts[nextRule.ListenPort]; exists {
+			return nil, fmt.Errorf("duplicate listen_port: %d", nextRule.ListenPort)
+		}
+		seenPorts[nextRule.ListenPort] = struct{}{}
+		normalized = append(normalized, nextRule)
+	}
+
+	return normalized, nil
+}
+
+func (h *Handler) SetStreamRules(rules []models.StreamRule) error {
+	normalized, err := h.ValidateStreamRules(rules)
+	if err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.StreamRules = normalized
+	h.saveConfigLocked()
+	return nil
+}
+
+func (h *Handler) FlushStreamRules() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.StreamRules = make([]models.StreamRule, 0)
+	h.saveConfigLocked()
+}
+
+func (h *Handler) GetStreamRules() []models.StreamRule {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	rules := make([]models.StreamRule, len(h.StreamRules))
+	copy(rules, h.StreamRules)
 	return rules
 }
 
@@ -784,6 +926,24 @@ func (h *Handler) GetTrafficStats(timestamp time.Time) TrafficStats {
 	}
 }
 
+func (h *Handler) AddStreamTraffic(bytesIn, bytesOut uint64, status int) {
+	if bytesIn > 0 {
+		atomic.AddUint64(&h.trafficTotalIn, bytesIn)
+	}
+	if bytesOut > 0 {
+		atomic.AddUint64(&h.trafficTotalOut, bytesOut)
+	}
+	if status >= 500 {
+		atomic.AddUint64(&h.trafficError5xx, 1)
+	}
+}
+
+func (h *Handler) LogGatewayEntry(entry gatewaylog.Entry) {
+	if h.gatewayLogManager != nil {
+		h.gatewayLogManager.Log(entry)
+	}
+}
+
 const loggedInActiveWindow = 2 * time.Minute
 
 func canonicalCookieIdentity(r *http.Request) string {
@@ -840,16 +1000,38 @@ func activeIdentityKey(r *http.Request, clientIP string) string {
 		return ""
 	}
 
+	return activeIdentityKeyFromSource(src)
+}
+
+func activeIdentityKeyFromSource(src string) string {
+	if strings.TrimSpace(src) == "" {
+		return ""
+	}
 	sum := sha256.Sum256([]byte(src))
 	return hex.EncodeToString(sum[:])
 }
 
-func (h *Handler) markLoggedInActive(r *http.Request, clientIP string, now time.Time) {
-	key := activeIdentityKey(r, clientIP)
+func activeIdentityKeyFromClientIP(clientIP string) string {
+	clientIP = strings.TrimSpace(clientIP)
+	if clientIP == "" {
+		return ""
+	}
+	return activeIdentityKeyFromSource("ip:" + clientIP)
+}
+
+func (h *Handler) storeLoggedInActive(key string, now time.Time) {
 	if key == "" {
 		return
 	}
 	h.loggedInActive.Store(key, now.UnixNano())
+}
+
+func (h *Handler) markLoggedInActive(r *http.Request, clientIP string, now time.Time) {
+	h.storeLoggedInActive(activeIdentityKey(r, clientIP), now)
+}
+
+func (h *Handler) MarkLoggedInActiveByClientIP(clientIP string, now time.Time) {
+	h.storeLoggedInActive(activeIdentityKeyFromClientIP(clientIP), now)
 }
 
 func (h *Handler) activeLoggedInCount(now time.Time) int64 {

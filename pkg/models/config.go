@@ -18,6 +18,12 @@ type HostRule struct {
 	PreserveHost    bool   `json:"preserve_host,omitempty" example:"true"`
 }
 
+type StreamRule struct {
+	ListenPort int    `json:"listen_port" example:"3306"`
+	Target     string `json:"target" example:"127.0.0.1:3306"`
+	UseAuth    bool   `json:"use_auth" example:"true"`
+}
+
 type AuthConfig struct {
 	AuthPort          int    `json:"auth_port" example:"3000"`                    // Local Auth Service Port
 	AuthURL           string `json:"auth_url" example:"/api/auth/verify"`         // Relative Verify URL (default /api/auth/verify)

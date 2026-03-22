@@ -10,6 +10,7 @@ import (
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/proxy"
 	"go-reauth-proxy/pkg/response"
+	"go-reauth-proxy/pkg/stream"
 	"go-reauth-proxy/pkg/version"
 	"io"
 	"log"
@@ -25,6 +26,7 @@ import (
 type Server struct {
 	ProxyHandler    *proxy.Handler
 	IptablesHandler *iptables.Handler
+	StreamManager   *stream.Manager
 	ConfigManager   *config.Manager
 	Port            int
 }
@@ -33,7 +35,7 @@ type ServerInfo struct {
 	Version string `json:"version" example:"0.0.1"`
 }
 
-func NewServer(handler *proxy.Handler, port int, cfgManager *config.Manager, initialCfg *config.AppConfig) *Server {
+func NewServer(handler *proxy.Handler, port int, cfgManager *config.Manager, initialCfg *config.AppConfig, streamManager *stream.Manager) *Server {
 	iptablesChainName := "REAUTH_FW"
 	if initialCfg != nil && initialCfg.IptablesChainName != "" {
 		iptablesChainName = initialCfg.IptablesChainName
@@ -48,6 +50,7 @@ func NewServer(handler *proxy.Handler, port int, cfgManager *config.Manager, ini
 	return &Server{
 		ProxyHandler:    handler,
 		IptablesHandler: iptablesHandler,
+		StreamManager:   streamManager,
 		ConfigManager:   cfgManager,
 		Port:            port,
 	}
@@ -62,6 +65,9 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/host-rules", s.handleGetHostRules).Methods("GET")
 	r.HandleFunc("/api/host-rules", s.handleAddHostRule).Methods("POST")
 	r.HandleFunc("/api/host-rules", s.handleFlushHostRules).Methods("DELETE")
+	r.HandleFunc("/api/stream-rules", s.handleGetStreamRules).Methods("GET")
+	r.HandleFunc("/api/stream-rules", s.handleSetStreamRules).Methods("POST")
+	r.HandleFunc("/api/stream-rules", s.handleFlushStreamRules).Methods("DELETE")
 	r.HandleFunc("/api/info", s.handleInfo).Methods("GET")
 	r.HandleFunc("/api/traffic", s.handleTraffic).Methods("GET")
 	r.HandleFunc("/api/config/default-route", s.handleGetDefaultRoute).Methods("GET")
@@ -260,6 +266,72 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleFlushHostRules(w http.ResponseWriter, r *http.Request) {
 	s.ProxyHandler.FlushHostRules()
+	response.Success(w, nil)
+}
+
+func (s *Server) handleGetStreamRules(w http.ResponseWriter, r *http.Request) {
+	rules := s.ProxyHandler.GetStreamRules()
+	response.Success(w, rules)
+}
+
+func (s *Server) handleSetStreamRules(w http.ResponseWriter, r *http.Request) {
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		response.Error(w, errors.CodeReadBodyFailed, "Failed to read request body")
+		return
+	}
+	r.Body.Close()
+
+	type streamRuleRequest struct {
+		ListenPort int    `json:"listen_port"`
+		Target     string `json:"target"`
+		UseAuth    *bool  `json:"use_auth"`
+	}
+
+	var reqs []streamRuleRequest
+	if err := json.Unmarshal(bodyBytes, &reqs); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON array: "+err.Error())
+		return
+	}
+
+	nextRules := make([]models.StreamRule, 0, len(reqs))
+	for _, req := range reqs {
+		nextRules = append(nextRules, models.StreamRule{
+			ListenPort: req.ListenPort,
+			Target:     req.Target,
+			UseAuth:    req.UseAuth == nil || *req.UseAuth,
+		})
+	}
+
+	normalizedRules, err := s.ProxyHandler.ValidateStreamRules(nextRules)
+	if err != nil {
+		response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to set stream rules: %v", err))
+		return
+	}
+
+	if s.StreamManager != nil {
+		if err := s.StreamManager.Reconcile(normalizedRules); err != nil {
+			response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to reconcile stream listeners: %v", err))
+			return
+		}
+	}
+
+	if err := s.ProxyHandler.SetStreamRules(normalizedRules); err != nil {
+		response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to persist stream rules: %v", err))
+		return
+	}
+
+	response.Success(w, s.ProxyHandler.GetStreamRules())
+}
+
+func (s *Server) handleFlushStreamRules(w http.ResponseWriter, r *http.Request) {
+	s.ProxyHandler.FlushStreamRules()
+	if s.StreamManager != nil {
+		if err := s.StreamManager.Reconcile(nil); err != nil {
+			response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to flush stream listeners: %v", err))
+			return
+		}
+	}
 	response.Success(w, nil)
 }
 

@@ -10,6 +10,7 @@ import (
 	"go-reauth-proxy/pkg/gatewaylog"
 	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/proxy"
+	"go-reauth-proxy/pkg/stream"
 	"log"
 	"net"
 	"net/http"
@@ -301,12 +302,24 @@ func main() {
 		}
 	}
 
-	proxyHandler := proxy.NewHandler(resolvedAdminPort, cfgManager, initialCfg, logsDir)
+	proxyHandler := proxy.NewHandler(resolvedAdminPort, *proxyPort, cfgManager, initialCfg, logsDir)
+	normalizedStreamRules, err := proxyHandler.ValidateStreamRules(proxyHandler.GetStreamRules())
+	if err != nil {
+		log.Fatalf("Failed to validate stream rules: %v", err)
+	}
+	if err := proxyHandler.SetStreamRules(normalizedStreamRules); err != nil {
+		log.Fatalf("Failed to initialize stream rules: %v", err)
+	}
 
 	currentConfig := proxyHandler.GetAuthConfig()
 	proxyHandler.SetAuthConfig(currentConfig)
 
-	adminServer := admin.NewServer(proxyHandler, resolvedAdminPort, cfgManager, initialCfg)
+	streamManager := stream.NewManager(proxyHandler)
+	if err := streamManager.Reconcile(normalizedStreamRules); err != nil {
+		log.Fatalf("Failed to start stream manager: %v", err)
+	}
+
+	adminServer := admin.NewServer(proxyHandler, resolvedAdminPort, cfgManager, initialCfg, streamManager)
 	go func() {
 		if err := adminServer.Start(); err != nil {
 			log.Fatalf("Admin server failed: %v", err)
@@ -397,5 +410,6 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down...")
+	streamManager.Stop()
 	proxyStack.Stop()
 }
