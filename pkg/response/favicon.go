@@ -14,7 +14,6 @@ var faviconFS embed.FS
 
 // faviconFiles maps URL paths to embedded file paths
 var faviconFiles = map[string]string{
-	"/favicon.ico":                "static/favicon/favicon.ico",
 	"/favicon-16x16.png":          "static/favicon/favicon-16x16.png",
 	"/favicon-32x32.png":          "static/favicon/favicon-32x32.png",
 	"/apple-touch-icon.png":       "static/favicon/apple-touch-icon.png",
