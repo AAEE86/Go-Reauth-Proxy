@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -75,9 +76,14 @@ func NewManager(handler *proxy.Handler) *Manager {
 }
 
 func (m *Manager) Reconcile(rules []models.StreamRule) error {
-	nextRules := make(map[int]models.StreamRule, len(rules))
-	nextPorts := make([]int, 0, len(rules))
-	for _, rule := range rules {
+	normalizedRules, err := m.normalizeRules(rules)
+	if err != nil {
+		return err
+	}
+
+	nextRules := make(map[int]models.StreamRule, len(normalizedRules))
+	nextPorts := make([]int, 0, len(normalizedRules))
+	for _, rule := range normalizedRules {
 		if _, exists := nextRules[rule.ListenPort]; exists {
 			return fmt.Errorf("duplicate listen_port: %d", rule.ListenPort)
 		}
@@ -208,6 +214,9 @@ func newListenerState(port int, handler func(net.Conn, int)) (*listenerState, er
 			}
 			for _, existing := range listeners {
 				_ = existing.Close()
+			}
+			if isAddrInUseErr(err) {
+				return nil, fmt.Errorf("listen_port %d is already in use", port)
 			}
 			return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
 		}
@@ -582,4 +591,116 @@ func isTimeoutErr(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func (m *Manager) normalizeRules(rules []models.StreamRule) ([]models.StreamRule, error) {
+	normalized := make([]models.StreamRule, 0, len(rules))
+	seenPorts := make(map[int]struct{}, len(rules))
+
+	for _, rule := range rules {
+		nextRule, err := m.normalizeRule(rule)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := seenPorts[nextRule.ListenPort]; exists {
+			return nil, fmt.Errorf("duplicate listen_port: %d", nextRule.ListenPort)
+		}
+		seenPorts[nextRule.ListenPort] = struct{}{}
+		normalized = append(normalized, nextRule)
+	}
+
+	return normalized, nil
+}
+
+func (m *Manager) normalizeRule(rule models.StreamRule) (models.StreamRule, error) {
+	rule.Target = strings.TrimSpace(rule.Target)
+
+	if rule.ListenPort <= 0 || rule.ListenPort > 65535 {
+		return models.StreamRule{}, fmt.Errorf("listen_port must be between 1 and 65535")
+	}
+	if reservedName := m.reservedPortName(rule.ListenPort); reservedName != "" {
+		return models.StreamRule{}, fmt.Errorf("listen_port %d is reserved for the %s", rule.ListenPort, reservedName)
+	}
+	if rule.Target == "" {
+		return models.StreamRule{}, fmt.Errorf("target cannot be empty")
+	}
+
+	targetHost, targetPort, err := parseStreamTarget(rule.Target)
+	if err != nil {
+		return models.StreamRule{}, fmt.Errorf("invalid target: %v", err)
+	}
+
+	if isLoopbackOrUnspecifiedHost(targetHost) {
+		if adminPort := m.adminPort(); adminPort > 0 && targetPort == adminPort {
+			return models.StreamRule{}, fmt.Errorf("invalid target: cannot target local admin port %d", adminPort)
+		}
+		if rule.ListenPort == targetPort {
+			return models.StreamRule{}, fmt.Errorf("listen_port %d cannot target the same local address %s", rule.ListenPort, rule.Target)
+		}
+	}
+
+	return rule, nil
+}
+
+func (m *Manager) reservedPortName(port int) string {
+	if m == nil || m.handler == nil {
+		return ""
+	}
+
+	switch {
+	case m.handler.AdminPort > 0 && port == m.handler.AdminPort:
+		return "admin API"
+	case m.handler.ProxyPort > 0 && port == m.handler.ProxyPort:
+		return "reverse proxy"
+	default:
+		return ""
+	}
+}
+
+func (m *Manager) adminPort() int {
+	if m == nil || m.handler == nil {
+		return 0
+	}
+	return m.handler.AdminPort
+}
+
+func parseStreamTarget(target string) (string, int, error) {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(target))
+	if err != nil {
+		return "", 0, fmt.Errorf("target must be in host:port format")
+	}
+
+	if strings.TrimSpace(host) == "" {
+		return "", 0, fmt.Errorf("target must include a valid hostname")
+	}
+
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum <= 0 || portNum > 65535 {
+		return "", 0, fmt.Errorf("target must include a valid port")
+	}
+
+	return host, portNum, nil
+}
+
+func isLoopbackOrUnspecifiedHost(host string) bool {
+	normalizedHost := strings.TrimSpace(strings.Trim(host, "[]"))
+	if normalizedHost == "" {
+		return false
+	}
+	if strings.EqualFold(normalizedHost, "localhost") {
+		return true
+	}
+
+	parsedIP := net.ParseIP(normalizedHost)
+	return parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsUnspecified())
+}
+
+func isAddrInUseErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
 }
