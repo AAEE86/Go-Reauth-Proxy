@@ -1356,10 +1356,10 @@ func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snap
 		if !authResult.allowed {
 			return authResult
 		}
-		response.SelectPage(w, snapshot.rules, snapshot.hostRules)
+		response.SelectPage(w, r, snapshot.rules, snapshot.hostRules)
 		return authResult
 	}
-	response.SelectPage(w, snapshot.rules, snapshot.hostRules)
+	response.SelectPage(w, r, snapshot.rules, snapshot.hostRules)
 	return authCheckResult{allowed: true, decision: "not_required"}
 }
 
@@ -1369,7 +1369,7 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 	}
 
 	if snapshot.authConfig.AuthPort <= 0 {
-		response.HTML(w, errors.CodeInternal, "Authentication service is not configured", nil)
+		response.HTML(w, r, errors.CodeInternal, "Authentication service is not configured", nil)
 		return true
 	}
 	targetURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", snapshot.authConfig.AuthPort))
@@ -1528,19 +1528,19 @@ func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
 func (h *Handler) handleNoMatchRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) {
 	if r.URL.Path == "/" {
 		if len(snapshot.rules) == 0 {
-			response.Welcome(w, nil)
+			response.Welcome(w, r, nil)
 			return
 		}
 		http.Redirect(w, r, "/__select__", http.StatusFound)
 		return
 	}
-	response.HTML(w, errors.CodeNotFound, "Not Found", snapshot.rules)
+	response.HTML(w, r, errors.CodeNotFound, "Not Found", snapshot.rules)
 }
 
 func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult) {
 	targetURL, err := url.Parse(matchedRule.Target)
 	if err != nil {
-		response.HTML(w, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
+		response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
 		return
 	}
 
@@ -1555,6 +1555,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	if transport == nil {
 		transport = newProxyTransport()
 	}
+	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -1586,18 +1587,18 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar {
+			if matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Host proxy error: %v", err)
-			response.HTML(w, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
+			response.HTML(w, r, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
 		},
 	}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		needsToolbar := matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar
+		needsToolbar := matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 		if !needsToolbar {
 			return nil
 		}
@@ -1637,7 +1638,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.Rule, clientIP string, authResult authCheckResult) {
 	targetURL, err := url.Parse(matchedRule.Target)
 	if err != nil {
-		response.HTML(w, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
+		response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
 		return
 	}
 
@@ -1652,6 +1653,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	if transport == nil {
 		transport = newProxyTransport()
 	}
+	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -1694,13 +1696,13 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.RewriteHTML || matchedRule.UseAuth {
+			if matchedRule.RewriteHTML || (matchedRule.UseAuth && !authResult.suppressToolbar && !suppressToolbarForUA) {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Proxy error: %v", err)
-			response.HTML(w, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
+			response.HTML(w, r, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
 		},
 	}
 
@@ -1713,7 +1715,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		resp.Header.Add("Set-Cookie", cookie.String())
 
 		needsRewrite := matchedRule.RewriteHTML && !matchedRule.UseRootMode
-		needsToolbar := matchedRule.UseAuth && !authResult.suppressToolbar
+		needsToolbar := matchedRule.UseAuth && !authResult.suppressToolbar && !suppressToolbarForUA
 		if !needsRewrite && !needsToolbar {
 			return nil
 		}
@@ -1804,7 +1806,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	if authConfig.AuthPort <= 0 {
 		log.Printf("Auth check requested but AuthPort is not configured")
-		response.HTML(w, errors.CodeInternal, "Authentication Service Not Configured", nil)
+		response.HTML(w, r, errors.CodeInternal, "Authentication Service Not Configured", nil)
 		return authCheckResult{decision: "error"}
 	}
 
@@ -1817,7 +1819,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	authReq, err := http.NewRequest("GET", authURL, nil)
 	if err != nil {
 		log.Printf("Failed to create auth request: %v", err)
-		response.HTML(w, errors.CodeInternal, "Internal Server Error during Auth", nil)
+		response.HTML(w, r, errors.CodeInternal, "Internal Server Error during Auth", nil)
 		return authCheckResult{decision: "error"}
 	}
 
@@ -1842,7 +1844,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	resp, err := client.Do(authReq)
 	if err != nil {
 		log.Printf("Auth request failed: %v", err)
-		response.HTML(w, errors.CodeProxyAuthFailed, "Authentication Service Unavailable", nil)
+		response.HTML(w, r, errors.CodeProxyAuthFailed, "Authentication Service Unavailable", nil)
 		return authCheckResult{decision: "error"}
 	}
 	defer resp.Body.Close()
@@ -1857,7 +1859,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	if err := json.NewDecoder(resp.Body).Decode(&authResponse); err != nil {
 		log.Printf("Failed to decode auth response: %v", err)
-		response.HTML(w, errors.CodeInternal, "Invalid Auth Response Format", nil)
+		response.HTML(w, r, errors.CodeInternal, "Invalid Auth Response Format", nil)
 		return authCheckResult{decision: "error"}
 	}
 	if authResponse.Success {

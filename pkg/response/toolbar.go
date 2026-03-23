@@ -661,6 +661,15 @@ var toolbarFuncMap = template.FuncMap{
 
 var toolbarTmpl = template.Must(template.New("toolbar").Funcs(toolbarFuncMap).Parse(toolbarTemplate))
 
+func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(userAgent))
+	if normalized == "" {
+		return false
+	}
+
+	return strings.Contains(normalized, "com.trim.app")
+}
+
 func GenerateToolbar(rules []models.Rule, currentPath string) string {
 	return GenerateToolbarWithHosts(rules, nil, currentPath, "", "")
 }

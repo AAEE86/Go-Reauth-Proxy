@@ -405,11 +405,19 @@ var selectTmpl = template.Must(
 		Parse(baseTemplate + selectContent),
 )
 
-func SelectPage(w http.ResponseWriter, rules []models.Rule, hostRules []models.HostRule) {
+func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hostRules []models.HostRule) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
-	toolbarHTML := GenerateToolbarWithHosts(rules, hostRules, "/__select__", "", "")
+	userAgent := ""
+	if r != nil {
+		userAgent = r.UserAgent()
+	}
+
+	toolbarHTML := ""
+	if !ShouldSuppressToolbarForUserAgent(userAgent) {
+		toolbarHTML = GenerateToolbarWithHosts(rules, hostRules, "/__select__", "", "")
+	}
 
 	data := pageData{
 		Title:       "Select Route",

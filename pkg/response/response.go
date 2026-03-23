@@ -126,14 +126,19 @@ var errorTmpl = template.Must(
 		Parse(baseTemplate + footerTemplate + errorContent),
 )
 
-func HTML(w http.ResponseWriter, code int, message string, rules []models.Rule) {
+func HTML(w http.ResponseWriter, r *http.Request, code int, message string, rules []models.Rule) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	httpStatus := mapHTTPStatus(code)
 	w.WriteHeader(httpStatus)
 
+	userAgent := ""
+	if r != nil {
+		userAgent = r.UserAgent()
+	}
+
 	var toolbarHTML template.HTML
-	if len(rules) > 0 {
+	if len(rules) > 0 && !ShouldSuppressToolbarForUserAgent(userAgent) {
 		toolbarHTML = template.HTML(GenerateToolbar(rules, ""))
 	}
 
@@ -150,12 +155,17 @@ func HTML(w http.ResponseWriter, code int, message string, rules []models.Rule) 
 	_ = errorTmpl.ExecuteTemplate(w, "layout", data)
 }
 
-func Welcome(w http.ResponseWriter, rules []models.Rule) {
+func Welcome(w http.ResponseWriter, r *http.Request, rules []models.Rule) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
+	userAgent := ""
+	if r != nil {
+		userAgent = r.UserAgent()
+	}
+
 	var toolbarHTML template.HTML
-	if len(rules) > 0 {
+	if len(rules) > 0 && !ShouldSuppressToolbarForUserAgent(userAgent) {
 		toolbarHTML = template.HTML(GenerateToolbar(rules, ""))
 	}
 
