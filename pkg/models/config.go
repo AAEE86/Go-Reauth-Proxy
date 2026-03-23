@@ -18,7 +18,13 @@ type HostRule struct {
 	PreserveHost    bool   `json:"preserve_host,omitempty" example:"true"`
 }
 
+const (
+	StreamProtocolTCP = "tcp"
+	StreamProtocolUDP = "udp"
+)
+
 type StreamRule struct {
+	Protocol   string `json:"protocol" example:"tcp"`
 	ListenPort int    `json:"listen_port" example:"3306"`
 	Target     string `json:"target" example:"127.0.0.1:3306"`
 	UseAuth    bool   `json:"use_auth" example:"true"`

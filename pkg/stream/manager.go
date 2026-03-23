@@ -21,29 +21,66 @@ import (
 )
 
 const (
-	streamAuthTimeout   = 2 * time.Second
-	streamDialTimeout   = 5 * time.Second
-	streamAcceptBackoff = 150 * time.Millisecond
-	maxAuthBodyBytes    = 1 << 20
+	streamAuthTimeout     = 2 * time.Second
+	streamDialTimeout     = 5 * time.Second
+	streamAcceptBackoff   = 150 * time.Millisecond
+	udpSessionIdleTimeout = 2 * time.Minute
+	maxAuthBodyBytes      = 1 << 20
+	udpPacketBufferSize   = 64 * 1024
 )
 
 type Manager struct {
 	mu         sync.RWMutex
 	handler    *proxy.Handler
-	listeners  map[int]*listenerState
-	rules      map[int]models.StreamRule
+	listeners  map[streamRuleKey]managedListener
+	rules      map[streamRuleKey]models.StreamRule
 	authClient *http.Client
 	closed     bool
 }
 
-type listenerState struct {
-	port      int
+type streamRuleKey struct {
+	Protocol   string
+	ListenPort int
+}
+
+func (k streamRuleKey) String() string {
+	return k.Protocol + "/" + strconv.Itoa(k.ListenPort)
+}
+
+type managedListener interface {
+	close()
+}
+
+type tcpListenerState struct {
+	key       streamRuleKey
 	listeners []net.Listener
 	stop      chan struct{}
 	wg        sync.WaitGroup
 	mu        sync.Mutex
 	conns     map[net.Conn]struct{}
 	closing   bool
+}
+
+type udpListenerState struct {
+	key         streamRuleKey
+	packetConns []net.PacketConn
+	stop        chan struct{}
+	wg          sync.WaitGroup
+	mu          sync.Mutex
+	sessions    map[string]*udpSession
+	closing     bool
+}
+
+type udpSession struct {
+	id         string
+	packetConn net.PacketConn
+	clientAddr net.Addr
+	upstream   net.Conn
+	start      time.Time
+
+	closeOnce sync.Once
+	mu        sync.Mutex
+	entry     gatewaylog.Entry
 }
 
 type authVerifyPayload struct {
@@ -66,8 +103,8 @@ func NewManager(handler *proxy.Handler) *Manager {
 
 	return &Manager{
 		handler:   handler,
-		listeners: make(map[int]*listenerState),
-		rules:     make(map[int]models.StreamRule),
+		listeners: make(map[streamRuleKey]managedListener),
+		rules:     make(map[streamRuleKey]models.StreamRule),
 		authClient: &http.Client{
 			Timeout:   streamAuthTimeout,
 			Transport: transport,
@@ -81,58 +118,59 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 		return err
 	}
 
-	nextRules := make(map[int]models.StreamRule, len(normalizedRules))
-	nextPorts := make([]int, 0, len(normalizedRules))
+	nextRules := make(map[streamRuleKey]models.StreamRule, len(normalizedRules))
+	nextKeys := make([]streamRuleKey, 0, len(normalizedRules))
 	for _, rule := range normalizedRules {
-		if _, exists := nextRules[rule.ListenPort]; exists {
-			return fmt.Errorf("duplicate listen_port: %d", rule.ListenPort)
+		key := streamRuleKeyFromRule(rule)
+		if _, exists := nextRules[key]; exists {
+			return fmt.Errorf("duplicate stream rule for %s", key.String())
 		}
-		nextRules[rule.ListenPort] = rule
-		nextPorts = append(nextPorts, rule.ListenPort)
+		nextRules[key] = rule
+		nextKeys = append(nextKeys, key)
 	}
-	slices.Sort(nextPorts)
+	slices.SortFunc(nextKeys, compareStreamRuleKeys)
 
 	m.mu.RLock()
 	if m.closed {
 		m.mu.RUnlock()
 		return fmt.Errorf("stream manager is closed")
 	}
-	currentPorts := make([]int, 0, len(m.listeners))
-	for port := range m.listeners {
-		currentPorts = append(currentPorts, port)
+	currentKeys := make([]streamRuleKey, 0, len(m.listeners))
+	for key := range m.listeners {
+		currentKeys = append(currentKeys, key)
 	}
 	m.mu.RUnlock()
-	slices.Sort(currentPorts)
+	slices.SortFunc(currentKeys, compareStreamRuleKeys)
 
-	currentSet := make(map[int]struct{}, len(currentPorts))
-	for _, port := range currentPorts {
-		currentSet[port] = struct{}{}
+	currentSet := make(map[streamRuleKey]struct{}, len(currentKeys))
+	for _, key := range currentKeys {
+		currentSet[key] = struct{}{}
 	}
 
-	toAdd := make([]int, 0)
-	for _, port := range nextPorts {
-		if _, exists := currentSet[port]; !exists {
-			toAdd = append(toAdd, port)
+	toAdd := make([]streamRuleKey, 0)
+	for _, key := range nextKeys {
+		if _, exists := currentSet[key]; !exists {
+			toAdd = append(toAdd, key)
 		}
-		delete(currentSet, port)
+		delete(currentSet, key)
 	}
 
-	toRemove := make([]int, 0, len(currentSet))
-	for port := range currentSet {
-		toRemove = append(toRemove, port)
+	toRemove := make([]streamRuleKey, 0, len(currentSet))
+	for key := range currentSet {
+		toRemove = append(toRemove, key)
 	}
-	slices.Sort(toRemove)
+	slices.SortFunc(toRemove, compareStreamRuleKeys)
 
-	created := make(map[int]*listenerState, len(toAdd))
-	for _, port := range toAdd {
-		state, err := newListenerState(port, m.handleConn)
+	created := make(map[streamRuleKey]managedListener, len(toAdd))
+	for _, key := range toAdd {
+		state, err := m.newManagedListener(key)
 		if err != nil {
 			for _, candidate := range created {
 				candidate.close()
 			}
 			return err
 		}
-		created[port] = state
+		created[key] = state
 	}
 
 	m.mu.Lock()
@@ -144,16 +182,16 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 		return fmt.Errorf("stream manager is closed")
 	}
 
-	for port, state := range created {
-		m.listeners[port] = state
+	for key, state := range created {
+		m.listeners[key] = state
 	}
 	m.rules = nextRules
 
-	removed := make([]*listenerState, 0, len(toRemove))
-	for _, port := range toRemove {
-		if state, exists := m.listeners[port]; exists {
+	removed := make([]managedListener, 0, len(toRemove))
+	for _, key := range toRemove {
+		if state, exists := m.listeners[key]; exists {
 			removed = append(removed, state)
-			delete(m.listeners, port)
+			delete(m.listeners, key)
 		}
 	}
 	m.mu.Unlock()
@@ -172,12 +210,13 @@ func (m *Manager) ReconcileBestEffort(rules []models.StreamRule) ([]models.Strea
 	for _, rule := range rules {
 		nextRule, err := m.normalizeRule(rule)
 		if err != nil {
-			warnings = append(warnings, fmt.Errorf("skipping stream rule %d -> %s: %w", rule.ListenPort, strings.TrimSpace(rule.Target), err))
+			key := streamRuleKey{Protocol: fallbackStreamProtocol(rule.Protocol), ListenPort: rule.ListenPort}
+			warnings = append(warnings, fmt.Errorf("skipping stream rule %s -> %s: %w", key.String(), strings.TrimSpace(rule.Target), err))
 			continue
 		}
 
 		if err := m.Reconcile(append(startedRules, nextRule)); err != nil {
-			warnings = append(warnings, fmt.Errorf("skipping stream rule %d -> %s: %w", nextRule.ListenPort, nextRule.Target, err))
+			warnings = append(warnings, fmt.Errorf("skipping stream rule %s -> %s: %w", streamRuleKeyFromRule(nextRule).String(), nextRule.Target, err))
 			continue
 		}
 		startedRules = append(startedRules, nextRule)
@@ -194,12 +233,12 @@ func (m *Manager) Stop() {
 	}
 	m.closed = true
 
-	states := make([]*listenerState, 0, len(m.listeners))
-	for port, state := range m.listeners {
+	states := make([]managedListener, 0, len(m.listeners))
+	for key, state := range m.listeners {
 		states = append(states, state)
-		delete(m.listeners, port)
+		delete(m.listeners, key)
 	}
-	m.rules = map[int]models.StreamRule{}
+	m.rules = map[streamRuleKey]models.StreamRule{}
 	m.mu.Unlock()
 
 	for _, state := range states {
@@ -207,15 +246,26 @@ func (m *Manager) Stop() {
 	}
 }
 
-func (m *Manager) currentRule(port int) (models.StreamRule, bool) {
+func (m *Manager) currentRule(key streamRuleKey) (models.StreamRule, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	rule, ok := m.rules[port]
+	rule, ok := m.rules[key]
 	return rule, ok
 }
 
-func newListenerState(port int, handler func(net.Conn, int)) (*listenerState, error) {
+func (m *Manager) newManagedListener(key streamRuleKey) (managedListener, error) {
+	switch key.Protocol {
+	case models.StreamProtocolTCP:
+		return newTCPListenerState(key, m.handleConn)
+	case models.StreamProtocolUDP:
+		return newUDPListenerState(key, m.handleUDPPacket)
+	default:
+		return nil, fmt.Errorf("unsupported stream protocol %q", key.Protocol)
+	}
+}
+
+func newTCPListenerState(key streamRuleKey, handler func(net.Conn, streamRuleKey)) (*tcpListenerState, error) {
 	hosts := []string{"0.0.0.0", "::"}
 	listeners := make([]net.Listener, 0, len(hosts))
 	listenAddrs := make([]string, 0, len(hosts))
@@ -226,31 +276,31 @@ func newListenerState(port int, handler func(net.Conn, int)) (*listenerState, er
 			network = "tcp6"
 		}
 
-		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		addr := net.JoinHostPort(host, strconv.Itoa(key.ListenPort))
 		ln, err := net.Listen(network, addr)
 		if err != nil {
 			if network == "tcp6" {
-				log.Printf("Stream IPv6 listener unavailable on %s: %v", addr, err)
+				log.Printf("Stream IPv6 listener unavailable on %s for %s: %v", addr, key.String(), err)
 				continue
 			}
 			for _, existing := range listeners {
 				_ = existing.Close()
 			}
 			if isAddrInUseErr(err) {
-				return nil, fmt.Errorf("listen_port %d is already in use", port)
+				return nil, fmt.Errorf("listen_port %d for %s is already in use", key.ListenPort, key.Protocol)
 			}
-			return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
+			return nil, fmt.Errorf("failed to listen on %s for %s: %w", addr, key.String(), err)
 		}
 		listeners = append(listeners, ln)
 		listenAddrs = append(listenAddrs, ln.Addr().String())
 	}
 
 	if len(listeners) == 0 {
-		return nil, fmt.Errorf("no stream listeners started for port %d", port)
+		return nil, fmt.Errorf("no stream listeners started for %s", key.String())
 	}
 
-	state := &listenerState{
-		port:      port,
+	state := &tcpListenerState{
+		key:       key,
 		listeners: listeners,
 		stop:      make(chan struct{}),
 		conns:     make(map[net.Conn]struct{}),
@@ -261,11 +311,11 @@ func newListenerState(port int, handler func(net.Conn, int)) (*listenerState, er
 		go state.acceptLoop(ln, handler)
 	}
 
-	log.Printf("Stream listener started on %s", strings.Join(listenAddrs, ", "))
+	log.Printf("Stream listener started for %s on %s", key.String(), strings.Join(listenAddrs, ", "))
 	return state, nil
 }
 
-func (s *listenerState) acceptLoop(ln net.Listener, handler func(net.Conn, int)) {
+func (s *tcpListenerState) acceptLoop(ln net.Listener, handler func(net.Conn, streamRuleKey)) {
 	defer s.wg.Done()
 
 	for {
@@ -278,14 +328,14 @@ func (s *listenerState) acceptLoop(ln net.Listener, handler func(net.Conn, int))
 			}
 
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				log.Printf("Temporary stream accept error on %d: %v", s.port, err)
+				log.Printf("Temporary stream accept error on %s: %v", s.key.String(), err)
 				time.Sleep(streamAcceptBackoff)
 				continue
 			}
 			if isClosedConnErr(err) {
 				return
 			}
-			log.Printf("Stream accept error on %d: %v", s.port, err)
+			log.Printf("Stream accept error on %s: %v", s.key.String(), err)
 			return
 		}
 
@@ -295,12 +345,12 @@ func (s *listenerState) acceptLoop(ln net.Listener, handler func(net.Conn, int))
 		}
 		go func() {
 			defer s.endConn(conn)
-			handler(conn, s.port)
+			handler(conn, s.key)
 		}()
 	}
 }
 
-func (s *listenerState) beginConn(conn net.Conn) bool {
+func (s *tcpListenerState) beginConn(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -313,14 +363,14 @@ func (s *listenerState) beginConn(conn net.Conn) bool {
 	return true
 }
 
-func (s *listenerState) endConn(conn net.Conn) {
+func (s *tcpListenerState) endConn(conn net.Conn) {
 	s.mu.Lock()
 	delete(s.conns, conn)
 	s.mu.Unlock()
 	s.wg.Done()
 }
 
-func (s *listenerState) close() {
+func (s *tcpListenerState) close() {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -348,7 +398,208 @@ func (s *listenerState) close() {
 	s.wg.Wait()
 }
 
-func (m *Manager) handleConn(client net.Conn, listenPort int) {
+func newUDPListenerState(key streamRuleKey, handler func(*udpListenerState, net.PacketConn, net.Addr, []byte, streamRuleKey)) (*udpListenerState, error) {
+	hosts := []string{"0.0.0.0", "::"}
+	packetConns := make([]net.PacketConn, 0, len(hosts))
+	listenAddrs := make([]string, 0, len(hosts))
+
+	for _, host := range hosts {
+		network := "udp4"
+		if strings.Contains(host, ":") {
+			network = "udp6"
+		}
+
+		addr := net.JoinHostPort(host, strconv.Itoa(key.ListenPort))
+		pc, err := net.ListenPacket(network, addr)
+		if err != nil {
+			if network == "udp6" {
+				log.Printf("Stream IPv6 packet listener unavailable on %s for %s: %v", addr, key.String(), err)
+				continue
+			}
+			for _, existing := range packetConns {
+				_ = existing.Close()
+			}
+			if isAddrInUseErr(err) {
+				return nil, fmt.Errorf("listen_port %d for %s is already in use", key.ListenPort, key.Protocol)
+			}
+			return nil, fmt.Errorf("failed to listen on %s for %s: %w", addr, key.String(), err)
+		}
+		packetConns = append(packetConns, pc)
+		listenAddrs = append(listenAddrs, pc.LocalAddr().String())
+	}
+
+	if len(packetConns) == 0 {
+		return nil, fmt.Errorf("no stream listeners started for %s", key.String())
+	}
+
+	state := &udpListenerState{
+		key:         key,
+		packetConns: packetConns,
+		stop:        make(chan struct{}),
+		sessions:    make(map[string]*udpSession),
+	}
+
+	for _, pc := range packetConns {
+		state.wg.Add(1)
+		go state.readLoop(pc, handler)
+	}
+
+	log.Printf("Stream listener started for %s on %s", key.String(), strings.Join(listenAddrs, ", "))
+	return state, nil
+}
+
+func (s *udpListenerState) readLoop(pc net.PacketConn, handler func(*udpListenerState, net.PacketConn, net.Addr, []byte, streamRuleKey)) {
+	defer s.wg.Done()
+
+	buffer := make([]byte, udpPacketBufferSize)
+	for {
+		n, clientAddr, err := pc.ReadFrom(buffer)
+		if err != nil {
+			select {
+			case <-s.stop:
+				return
+			default:
+			}
+
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				log.Printf("Temporary stream packet read error on %s: %v", s.key.String(), err)
+				time.Sleep(streamAcceptBackoff)
+				continue
+			}
+			if isClosedConnErr(err) {
+				return
+			}
+			log.Printf("Stream packet read error on %s: %v", s.key.String(), err)
+			return
+		}
+		if n <= 0 || clientAddr == nil {
+			continue
+		}
+
+		payload := append([]byte(nil), buffer[:n]...)
+		handler(s, pc, clientAddr, payload, s.key)
+	}
+}
+
+func (s *udpListenerState) sessionID(pc net.PacketConn, clientAddr net.Addr) string {
+	return pc.LocalAddr().String() + "|" + clientAddr.String()
+}
+
+func (s *udpListenerState) getSession(id string) (*udpSession, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	session, ok := s.sessions[id]
+	return session, ok
+}
+
+func (s *udpListenerState) storeSession(session *udpSession) (*udpSession, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closing {
+		return nil, false, false
+	}
+	if existing, ok := s.sessions[session.id]; ok {
+		return existing, true, true
+	}
+
+	s.sessions[session.id] = session
+	s.wg.Add(1)
+	return session, false, true
+}
+
+func (s *udpListenerState) removeSession(id string, session *udpSession) {
+	s.mu.Lock()
+	if current, ok := s.sessions[id]; ok && current == session {
+		delete(s.sessions, id)
+	}
+	s.mu.Unlock()
+}
+
+func (s *udpListenerState) close() {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.closing = true
+	sessions := make([]*udpSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.mu.Unlock()
+
+	select {
+	case <-s.stop:
+	default:
+		close(s.stop)
+	}
+
+	for _, pc := range s.packetConns {
+		_ = pc.Close()
+	}
+	for _, session := range sessions {
+		session.close()
+	}
+	s.wg.Wait()
+}
+
+func (s *udpSession) addBytesIn(bytes int) {
+	if bytes <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	s.entry.BytesIn += uint64(bytes)
+	s.mu.Unlock()
+}
+
+func (s *udpSession) addBytesOut(bytes int) {
+	if bytes <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	s.entry.BytesOut += uint64(bytes)
+	s.mu.Unlock()
+}
+
+func (s *udpSession) setStatus(status int) {
+	if status <= 0 {
+		return
+	}
+
+	s.mu.Lock()
+	s.entry.Status = status
+	s.mu.Unlock()
+}
+
+func (s *udpSession) snapshotEntry() gatewaylog.Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := s.entry
+	entry.DurationMs = time.Since(s.start).Milliseconds()
+	return entry
+}
+
+func (s *udpSession) routeInfo() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.entry.RouteKey, s.entry.Upstream
+}
+
+func (s *udpSession) close() {
+	s.closeOnce.Do(func() {
+		if s.upstream != nil {
+			_ = s.upstream.Close()
+		}
+	})
+}
+
+func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 	start := time.Now()
 	remoteAddr := ""
 	clientIP := ""
@@ -357,28 +608,16 @@ func (m *Manager) handleConn(client net.Conn, listenPort int) {
 		clientIP = extractRemoteIP(client.RemoteAddr())
 	}
 
-	entry := gatewaylog.Entry{
-		Method:       "STREAM",
-		Protocol:     "tcp",
-		Status:       http.StatusOK,
-		RemoteAddr:   remoteAddr,
-		RemoteIP:     clientIP,
-		RouteType:    "stream_rule",
-		RouteKey:     strconv.Itoa(listenPort),
-		Matched:      true,
-		AuthDecision: "bypassed",
-	}
+	entry := newStreamEntry(key, remoteAddr, clientIP)
 
 	defer func() {
-		entry.DurationMs = time.Since(start).Milliseconds()
-		m.handler.AddStreamTraffic(entry.BytesIn, entry.BytesOut, entry.Status)
-		m.handler.LogGatewayEntry(entry)
+		m.logStreamEntry(entry, start)
 		if client != nil {
 			_ = client.Close()
 		}
 	}()
 
-	rule, ok := m.currentRule(listenPort)
+	rule, ok := m.currentRule(key)
 	if !ok {
 		entry.Matched = false
 		entry.Status = http.StatusNotFound
@@ -396,7 +635,7 @@ func (m *Manager) handleConn(client net.Conn, listenPort int) {
 		if !allowed {
 			entry.Status = status
 			if err != nil {
-				log.Printf("Stream auth rejected on port %d for %s: %v", listenPort, clientIP, err)
+				log.Printf("Stream auth rejected on %s for %s: %v", key.String(), clientIP, err)
 			}
 			return
 		}
@@ -409,10 +648,10 @@ func (m *Manager) handleConn(client net.Conn, listenPort int) {
 		Timeout:   streamDialTimeout,
 		KeepAlive: 30 * time.Second,
 	}
-	upstream, err := dialer.Dial("tcp", rule.Target)
+	upstream, err := dialer.Dial(rule.Protocol, rule.Target)
 	if err != nil {
 		entry.Status = http.StatusBadGateway
-		log.Printf("Stream upstream dial failed on port %d to %s: %v", listenPort, rule.Target, err)
+		log.Printf("Stream upstream dial failed on %s to %s: %v", key.String(), rule.Target, err)
 		return
 	}
 	defer upstream.Close()
@@ -422,7 +661,157 @@ func (m *Manager) handleConn(client net.Conn, listenPort int) {
 	entry.BytesOut = bytesOut
 	if relayErr != nil {
 		entry.Status = http.StatusBadGateway
-		log.Printf("Stream relay failed on port %d to %s: %v", listenPort, rule.Target, relayErr)
+		log.Printf("Stream relay failed on %s to %s: %v", key.String(), rule.Target, relayErr)
+	}
+}
+
+func (m *Manager) handleUDPPacket(listener *udpListenerState, packetConn net.PacketConn, clientAddr net.Addr, payload []byte, key streamRuleKey) {
+	if len(payload) == 0 {
+		return
+	}
+
+	rule, ok := m.currentRule(key)
+	if !ok {
+		entry := newStreamEntry(key, addrString(clientAddr), extractRemoteIP(clientAddr))
+		entry.Matched = false
+		entry.Status = http.StatusNotFound
+		entry.AuthDecision = "rule_missing"
+		m.logStreamEntry(entry, time.Now())
+		return
+	}
+
+	sessionID := listener.sessionID(packetConn, clientAddr)
+	session, exists := listener.getSession(sessionID)
+	if !exists {
+		session = m.createUDPSession(listener, packetConn, clientAddr, rule)
+		if session == nil {
+			return
+		}
+	}
+
+	if err := session.upstream.SetDeadline(time.Now().Add(udpSessionIdleTimeout)); err != nil {
+		_, target := session.routeInfo()
+		log.Printf("Failed to refresh UDP session deadline on %s for %s: %v", key.String(), target, err)
+	}
+
+	written, err := session.upstream.Write(payload)
+	if written > 0 {
+		session.addBytesIn(written)
+	}
+	if err != nil {
+		session.setStatus(http.StatusBadGateway)
+		log.Printf("UDP upstream write failed on %s to %s for %s: %v", key.String(), rule.Target, addrString(clientAddr), err)
+		session.close()
+		return
+	}
+	if written != len(payload) {
+		session.setStatus(http.StatusBadGateway)
+		log.Printf("UDP upstream short write on %s to %s for %s: wrote %d of %d bytes", key.String(), rule.Target, addrString(clientAddr), written, len(payload))
+		session.close()
+	}
+}
+
+func (m *Manager) createUDPSession(listener *udpListenerState, packetConn net.PacketConn, clientAddr net.Addr, rule models.StreamRule) *udpSession {
+	start := time.Now()
+	key := streamRuleKeyFromRule(rule)
+	clientIP := extractRemoteIP(clientAddr)
+	entry := newStreamEntry(key, addrString(clientAddr), clientIP)
+	entry.AuthRequired = rule.UseAuth
+	entry.Upstream = rule.Target
+
+	if rule.UseAuth {
+		allowed, status, decision, err := m.verify(rule, clientIP)
+		entry.AuthDecision = decision
+		entry.LoggedIn = allowed
+		if !allowed {
+			entry.Status = status
+			if err != nil {
+				log.Printf("Stream auth rejected on %s for %s: %v", key.String(), clientIP, err)
+			}
+			m.logStreamEntry(entry, start)
+			return nil
+		}
+		m.handler.MarkLoggedInActiveByClientIP(clientIP, time.Now())
+	} else {
+		entry.AuthDecision = "public"
+	}
+
+	upstream, err := net.DialTimeout(rule.Protocol, rule.Target, streamDialTimeout)
+	if err != nil {
+		entry.Status = http.StatusBadGateway
+		log.Printf("Stream upstream dial failed on %s to %s: %v", key.String(), rule.Target, err)
+		m.logStreamEntry(entry, start)
+		return nil
+	}
+
+	session := &udpSession{
+		id:         listener.sessionID(packetConn, clientAddr),
+		packetConn: packetConn,
+		clientAddr: clientAddr,
+		upstream:   upstream,
+		start:      start,
+		entry:      entry,
+	}
+
+	if err := session.upstream.SetDeadline(time.Now().Add(udpSessionIdleTimeout)); err != nil {
+		log.Printf("Failed to initialize UDP session deadline on %s for %s: %v", key.String(), rule.Target, err)
+	}
+
+	storedSession, loaded, ok := listener.storeSession(session)
+	if !ok {
+		session.close()
+		return nil
+	}
+	if loaded {
+		session.close()
+		return storedSession
+	}
+
+	go m.runUDPSession(listener, storedSession)
+	return storedSession
+}
+
+func (m *Manager) runUDPSession(listener *udpListenerState, session *udpSession) {
+	defer listener.wg.Done()
+	defer listener.removeSession(session.id, session)
+	defer session.close()
+	defer func() {
+		m.logStreamEntry(session.snapshotEntry(), session.start)
+	}()
+
+	buffer := make([]byte, udpPacketBufferSize)
+	for {
+		_ = session.upstream.SetReadDeadline(time.Now().Add(udpSessionIdleTimeout))
+		n, err := session.upstream.Read(buffer)
+		if n > 0 {
+			written, writeErr := session.packetConn.WriteTo(buffer[:n], session.clientAddr)
+			if written > 0 {
+				session.addBytesOut(written)
+			}
+			if writeErr != nil {
+				if !isClosedConnErr(writeErr) {
+					session.setStatus(http.StatusBadGateway)
+					routeKey, target := session.routeInfo()
+					log.Printf("UDP downstream write failed on %s to %s for %s: %v", routeKey, target, addrString(session.clientAddr), writeErr)
+				}
+				return
+			}
+			if written != n {
+				session.setStatus(http.StatusBadGateway)
+				routeKey, target := session.routeInfo()
+				log.Printf("UDP downstream short write on %s to %s for %s: wrote %d of %d bytes", routeKey, target, addrString(session.clientAddr), written, n)
+				return
+			}
+		}
+		if err != nil {
+			if isTimeoutErr(err) || isClosedConnErr(err) || errors.Is(err, io.EOF) {
+				return
+			}
+			session.setStatus(http.StatusBadGateway)
+			routeKey, target := session.routeInfo()
+			log.Printf("UDP upstream read failed on %s to %s for %s: %v", routeKey, target, addrString(session.clientAddr), err)
+			return
+		}
 	}
 }
 
@@ -449,7 +838,7 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 	req.Header.Set("User-Agent", "")
 	req.Header.Set("X-Real-IP", clientIP)
 	req.Header.Set("X-Forwarded-For", clientIP)
-	req.Header.Set("X-Reauth-Protocol", "tcp")
+	req.Header.Set("X-Reauth-Protocol", rule.Protocol)
 	req.Header.Set("X-Reauth-Listen-Port", strconv.Itoa(rule.ListenPort))
 	req.Header.Set("X-Reauth-Target", rule.Target)
 
@@ -583,6 +972,13 @@ func extractRemoteIP(addr net.Addr) string {
 	return strings.TrimSpace(addr.String())
 }
 
+func addrString(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	return strings.TrimSpace(addr.String())
+}
+
 func ensureLeadingSlash(path string) string {
 	if path == "" {
 		return "/"
@@ -616,17 +1012,18 @@ func isTimeoutErr(err error) bool {
 
 func (m *Manager) normalizeRules(rules []models.StreamRule) ([]models.StreamRule, error) {
 	normalized := make([]models.StreamRule, 0, len(rules))
-	seenPorts := make(map[int]struct{}, len(rules))
+	seenRules := make(map[streamRuleKey]struct{}, len(rules))
 
 	for _, rule := range rules {
 		nextRule, err := m.normalizeRule(rule)
 		if err != nil {
 			return nil, err
 		}
-		if _, exists := seenPorts[nextRule.ListenPort]; exists {
-			return nil, fmt.Errorf("duplicate listen_port: %d", nextRule.ListenPort)
+		key := streamRuleKeyFromRule(nextRule)
+		if _, exists := seenRules[key]; exists {
+			return nil, fmt.Errorf("duplicate stream rule for %s", key.String())
 		}
-		seenPorts[nextRule.ListenPort] = struct{}{}
+		seenRules[key] = struct{}{}
 		normalized = append(normalized, nextRule)
 	}
 
@@ -636,10 +1033,16 @@ func (m *Manager) normalizeRules(rules []models.StreamRule) ([]models.StreamRule
 func (m *Manager) normalizeRule(rule models.StreamRule) (models.StreamRule, error) {
 	rule.Target = strings.TrimSpace(rule.Target)
 
+	protocol, err := normalizeStreamProtocol(rule.Protocol)
+	if err != nil {
+		return models.StreamRule{}, err
+	}
+	rule.Protocol = protocol
+
 	if rule.ListenPort <= 0 || rule.ListenPort > 65535 {
 		return models.StreamRule{}, fmt.Errorf("listen_port must be between 1 and 65535")
 	}
-	if reservedName := m.reservedPortName(rule.ListenPort); reservedName != "" {
+	if reservedName := m.reservedPortName(rule); reservedName != "" {
 		return models.StreamRule{}, fmt.Errorf("listen_port %d is reserved for the %s", rule.ListenPort, reservedName)
 	}
 	if rule.Target == "" {
@@ -651,27 +1054,27 @@ func (m *Manager) normalizeRule(rule models.StreamRule) (models.StreamRule, erro
 		return models.StreamRule{}, fmt.Errorf("invalid target: %v", err)
 	}
 
-	if isLoopbackOrUnspecifiedHost(targetHost) {
+	if rule.Protocol == models.StreamProtocolTCP && isLoopbackOrUnspecifiedHost(targetHost) {
 		if adminPort := m.adminPort(); adminPort > 0 && targetPort == adminPort {
 			return models.StreamRule{}, fmt.Errorf("invalid target: cannot target local admin port %d", adminPort)
 		}
-		if rule.ListenPort == targetPort {
-			return models.StreamRule{}, fmt.Errorf("listen_port %d cannot target the same local address %s", rule.ListenPort, rule.Target)
-		}
+	}
+	if isLoopbackOrUnspecifiedHost(targetHost) && rule.ListenPort == targetPort {
+		return models.StreamRule{}, fmt.Errorf("listen_port %d cannot target the same local address %s", rule.ListenPort, rule.Target)
 	}
 
 	return rule, nil
 }
 
-func (m *Manager) reservedPortName(port int) string {
-	if m == nil || m.handler == nil {
+func (m *Manager) reservedPortName(rule models.StreamRule) string {
+	if m == nil || m.handler == nil || rule.Protocol != models.StreamProtocolTCP {
 		return ""
 	}
 
 	switch {
-	case m.handler.AdminPort > 0 && port == m.handler.AdminPort:
+	case m.handler.AdminPort > 0 && rule.ListenPort == m.handler.AdminPort:
 		return "admin API"
-	case m.handler.ProxyPort > 0 && port == m.handler.ProxyPort:
+	case m.handler.ProxyPort > 0 && rule.ListenPort == m.handler.ProxyPort:
 		return "reverse proxy"
 	default:
 		return ""
@@ -701,6 +1104,69 @@ func parseStreamTarget(target string) (string, int, error) {
 	}
 
 	return host, portNum, nil
+}
+
+func normalizeStreamProtocol(protocol string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "", models.StreamProtocolTCP:
+		return models.StreamProtocolTCP, nil
+	case models.StreamProtocolUDP:
+		return models.StreamProtocolUDP, nil
+	default:
+		return "", fmt.Errorf("protocol must be tcp or udp")
+	}
+}
+
+func fallbackStreamProtocol(protocol string) string {
+	normalized := strings.ToLower(strings.TrimSpace(protocol))
+	if normalized == "" {
+		return models.StreamProtocolTCP
+	}
+	return normalized
+}
+
+func streamRuleKeyFromRule(rule models.StreamRule) streamRuleKey {
+	return streamRuleKey{
+		Protocol:   rule.Protocol,
+		ListenPort: rule.ListenPort,
+	}
+}
+
+func compareStreamRuleKeys(a streamRuleKey, b streamRuleKey) int {
+	if a.Protocol < b.Protocol {
+		return -1
+	}
+	if a.Protocol > b.Protocol {
+		return 1
+	}
+	switch {
+	case a.ListenPort < b.ListenPort:
+		return -1
+	case a.ListenPort > b.ListenPort:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func newStreamEntry(key streamRuleKey, remoteAddr string, clientIP string) gatewaylog.Entry {
+	return gatewaylog.Entry{
+		Method:       "STREAM",
+		Protocol:     key.Protocol,
+		Status:       http.StatusOK,
+		RemoteAddr:   remoteAddr,
+		RemoteIP:     clientIP,
+		RouteType:    "stream_rule",
+		RouteKey:     key.String(),
+		Matched:      true,
+		AuthDecision: "bypassed",
+	}
+}
+
+func (m *Manager) logStreamEntry(entry gatewaylog.Entry, start time.Time) {
+	entry.DurationMs = time.Since(start).Milliseconds()
+	m.handler.AddStreamTraffic(entry.BytesIn, entry.BytesOut, entry.Status)
+	m.handler.LogGatewayEntry(entry)
 }
 
 func isLoopbackOrUnspecifiedHost(host string) bool {

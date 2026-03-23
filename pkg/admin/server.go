@@ -283,6 +283,7 @@ func (s *Server) handleSetStreamRules(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	type streamRuleRequest struct {
+		Protocol   string `json:"protocol"`
 		ListenPort int    `json:"listen_port"`
 		Target     string `json:"target"`
 		UseAuth    *bool  `json:"use_auth"`
@@ -297,6 +298,7 @@ func (s *Server) handleSetStreamRules(w http.ResponseWriter, r *http.Request) {
 	nextRules := make([]models.StreamRule, 0, len(reqs))
 	for _, req := range reqs {
 		nextRules = append(nextRules, models.StreamRule{
+			Protocol:   req.Protocol,
 			ListenPort: req.ListenPort,
 			Target:     req.Target,
 			UseAuth:    req.UseAuth == nil || *req.UseAuth,

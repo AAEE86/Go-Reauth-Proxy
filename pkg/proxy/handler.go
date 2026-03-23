@@ -604,6 +604,21 @@ func parseStreamTarget(target string) (string, int, error) {
 	return host, portNum, nil
 }
 
+func normalizeStreamProtocol(protocol string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "", models.StreamProtocolTCP:
+		return models.StreamProtocolTCP, nil
+	case models.StreamProtocolUDP:
+		return models.StreamProtocolUDP, nil
+	default:
+		return "", fmt.Errorf("protocol must be tcp or udp")
+	}
+}
+
+func streamRuleMapKey(rule models.StreamRule) string {
+	return rule.Protocol + "/" + strconv.Itoa(rule.ListenPort)
+}
+
 func isLoopbackOrUnspecifiedHost(host string) bool {
 	normalizedHost := strings.TrimSpace(strings.Trim(host, "[]"))
 	if normalizedHost == "" {
@@ -617,24 +632,28 @@ func isLoopbackOrUnspecifiedHost(host string) bool {
 	return parsedIP != nil && (parsedIP.IsLoopback() || parsedIP.IsUnspecified())
 }
 
-func (h *Handler) reservedStreamPortName(port int) string {
+func (h *Handler) reservedStreamPortName(rule models.StreamRule) string {
+	if rule.Protocol != models.StreamProtocolTCP {
+		return ""
+	}
+
 	switch {
-	case h.AdminPort > 0 && port == h.AdminPort:
+	case h.AdminPort > 0 && rule.ListenPort == h.AdminPort:
 		return "admin API"
-	case h.ProxyPort > 0 && port == h.ProxyPort:
+	case h.ProxyPort > 0 && rule.ListenPort == h.ProxyPort:
 		return "reverse proxy"
 	default:
 		return ""
 	}
 }
 
-func (h *Handler) checkSafeStreamTarget(target string) (string, int, error) {
+func (h *Handler) checkSafeStreamTarget(protocol string, target string) (string, int, error) {
 	host, portNum, err := parseStreamTarget(target)
 	if err != nil {
 		return "", 0, err
 	}
 
-	if isLoopbackOrUnspecifiedHost(host) {
+	if protocol == models.StreamProtocolTCP && isLoopbackOrUnspecifiedHost(host) {
 		if portNum == h.AdminPort {
 			return "", 0, fmt.Errorf("cannot target local admin port %d", h.AdminPort)
 		}
@@ -645,17 +664,22 @@ func (h *Handler) checkSafeStreamTarget(target string) (string, int, error) {
 
 func (h *Handler) normalizeStreamRule(newRule models.StreamRule) (models.StreamRule, error) {
 	newRule.Target = strings.TrimSpace(newRule.Target)
+	var err error
+	newRule.Protocol, err = normalizeStreamProtocol(newRule.Protocol)
+	if err != nil {
+		return models.StreamRule{}, err
+	}
 
 	if newRule.ListenPort <= 0 || newRule.ListenPort > 65535 {
 		return models.StreamRule{}, fmt.Errorf("listen_port must be between 1 and 65535")
 	}
-	if reservedName := h.reservedStreamPortName(newRule.ListenPort); reservedName != "" {
+	if reservedName := h.reservedStreamPortName(newRule); reservedName != "" {
 		return models.StreamRule{}, fmt.Errorf("listen_port %d is reserved for the %s", newRule.ListenPort, reservedName)
 	}
 	if newRule.Target == "" {
 		return models.StreamRule{}, fmt.Errorf("cannot add stream rule with empty target")
 	}
-	targetHost, targetPort, err := h.checkSafeStreamTarget(newRule.Target)
+	targetHost, targetPort, err := h.checkSafeStreamTarget(newRule.Protocol, newRule.Target)
 	if err != nil {
 		return models.StreamRule{}, fmt.Errorf("invalid target: %v", err)
 	}
@@ -752,17 +776,18 @@ func (h *Handler) GetHostRules() []models.HostRule {
 
 func (h *Handler) ValidateStreamRules(rules []models.StreamRule) ([]models.StreamRule, error) {
 	normalized := make([]models.StreamRule, 0, len(rules))
-	seenPorts := make(map[int]struct{}, len(rules))
+	seenRules := make(map[string]struct{}, len(rules))
 
 	for _, rule := range rules {
 		nextRule, err := h.normalizeStreamRule(rule)
 		if err != nil {
 			return nil, err
 		}
-		if _, exists := seenPorts[nextRule.ListenPort]; exists {
-			return nil, fmt.Errorf("duplicate listen_port: %d", nextRule.ListenPort)
+		key := streamRuleMapKey(nextRule)
+		if _, exists := seenRules[key]; exists {
+			return nil, fmt.Errorf("duplicate stream rule for %s", key)
 		}
-		seenPorts[nextRule.ListenPort] = struct{}{}
+		seenRules[key] = struct{}{}
 		normalized = append(normalized, nextRule)
 	}
 
