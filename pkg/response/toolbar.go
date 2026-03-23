@@ -667,7 +667,8 @@ func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
 		return false
 	}
 
-	return strings.Contains(normalized, "com.trim.app")
+	return strings.Contains(normalized, "com.trim.app") ||
+		strings.Contains(normalized, "fnos")
 }
 
 func GenerateToolbar(rules []models.Rule, currentPath string) string {
