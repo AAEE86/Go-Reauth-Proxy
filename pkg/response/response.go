@@ -50,6 +50,7 @@ type pageData struct {
 	Version     string
 	BodyClass   string
 	Rules       []models.Rule
+	HostRules   []models.HostRule
 	ToolbarHTML template.HTML
 }
 

@@ -303,20 +303,31 @@ func main() {
 	}
 
 	proxyHandler := proxy.NewHandler(resolvedAdminPort, *proxyPort, cfgManager, initialCfg, logsDir)
-	normalizedStreamRules, err := proxyHandler.ValidateStreamRules(proxyHandler.GetStreamRules())
-	if err != nil {
-		log.Fatalf("Failed to validate stream rules: %v", err)
-	}
-	if err := proxyHandler.SetStreamRules(normalizedStreamRules); err != nil {
-		log.Fatalf("Failed to initialize stream rules: %v", err)
+	configuredStreamRules := proxyHandler.GetStreamRules()
+	normalizedStreamRules := configuredStreamRules
+	if validatedStreamRules, err := proxyHandler.ValidateStreamRules(configuredStreamRules); err != nil {
+		log.Printf("Initial stream rules contain invalid entries and will be loaded in best-effort mode: %v", err)
+	} else {
+		normalizedStreamRules = validatedStreamRules
+		if err := proxyHandler.SetStreamRules(normalizedStreamRules); err != nil {
+			log.Printf("Failed to normalize initial stream rules in config manager: %v", err)
+		}
 	}
 
 	currentConfig := proxyHandler.GetAuthConfig()
 	proxyHandler.SetAuthConfig(currentConfig)
 
 	streamManager := stream.NewManager(proxyHandler)
-	if err := streamManager.Reconcile(normalizedStreamRules); err != nil {
-		log.Fatalf("Failed to start stream manager: %v", err)
+	startedStreamRules, startupWarnings := streamManager.ReconcileBestEffort(normalizedStreamRules)
+	for _, warning := range startupWarnings {
+		log.Printf("Stream startup warning: %v", warning)
+	}
+	if len(startupWarnings) > 0 {
+		log.Printf(
+			"Stream manager started %d of %d configured rules; skipped rules can be fixed later from the admin UI",
+			len(startedStreamRules),
+			len(normalizedStreamRules),
+		)
 	}
 
 	adminServer := admin.NewServer(proxyHandler, resolvedAdminPort, cfgManager, initialCfg, streamManager)

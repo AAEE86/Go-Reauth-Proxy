@@ -1331,10 +1331,10 @@ func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snap
 		if !authResult.allowed {
 			return authResult
 		}
-		response.SelectPage(w, snapshot.rules)
+		response.SelectPage(w, snapshot.rules, snapshot.hostRules)
 		return authResult
 	}
-	response.SelectPage(w, snapshot.rules)
+	response.SelectPage(w, snapshot.rules, snapshot.hostRules)
 	return authCheckResult{allowed: true, decision: "not_required"}
 }
 

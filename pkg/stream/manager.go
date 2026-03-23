@@ -165,6 +165,27 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 	return nil
 }
 
+func (m *Manager) ReconcileBestEffort(rules []models.StreamRule) ([]models.StreamRule, []error) {
+	startedRules := make([]models.StreamRule, 0, len(rules))
+	warnings := make([]error, 0)
+
+	for _, rule := range rules {
+		nextRule, err := m.normalizeRule(rule)
+		if err != nil {
+			warnings = append(warnings, fmt.Errorf("skipping stream rule %d -> %s: %w", rule.ListenPort, strings.TrimSpace(rule.Target), err))
+			continue
+		}
+
+		if err := m.Reconcile(append(startedRules, nextRule)); err != nil {
+			warnings = append(warnings, fmt.Errorf("skipping stream rule %d -> %s: %w", nextRule.ListenPort, nextRule.Target, err))
+			continue
+		}
+		startedRules = append(startedRules, nextRule)
+	}
+
+	return startedRules, warnings
+}
+
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	if m.closed {

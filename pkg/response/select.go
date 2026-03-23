@@ -318,17 +318,19 @@ const selectContent = `
 	</div>
 
 	<div class="routes-grid">
-		{{if not .Rules}}
-			<div class="empty-card">
-				<svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-					<circle cx="12" cy="12" r="10"/>
-					<path d="M16 16s-1.5-2-4-2-4 2-4 2"/>
-					<line x1="9" y1="9" x2="9.01" y2="9"/>
-					<line x1="15" y1="9" x2="15.01" y2="9"/>
+		{{if .HostRules}}
+			{{range .HostRules}}
+			<a href="/" data-host="{{.Host}}" class="route-card host-route-card">
+				<div>
+					<div class="route-path">{{.Host}}</div>
+					<div class="route-target">{{.Target}}</div>
+				</div>
+				<svg class="route-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<polyline points="9 18 15 12 9 6"/>
 				</svg>
-				No routes available.
-			</div>
-		{{else}}
+			</a>
+			{{end}}
+		{{else if .Rules}}
 			{{range .Rules}}
 			<a href="{{ensureSlash .Path}}" class="route-card">
 				<div>
@@ -340,6 +342,16 @@ const selectContent = `
 				</svg>
 			</a>
 			{{end}}
+		{{else}}
+			<div class="empty-card">
+				<svg class="empty-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="12" cy="12" r="10"/>
+					<path d="M16 16s-1.5-2-4-2-4 2-4 2"/>
+					<line x1="9" y1="9" x2="9.01" y2="9"/>
+					<line x1="15" y1="9" x2="15.01" y2="9"/>
+				</svg>
+				No routes available.
+			</div>
 		{{end}}
 	</div>
 
@@ -352,6 +364,24 @@ const selectContent = `
 		</p>
 	</div>
 </div>
+
+<script>
+	(function() {
+		function buildHostHref(host) {
+			var port = window.location.port ? ':' + window.location.port : '';
+			return window.location.protocol + '//' + host + port + '/';
+		}
+
+		var hostLinks = document.querySelectorAll('.host-route-card[data-host]');
+		for (var i = 0; i < hostLinks.length; i++) {
+			var host = hostLinks[i].getAttribute('data-host');
+			if (!host) {
+				continue;
+			}
+			hostLinks[i].setAttribute('href', buildHostHref(host));
+		}
+	})();
+</script>
 
 <div id="logout-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
 	<div class="modal-content">
@@ -367,7 +397,6 @@ const selectContent = `
 		</div>
 	</div>
 </div>
-{{.ToolbarHTML}}
 {{end}}
 `
 
@@ -376,11 +405,11 @@ var selectTmpl = template.Must(
 		Parse(baseTemplate + selectContent),
 )
 
-func SelectPage(w http.ResponseWriter, rules []models.Rule) {
+func SelectPage(w http.ResponseWriter, rules []models.Rule, hostRules []models.HostRule) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
-	toolbarHTML := GenerateToolbar(rules, "/__select__")
+	toolbarHTML := GenerateToolbarWithHosts(rules, hostRules, "/__select__", "", "")
 
 	data := pageData{
 		Title:       "Select Route",
@@ -388,6 +417,7 @@ func SelectPage(w http.ResponseWriter, rules []models.Rule) {
 		Version:     version.Version,
 		BodyClass:   "select-page",
 		Rules:       rules,
+		HostRules:   hostRules,
 		ToolbarHTML: template.HTML(toolbarHTML),
 	}
 
