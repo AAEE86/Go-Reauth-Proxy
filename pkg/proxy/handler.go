@@ -40,6 +40,7 @@ type Handler struct {
 	AdminPort             int
 	ProxyPort             int
 	ProxyProtocolForce    bool
+	ReverseProxyThrottle  models.ReverseProxyThrottleConfig
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
@@ -61,6 +62,7 @@ type Handler struct {
 	preflightSkipUntilUnixNano int64
 	authCache                  authStateCache
 	preflightCache             preflightStateCache
+	reverseProxyThrottle       *reverseProxyThrottle
 }
 
 type requestSnapshot struct {
@@ -101,24 +103,15 @@ func (h *Handler) snapshotForRequest() requestSnapshot {
 }
 
 func resolveClientIP(r *http.Request, proxyProtocolForce bool) string {
-	if !proxyProtocolForce {
-		remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		return remoteIP
-	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
-			}
+	if proxyProtocolForce {
+		if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+			return ip
+		}
+		if ip := normalizeIPAddress(r.Header.Get("X-Real-IP")); ip != "" {
+			return ip
 		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return remoteIP
+	return normalizeClientIP(r.RemoteAddr)
 }
 
 func copyRule(rule models.Rule) *models.Rule {
@@ -366,19 +359,20 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 	}
 
 	h := &Handler{
-		Rules:              initialCfg.Rules,
-		HostRules:          initialCfg.HostRules,
-		StreamRules:        initialCfg.StreamRules,
-		DefaultRoute:       initialCfg.DefaultRoute,
-		AuthConfig:         initialCfg.AuthConfig,
-		LoggingConfig:      logConfig,
-		AdminPort:          adminPort,
-		ProxyPort:          proxyPort,
-		ProxyProtocolForce: initialCfg.ProxyProtocolForce,
-		configManager:      cfgManager,
-		sslConfig:          copySSLConfig(initialCfg.SSL),
-		gatewayLogManager:  gatewaylog.NewManager(logsDir, logConfig),
-		fnAppMockService:   newFNAppMockServiceFromEnv(),
+		Rules:                initialCfg.Rules,
+		HostRules:            initialCfg.HostRules,
+		StreamRules:          initialCfg.StreamRules,
+		DefaultRoute:         initialCfg.DefaultRoute,
+		AuthConfig:           initialCfg.AuthConfig,
+		LoggingConfig:        logConfig,
+		AdminPort:            adminPort,
+		ProxyPort:            proxyPort,
+		ProxyProtocolForce:   initialCfg.ProxyProtocolForce,
+		ReverseProxyThrottle: normalizeReverseProxyThrottleConfig(initialCfg.ReverseProxyThrottle),
+		configManager:        cfgManager,
+		sslConfig:            copySSLConfig(initialCfg.SSL),
+		gatewayLogManager:    gatewaylog.NewManager(logsDir, logConfig),
+		fnAppMockService:     newFNAppMockServiceFromEnv(),
 		preflightClient: &http.Client{
 			Timeout:   preflightTimeout,
 			Transport: newInternalTransport(),
@@ -391,6 +385,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		authCache:      newAuthStateCache(),
 		preflightCache: newPreflightStateCache(),
 	}
+	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
 
 	var emptyHook func()
 	h.sslOnChange.Store(emptyHook)
@@ -463,6 +458,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.AuthConfig = h.AuthConfig
 		conf.Logging = h.LoggingConfig
 		conf.ProxyProtocolForce = h.ProxyProtocolForce
+		conf.ReverseProxyThrottle = h.ReverseProxyThrottle
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
 		return nil
@@ -487,6 +483,16 @@ func (h *Handler) SetProxyProtocolForce(force bool) {
 	if changed && hook != nil {
 		hook()
 	}
+}
+
+func (h *Handler) shouldThrottleReverseProxyRequest(isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule, clientIP string) bool {
+	if !isAuthRoute && matchedHostRule == nil && matchedRule == nil {
+		return false
+	}
+	if h.reverseProxyThrottle == nil {
+		return false
+	}
+	return !h.reverseProxyThrottle.allow(clientIP, time.Now())
 }
 
 func (h *Handler) SetSSLDeployment(config models.SSLConfig) error {
@@ -994,6 +1000,36 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	return nil
 }
 
+func (h *Handler) GetReverseProxyThrottle() models.ReverseProxyThrottleConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.ReverseProxyThrottle
+}
+
+func (h *Handler) SetReverseProxyThrottle(cfg models.ReverseProxyThrottleConfig) {
+	normalized := normalizeReverseProxyThrottleConfig(cfg)
+
+	h.mu.Lock()
+	h.ReverseProxyThrottle = normalized
+	h.saveConfigLocked()
+	throttle := h.reverseProxyThrottle
+	h.mu.Unlock()
+
+	if throttle == nil {
+		h.mu.Lock()
+		if h.reverseProxyThrottle == nil {
+			h.reverseProxyThrottle = newReverseProxyThrottle(normalized)
+			throttle = h.reverseProxyThrottle
+		} else {
+			throttle = h.reverseProxyThrottle
+		}
+		h.mu.Unlock()
+	}
+	if throttle != nil {
+		throttle.updateConfig(normalized)
+	}
+}
+
 type TrafficStats struct {
 	TotalIn     uint64 `json:"total_in"`
 	TotalOut    uint64 `json:"total_out"`
@@ -1159,8 +1195,9 @@ func (trc *trafficReadCloser) Read(p []byte) (int, error) {
 
 type trafficResponseWriter struct {
 	http.ResponseWriter
-	handler *Handler
-	metrics *requestTrafficMetrics
+	handler       *Handler
+	metrics       *requestTrafficMetrics
+	skipAccessLog bool
 }
 
 func (tw *trafficResponseWriter) WriteHeader(statusCode int) {
@@ -1205,6 +1242,20 @@ func (tw *trafficResponseWriter) Push(target string, opts *http.PushOptions) err
 	return ps.Push(target, opts)
 }
 
+func (tw *trafficResponseWriter) SuppressAccessLog() {
+	tw.skipAccessLog = true
+}
+
+type accessLogSuppressor interface {
+	SuppressAccessLog()
+}
+
+func suppressAccessLog(w http.ResponseWriter) {
+	if suppressor, ok := w.(accessLogSuppressor); ok {
+		suppressor.SuppressAccessLog()
+	}
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	atomic.AddInt64(&h.trafficActive, 1)
@@ -1232,7 +1283,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		r.Body = &trafficReadCloser{ReadCloser: r.Body, handler: h, metrics: metrics}
 	}
-	w = &trafficResponseWriter{ResponseWriter: w, handler: h, metrics: metrics}
+	tw := &trafficResponseWriter{ResponseWriter: w, handler: h, metrics: metrics}
+	w = tw
 
 	defer func() {
 		atomic.AddInt64(&h.trafficActive, -1)
@@ -1253,7 +1305,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if clientIP != "" {
 			accessEntry.RemoteIP = clientIP
 		}
-		if h.gatewayLogManager != nil {
+		if !tw.skipAccessLog && h.gatewayLogManager != nil {
 			h.gatewayLogManager.Log(accessEntry)
 		}
 		if rec := recover(); rec != nil {
@@ -1301,6 +1353,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if h.shouldThrottleReverseProxyRequest(isAuthRoute, matchedHostRule, matchedRule, clientIP) {
+		suppressAccessLog(w)
+		h.abortConnection(w)
+		return
+	}
 	isMatch := isSelectRoute || isAuthRoute || matchedHostRule != nil || matchedRule != nil || r.URL.Path == "/"
 	accessEntry.Matched = isMatch
 	accessEntry.AccessMode = accessMode
@@ -1309,6 +1366,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.RouteType = "preflight"
 		accessEntry.AuthDecision = "denied"
 		loggedStatusCode = 499
+		suppressAccessLog(w)
 		h.abortConnection(w)
 		return
 	}
@@ -2055,6 +2113,7 @@ func (h *Handler) applyAuthCheckPlan(w http.ResponseWriter, r *http.Request, pla
 	}
 
 	if plan.abortConnection {
+		suppressAccessLog(w)
 		h.abortConnection(w)
 		return plan.result
 	}

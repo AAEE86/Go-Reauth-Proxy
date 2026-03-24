@@ -49,6 +49,13 @@ type LoggingConfig struct {
 	MaxDays int  `json:"max_days,omitempty"`
 }
 
+type ReverseProxyThrottleConfig struct {
+	Enabled           bool `json:"enabled,omitempty"`
+	RequestsPerSecond int  `json:"requests_per_second,omitempty" example:"8"`
+	Burst             int  `json:"burst,omitempty" example:"16"`
+	BlockSeconds      int  `json:"block_seconds,omitempty" example:"30"`
+}
+
 type PortConfig struct {
 	Port  int    `json:"port"`
 	Rules []Rule `json:"rules"`

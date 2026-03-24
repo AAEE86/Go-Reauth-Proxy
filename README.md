@@ -113,6 +113,12 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
   },
   "admin_port": 7996,
   "proxy_protocol_force": false,
+  "reverse_proxy_throttle": {
+    "enabled": true,
+    "requests_per_second": 20,
+    "burst": 50,
+    "block_seconds": 30
+  },
   "iptables_chain_name": "",
   "ssl_cert": "",
   "ssl_key": ""
@@ -128,8 +134,26 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 - `auth_config.public_https_port`: 可选，显式指定对外暴露的 HTTPS 端口
 - `admin_port`: 管理端口（仅在 `-admin-port=0` 时作为回退）
 - `proxy_protocol_force`: 是否强制按 PROXY protocol 场景处理来源 IP
+- `reverse_proxy_throttle`: 反代数据面节流配置，作用于命中 host/path 规则的请求以及 `__auth__` 认证代理路径，不影响 `admin-port`、`/__select__`
+- `reverse_proxy_throttle.enabled`: 是否启用节流
+- `reverse_proxy_throttle.requests_per_second`: 单个客户端 IP 每秒允许的请求数
+- `reverse_proxy_throttle.burst`: 单个客户端 IP 可瞬时突发的令牌数
+- `reverse_proxy_throttle.block_seconds`: 超限后直接断开连接的封禁时长；被中断的请求不会写 access log
 - `iptables_chain_name`: iptables 链名（默认 `REAUTH_FW`）
 - `ssl_cert` / `ssl_key`: PEM 证书与私钥（由 API 写入）
+
+一个常见配置示例：
+
+```json
+{
+  "reverse_proxy_throttle": {
+    "enabled": true,
+    "requests_per_second": 20,
+    "burst": 50,
+    "block_seconds": 30
+  }
+}
+```
 
 当网关运行在非标准本地端口上，但前面存在 NAT 或转发时，这两个字段可用于修正网关生成的公开跳转地址。
 

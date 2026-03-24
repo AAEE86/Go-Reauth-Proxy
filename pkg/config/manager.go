@@ -13,21 +13,25 @@ import (
 const (
 	defaultAuthCacheTTLSeconds             = 1
 	defaultAuthCacheUnauthorizedTTLSeconds = 1
+	defaultReverseProxyThrottleRPS         = 20
+	defaultReverseProxyThrottleBurst       = 50
+	defaultReverseProxyThrottleBlockSecs   = 30
 )
 
 type AppConfig struct {
-	Rules              []models.Rule        `json:"rules"`
-	HostRules          []models.HostRule    `json:"host_rules,omitempty"`
-	StreamRules        []models.StreamRule  `json:"stream_rules,omitempty"`
-	DefaultRoute       string               `json:"default_route"`
-	AuthConfig         models.AuthConfig    `json:"auth_config"`
-	AdminPort          int                  `json:"admin_port,omitempty"`
-	ProxyProtocolForce bool                 `json:"proxy_protocol_force,omitempty"`
-	IptablesChainName  string               `json:"iptables_chain_name,omitempty"`
-	Logging            models.LoggingConfig `json:"logging,omitempty"`
-	SSL                models.SSLConfig     `json:"ssl,omitempty"`
-	SSLCert            string               `json:"ssl_cert,omitempty"`
-	SSLKey             string               `json:"ssl_key,omitempty"`
+	Rules                []models.Rule                     `json:"rules"`
+	HostRules            []models.HostRule                 `json:"host_rules,omitempty"`
+	StreamRules          []models.StreamRule               `json:"stream_rules,omitempty"`
+	DefaultRoute         string                            `json:"default_route"`
+	AuthConfig           models.AuthConfig                 `json:"auth_config"`
+	AdminPort            int                               `json:"admin_port,omitempty"`
+	ProxyProtocolForce   bool                              `json:"proxy_protocol_force,omitempty"`
+	ReverseProxyThrottle models.ReverseProxyThrottleConfig `json:"reverse_proxy_throttle,omitempty"`
+	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
+	Logging              models.LoggingConfig              `json:"logging,omitempty"`
+	SSL                  models.SSLConfig                  `json:"ssl,omitempty"`
+	SSLCert              string                            `json:"ssl_cert,omitempty"`
+	SSLKey               string                            `json:"ssl_key,omitempty"`
 }
 
 type Manager struct {
@@ -62,6 +66,12 @@ func defaultConfig() *AppConfig {
 		},
 		AdminPort:          7996,
 		ProxyProtocolForce: false,
+		ReverseProxyThrottle: models.ReverseProxyThrottleConfig{
+			Enabled:           true,
+			RequestsPerSecond: defaultReverseProxyThrottleRPS,
+			Burst:             defaultReverseProxyThrottleBurst,
+			BlockSeconds:      defaultReverseProxyThrottleBlockSecs,
+		},
 		Logging: models.LoggingConfig{
 			Enabled: false,
 			MaxDays: gatewaylog.DefaultMaxDays,
@@ -148,6 +158,17 @@ func applyDefaults(cfg *AppConfig) {
 	if cfg.AdminPort <= 0 {
 		cfg.AdminPort = 7996
 	}
+	if cfg.ReverseProxyThrottle.Enabled {
+		if cfg.ReverseProxyThrottle.RequestsPerSecond <= 0 {
+			cfg.ReverseProxyThrottle.RequestsPerSecond = defaultReverseProxyThrottleRPS
+		}
+		if cfg.ReverseProxyThrottle.Burst <= 0 {
+			cfg.ReverseProxyThrottle.Burst = defaultReverseProxyThrottleBurst
+		}
+		if cfg.ReverseProxyThrottle.BlockSeconds <= 0 {
+			cfg.ReverseProxyThrottle.BlockSeconds = defaultReverseProxyThrottleBlockSecs
+		}
+	}
 	if cfg.Logging.MaxDays <= 0 {
 		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays
 	}
@@ -169,6 +190,16 @@ func detectAuthCacheFieldPresence(data []byte) (hasAuthCacheTTL bool, hasAuthCac
 	return hasAuthCacheTTL, hasAuthCacheFailTTL
 }
 
+func detectReverseProxyThrottleFieldPresence(data []byte) bool {
+	var raw struct {
+		ReverseProxyThrottle json.RawMessage `json:"reverse_proxy_throttle"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	return len(raw.ReverseProxyThrottle) > 0
+}
+
 func applyMissingAuthCacheDefaults(cfg *AppConfig, hasAuthCacheTTL bool, hasAuthCacheFailTTL bool) bool {
 	changed := false
 
@@ -182,6 +213,20 @@ func applyMissingAuthCacheDefaults(cfg *AppConfig, hasAuthCacheTTL bool, hasAuth
 	}
 
 	return changed
+}
+
+func applyMissingReverseProxyThrottleDefaults(cfg *AppConfig, hasReverseProxyThrottle bool) bool {
+	if hasReverseProxyThrottle {
+		return false
+	}
+
+	cfg.ReverseProxyThrottle = models.ReverseProxyThrottleConfig{
+		Enabled:           true,
+		RequestsPerSecond: defaultReverseProxyThrottleRPS,
+		Burst:             defaultReverseProxyThrottleBurst,
+		BlockSeconds:      defaultReverseProxyThrottleBlockSecs,
+	}
+	return true
 }
 
 func (m *Manager) loadUnlocked() (*AppConfig, bool, bool, error) {
@@ -199,7 +244,11 @@ func (m *Manager) loadUnlocked() (*AppConfig, bool, bool, error) {
 	}
 	applyDefaults(&cfg)
 	hasAuthCacheTTL, hasAuthCacheFailTTL := detectAuthCacheFieldPresence(data)
+	hasReverseProxyThrottle := detectReverseProxyThrottleFieldPresence(data)
 	migrated := applyMissingAuthCacheDefaults(&cfg, hasAuthCacheTTL, hasAuthCacheFailTTL)
+	if applyMissingReverseProxyThrottleDefaults(&cfg, hasReverseProxyThrottle) {
+		migrated = true
+	}
 	return &cfg, true, migrated, nil
 }
 

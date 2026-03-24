@@ -88,6 +88,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/default-route", s.handleSetDefaultRoute).Methods("POST")
 	r.HandleFunc("/api/config/proxy-protocol", s.handleGetProxyProtocolForce).Methods("GET")
 	r.HandleFunc("/api/config/proxy-protocol", s.handleSetProxyProtocolForce).Methods("POST")
+	r.HandleFunc("/api/config/reverse-proxy-throttle", s.handleGetReverseProxyThrottle).Methods("GET")
+	r.HandleFunc("/api/config/reverse-proxy-throttle", s.handleSetReverseProxyThrottle).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
 	r.HandleFunc("/api/auth", s.handleSetAuth).Methods("POST")
 	r.HandleFunc("/api/logging", s.handleGetLoggingConfig).Methods("GET")
@@ -423,6 +425,8 @@ type proxyProtocolForceRequest struct {
 	ProxyProtocolForce bool `json:"proxy_protocol_force" example:"true"`
 }
 
+type reverseProxyThrottleResponse = models.ReverseProxyThrottleConfig
+
 // handleGetProxyProtocolForce gets the current proxy protocol policy
 // @Summary Get proxy protocol force
 // @Description Get whether the proxy port requires Proxy Protocol header
@@ -468,6 +472,20 @@ func (s *Server) handleSetProxyProtocolForce(w http.ResponseWriter, r *http.Requ
 
 	s.ProxyHandler.SetProxyProtocolForce(*req.ProxyProtocolForce)
 	response.Success(w, proxyProtocolForceResponse{ProxyProtocolForce: *req.ProxyProtocolForce})
+}
+
+func (s *Server) handleGetReverseProxyThrottle(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetReverseProxyThrottle())
+}
+
+func (s *Server) handleSetReverseProxyThrottle(w http.ResponseWriter, r *http.Request) {
+	var req reverseProxyThrottleResponse
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+	s.ProxyHandler.SetReverseProxyThrottle(req)
+	response.Success(w, s.ProxyHandler.GetReverseProxyThrottle())
 }
 
 // handleGetAuth gets the global auth configuration (port and relative urls)
