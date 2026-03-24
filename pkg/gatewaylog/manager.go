@@ -95,6 +95,8 @@ type DailyFileWriter struct {
 	retentionDays int
 	currentDate   string
 	currentFile   *os.File
+	lastCleanup   string
+	dirReady      bool
 }
 
 func NewDailyFileWriter(baseDir string, retentionDays int) *DailyFileWriter {
@@ -141,19 +143,42 @@ func (w *DailyFileWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 
 	now := time.Now()
-	if err := os.MkdirAll(w.baseDir, 0o755); err != nil {
+	if err := w.ensureDirLocked(); err != nil {
 		return 0, err
 	}
 	if err := w.rotateLocked(now); err != nil {
 		return 0, err
 	}
-	if err := w.cleanupLocked(now); err != nil {
+	if err := w.maybeCleanupLocked(now); err != nil {
 		return 0, err
 	}
 	if w.currentFile == nil {
 		return 0, fmt.Errorf("log file is not open")
 	}
 	return w.currentFile.Write(p)
+}
+
+func (w *DailyFileWriter) ensureDirLocked() error {
+	if w.dirReady {
+		return nil
+	}
+	if err := os.MkdirAll(w.baseDir, 0o755); err != nil {
+		return err
+	}
+	w.dirReady = true
+	return nil
+}
+
+func (w *DailyFileWriter) maybeCleanupLocked(now time.Time) error {
+	date := now.Format(dateLayout)
+	if w.lastCleanup == date {
+		return nil
+	}
+	if err := w.cleanupLocked(now); err != nil {
+		return err
+	}
+	w.lastCleanup = date
+	return nil
 }
 
 func (w *DailyFileWriter) rotateLocked(now time.Time) error {

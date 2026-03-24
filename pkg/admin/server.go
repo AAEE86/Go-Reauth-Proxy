@@ -35,6 +35,20 @@ type ServerInfo struct {
 	Version string `json:"version" example:"0.0.1"`
 }
 
+type authConfigPatch struct {
+	AuthPort          *int    `json:"auth_port"`
+	AuthURL           *string `json:"auth_url"`
+	LoginURL          *string `json:"login_url"`
+	LogoutURL         *string `json:"logout_url"`
+	PreflightURL      *string `json:"preflight_url"`
+	AuthCacheTTL      *int    `json:"auth_cache_ttl_seconds"`
+	AuthCacheFailTTL  *int    `json:"auth_cache_unauthorized_ttl_seconds"`
+	PublicAuthBaseURL *string `json:"public_auth_base_url"`
+	PublicHTTPPort    *int    `json:"public_http_port"`
+	PublicHTTPSPort   *int    `json:"public_https_port"`
+	AuthHost          *string `json:"auth_host"`
+}
+
 func NewServer(handler *proxy.Handler, port int, cfgManager *config.Manager, initialCfg *config.AppConfig, streamManager *stream.Manager) *Server {
 	iptablesChainName := "REAUTH_FW"
 	if initialCfg != nil && initialCfg.IptablesChainName != "" {
@@ -468,6 +482,46 @@ func (s *Server) handleGetAuth(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, config)
 }
 
+func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) models.AuthConfig {
+	merged := current
+
+	if patch.AuthPort != nil {
+		merged.AuthPort = *patch.AuthPort
+	}
+	if patch.AuthURL != nil {
+		merged.AuthURL = *patch.AuthURL
+	}
+	if patch.LoginURL != nil {
+		merged.LoginURL = *patch.LoginURL
+	}
+	if patch.LogoutURL != nil {
+		merged.LogoutURL = *patch.LogoutURL
+	}
+	if patch.PreflightURL != nil {
+		merged.PreflightURL = *patch.PreflightURL
+	}
+	if patch.AuthCacheTTL != nil {
+		merged.AuthCacheTTL = *patch.AuthCacheTTL
+	}
+	if patch.AuthCacheFailTTL != nil {
+		merged.AuthCacheFailTTL = *patch.AuthCacheFailTTL
+	}
+	if patch.PublicAuthBaseURL != nil {
+		merged.PublicAuthBaseURL = *patch.PublicAuthBaseURL
+	}
+	if patch.PublicHTTPPort != nil {
+		merged.PublicHTTPPort = *patch.PublicHTTPPort
+	}
+	if patch.PublicHTTPSPort != nil {
+		merged.PublicHTTPSPort = *patch.PublicHTTPSPort
+	}
+	if patch.AuthHost != nil {
+		merged.AuthHost = *patch.AuthHost
+	}
+
+	return merged
+}
+
 // handleSetAuth sets the global auth configuration
 // @Summary Set global auth config
 // @Description Set the global authentication configurations (port, auth_url, login_url)
@@ -479,13 +533,14 @@ func (s *Server) handleGetAuth(w http.ResponseWriter, r *http.Request) {
 // @Failure 400 {object} response.Response
 // @Router /api/auth [post]
 func (s *Server) handleSetAuth(w http.ResponseWriter, r *http.Request) {
-	var req models.AuthConfig
+	var req authConfigPatch
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
 		return
 	}
 
-	if err := s.ProxyHandler.SetAuthConfig(req); err != nil {
+	nextConfig := mergeAuthConfig(s.ProxyHandler.GetAuthConfig(), req)
+	if err := s.ProxyHandler.SetAuthConfig(nextConfig); err != nil {
 		response.Error(w, errors.CodeBadRequest, err.Error())
 		return
 	}

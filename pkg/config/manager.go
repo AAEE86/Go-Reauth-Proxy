@@ -10,6 +10,11 @@ import (
 	"sync"
 )
 
+const (
+	defaultAuthCacheTTLSeconds             = 1
+	defaultAuthCacheUnauthorizedTTLSeconds = 1
+)
+
 type AppConfig struct {
 	Rules              []models.Rule        `json:"rules"`
 	HostRules          []models.HostRule    `json:"host_rules,omitempty"`
@@ -48,6 +53,8 @@ func defaultConfig() *AppConfig {
 			LoginURL:          "/login",
 			LogoutURL:         "/api/auth/logout",
 			PreflightURL:      "/api/auth/preflight",
+			AuthCacheTTL:      defaultAuthCacheTTLSeconds,
+			AuthCacheFailTTL:  defaultAuthCacheUnauthorizedTTLSeconds,
 			PublicAuthBaseURL: "",
 			PublicHTTPPort:    0,
 			PublicHTTPSPort:   0,
@@ -119,6 +126,12 @@ func applyDefaults(cfg *AppConfig) {
 	if cfg.AuthConfig.PreflightURL == "" {
 		cfg.AuthConfig.PreflightURL = "/api/auth/preflight"
 	}
+	if cfg.AuthConfig.AuthCacheTTL < 0 {
+		cfg.AuthConfig.AuthCacheTTL = 0
+	}
+	if cfg.AuthConfig.AuthCacheFailTTL < 0 {
+		cfg.AuthConfig.AuthCacheFailTTL = 0
+	}
 	if cfg.AuthConfig.PublicAuthBaseURL == "" {
 		cfg.AuthConfig.PublicAuthBaseURL = ""
 	}
@@ -140,21 +153,54 @@ func applyDefaults(cfg *AppConfig) {
 	}
 }
 
-func (m *Manager) loadUnlocked() (*AppConfig, bool, error) {
+func detectAuthCacheFieldPresence(data []byte) (hasAuthCacheTTL bool, hasAuthCacheFailTTL bool) {
+	var raw struct {
+		AuthConfig map[string]json.RawMessage `json:"auth_config"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false, false
+	}
+	if raw.AuthConfig == nil {
+		return false, false
+	}
+
+	_, hasAuthCacheTTL = raw.AuthConfig["auth_cache_ttl_seconds"]
+	_, hasAuthCacheFailTTL = raw.AuthConfig["auth_cache_unauthorized_ttl_seconds"]
+	return hasAuthCacheTTL, hasAuthCacheFailTTL
+}
+
+func applyMissingAuthCacheDefaults(cfg *AppConfig, hasAuthCacheTTL bool, hasAuthCacheFailTTL bool) bool {
+	changed := false
+
+	if !hasAuthCacheTTL && cfg.AuthConfig.AuthCacheTTL == 0 {
+		cfg.AuthConfig.AuthCacheTTL = defaultAuthCacheTTLSeconds
+		changed = true
+	}
+	if !hasAuthCacheFailTTL && cfg.AuthConfig.AuthCacheFailTTL == 0 {
+		cfg.AuthConfig.AuthCacheFailTTL = defaultAuthCacheUnauthorizedTTLSeconds
+		changed = true
+	}
+
+	return changed
+}
+
+func (m *Manager) loadUnlocked() (*AppConfig, bool, bool, error) {
 	data, err := os.ReadFile(m.filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return defaultConfig(), false, nil
+			return defaultConfig(), false, true, nil
 		}
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	var cfg AppConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, true, err
+		return nil, true, false, err
 	}
 	applyDefaults(&cfg)
-	return &cfg, true, nil
+	hasAuthCacheTTL, hasAuthCacheFailTTL := detectAuthCacheFieldPresence(data)
+	migrated := applyMissingAuthCacheDefaults(&cfg, hasAuthCacheTTL, hasAuthCacheFailTTL)
+	return &cfg, true, migrated, nil
 }
 
 func (m *Manager) saveUnlocked(cfg *AppConfig) error {
@@ -175,11 +221,11 @@ func (m *Manager) Load() (*AppConfig, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cfg, existed, err := m.loadUnlocked()
+	cfg, existed, migrated, err := m.loadUnlocked()
 	if err != nil {
 		return nil, err
 	}
-	if !existed {
+	if !existed || migrated {
 		if err := m.saveUnlocked(cfg); err != nil {
 			return nil, err
 		}
@@ -198,7 +244,7 @@ func (m *Manager) Update(updateFn func(*AppConfig) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cfg, _, err := m.loadUnlocked()
+	cfg, _, _, err := m.loadUnlocked()
 	if err != nil {
 		return err
 	}

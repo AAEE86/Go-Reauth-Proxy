@@ -59,6 +59,8 @@ type Handler struct {
 	authClient                 *http.Client
 	proxyTransport             *http.Transport
 	preflightSkipUntilUnixNano int64
+	authCache                  authStateCache
+	preflightCache             preflightStateCache
 }
 
 type requestSnapshot struct {
@@ -235,10 +237,62 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	if authConfig.AuthPort <= 0 {
 		return preflightDecision{}
 	}
-	if skipUntil := atomic.LoadInt64(&h.preflightSkipUntilUnixNano); skipUntil > time.Now().UnixNano() {
+	now := time.Now()
+	lookup, canLookup := buildPreflightCacheLookup(r, clientIP, accessMode, isMatch)
+	ttl := preflightCacheTTL(authConfig)
+
+	if canLookup && ttl > 0 {
+		if entry, ok := h.preflightCacheGet(lookup.cacheKey, now); ok {
+			return entry.decision
+		}
+	}
+	if skipUntil := atomic.LoadInt64(&h.preflightSkipUntilUnixNano); skipUntil > now.UnixNano() {
 		return preflightDecision{}
 	}
 
+	if canLookup && ttl > 0 {
+		executionAny, _, _ := h.preflightCache.group.Do(lookup.cacheKey, func() (any, error) {
+			if entry, ok := h.preflightCacheGet(lookup.cacheKey, time.Now()); ok {
+				return preflightCacheExecution{entry: &entry}, nil
+			}
+
+			decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
+			if err != nil {
+				cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
+				atomic.StoreInt64(&h.preflightSkipUntilUnixNano, cooldownUntil)
+				log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
+				return preflightCacheExecution{}, nil
+			}
+			atomic.StoreInt64(&h.preflightSkipUntilUnixNano, 0)
+
+			entry := preflightCacheEntry{
+				decision:    decision,
+				expiresAt:   time.Now().Add(ttl),
+				identityKey: lookup.identityKey,
+			}
+			h.preflightCacheStore(lookup.cacheKey, entry, time.Now())
+			return preflightCacheExecution{entry: &entry}, nil
+		})
+
+		execution, _ := executionAny.(preflightCacheExecution)
+		if execution.entry != nil {
+			return execution.entry.decision
+		}
+		return execution.decision
+	}
+
+	decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
+	if err != nil {
+		cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
+		atomic.StoreInt64(&h.preflightSkipUntilUnixNano, cooldownUntil)
+		log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
+		return preflightDecision{}
+	}
+	atomic.StoreInt64(&h.preflightSkipUntilUnixNano, 0)
+	return decision
+}
+
+func (h *Handler) performPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string) (preflightDecision, error) {
 	preflightURLPath := authConfig.PreflightURL
 	if preflightURLPath == "" {
 		preflightURLPath = "/api/auth/preflight"
@@ -248,7 +302,7 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	preflightReq, err := http.NewRequest(http.MethodHead, preflightURL, nil)
 	if err != nil {
 		log.Printf("Failed to create preflight request: %v", err)
-		return preflightDecision{}
+		return preflightDecision{}, err
 	}
 
 	preflightReq.Header.Set("X-Real-IP", clientIP)
@@ -280,13 +334,9 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 
 	resp, err := client.Do(preflightReq)
 	if err != nil {
-		cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
-		atomic.StoreInt64(&h.preflightSkipUntilUnixNano, cooldownUntil)
-		log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
-		return preflightDecision{}
+		return preflightDecision{}, err
 	}
-	resp.Body.Close()
-	atomic.StoreInt64(&h.preflightSkipUntilUnixNano, 0)
+	defer resp.Body.Close()
 
 	decision := preflightDecision{
 		deny: strings.EqualFold(resp.Header.Get("X-Option"), "deny"),
@@ -296,7 +346,7 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 			decision.redirectLocation = location
 		}
 	}
-	return decision
+	return decision, nil
 }
 
 func (h *Handler) abortConnection(w http.ResponseWriter) {
@@ -338,6 +388,8 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 			Transport: newInternalTransport(),
 		},
 		proxyTransport: newProxyTransport(),
+		authCache:      newAuthStateCache(),
+		preflightCache: newPreflightStateCache(),
 	}
 
 	var emptyHook func()
@@ -919,6 +971,12 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	if config.PreflightURL == "" {
 		config.PreflightURL = "/api/auth/preflight"
 	}
+	if config.AuthCacheTTL < 0 {
+		config.AuthCacheTTL = 0
+	}
+	if config.AuthCacheFailTTL < 0 {
+		config.AuthCacheFailTTL = 0
+	}
 	if config.PublicHTTPPort < 0 {
 		config.PublicHTTPPort = 0
 	}
@@ -932,6 +990,7 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	defer h.mu.Unlock()
 	h.AuthConfig = config
 	h.saveConfigLocked()
+	h.clearAuthCache()
 	return nil
 }
 
@@ -1419,6 +1478,10 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 		req.Header.Del("X-Match")
 		copyUserAgentHeader(req, r)
 	}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
+		return nil
+	}
 
 	proxy.ServeHTTP(w, r)
 	return true
@@ -1556,6 +1619,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		transport = newProxyTransport()
 	}
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -1598,6 +1662,10 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		if isAuthHostProxy {
+			h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
+		}
+
 		needsToolbar := matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 		if !needsToolbar {
 			return nil
@@ -1795,7 +1863,26 @@ func injectToolbarIntoHTML(bodyStr string, toolbarHTML string) string {
 	return bodyStr
 }
 
-func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string) authCheckResult {
+type authCheckErrorPage struct {
+	code    int
+	title   string
+	message string
+}
+
+type authCheckPlan struct {
+	result           authCheckResult
+	setCookies       []string
+	redirectLocation string
+	abortConnection  bool
+	errorPage        *authCheckErrorPage
+}
+
+type authCheckExecution struct {
+	entry *authCacheEntry
+	plan  authCheckPlan
+}
+
+func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string) authCheckPlan {
 	client := h.authClient
 	if client == nil {
 		client = &http.Client{
@@ -1806,8 +1893,14 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	if authConfig.AuthPort <= 0 {
 		log.Printf("Auth check requested but AuthPort is not configured")
-		response.HTML(w, r, errors.CodeInternal, "Authentication Service Not Configured", nil)
-		return authCheckResult{decision: "error"}
+		return authCheckPlan{
+			result: authCheckResult{decision: "error"},
+			errorPage: &authCheckErrorPage{
+				code:    errors.CodeInternal,
+				title:   "Authentication Service Not Configured",
+				message: "Authentication Service Not Configured",
+			},
+		}
 	}
 
 	authURLPath := authConfig.AuthURL
@@ -1819,8 +1912,14 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	authReq, err := http.NewRequest("GET", authURL, nil)
 	if err != nil {
 		log.Printf("Failed to create auth request: %v", err)
-		response.HTML(w, r, errors.CodeInternal, "Internal Server Error during Auth", nil)
-		return authCheckResult{decision: "error"}
+		return authCheckPlan{
+			result: authCheckResult{decision: "error"},
+			errorPage: &authCheckErrorPage{
+				code:    errors.CodeInternal,
+				title:   "Internal Server Error during Auth",
+				message: "Internal Server Error during Auth",
+			},
+		}
 	}
 
 	authReq.Header.Set("X-Real-IP", clientIP)
@@ -1844,13 +1943,17 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 	resp, err := client.Do(authReq)
 	if err != nil {
 		log.Printf("Auth request failed: %v", err)
-		response.HTML(w, r, errors.CodeProxyAuthFailed, "Authentication Service Unavailable", nil)
-		return authCheckResult{decision: "error"}
+		return authCheckPlan{
+			result: authCheckResult{decision: "error"},
+			errorPage: &authCheckErrorPage{
+				code:    errors.CodeProxyAuthFailed,
+				title:   "Authentication Service Unavailable",
+				message: "Authentication Service Unavailable",
+			},
+		}
 	}
 	defer resp.Body.Close()
-	for _, setCookie := range resp.Header.Values("Set-Cookie") {
-		w.Header().Add("Set-Cookie", setCookie)
-	}
+	setCookies := copySetCookieHeaders(resp.Header.Values("Set-Cookie"))
 
 	var authResponse struct {
 		Success bool   `json:"success"`
@@ -1859,37 +1962,41 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	if err := json.NewDecoder(resp.Body).Decode(&authResponse); err != nil {
 		log.Printf("Failed to decode auth response: %v", err)
-		response.HTML(w, r, errors.CodeInternal, "Invalid Auth Response Format", nil)
-		return authCheckResult{decision: "error"}
+		return authCheckPlan{
+			result: authCheckResult{decision: "error"},
+			errorPage: &authCheckErrorPage{
+				code:    errors.CodeInternal,
+				title:   "Invalid Auth Response Format",
+				message: "Invalid Auth Response Format",
+			},
+		}
 	}
 	if authResponse.Success {
-		h.markLoggedInActive(r, clientIP, time.Now())
-		return authCheckResult{
-			allowed:         true,
-			authenticated:   true,
-			suppressToolbar: strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share"),
-			decision:        "passed",
+		return authCheckPlan{
+			result: authCheckResult{
+				allowed:         true,
+				authenticated:   true,
+				suppressToolbar: strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share"),
+				decision:        "passed",
+			},
+			setCookies: setCookies,
 		}
 	}
 	log.Printf("Auth failed: %s", authResponse.Message)
-	if h.fnAppMockService != nil {
-		handled, err := h.fnAppMockService.handleUnauthorizedRequest(w, r, upstreamTarget)
-		if err != nil {
-			log.Printf("Failed to serve unauthorized FN App mock response: %v", err)
-			return authCheckResult{decision: "error"}
-		}
-		if handled {
-			return authCheckResult{decision: "fn_app_prompt"}
-		}
-	}
 	if accessMode == "strict_whitelist" {
-		h.abortConnection(w)
-		return authCheckResult{decision: "denied"}
+		return authCheckPlan{
+			result:          authCheckResult{decision: "denied"},
+			setCookies:      setCookies,
+			abortConnection: true,
+		}
 	}
 	if redirectLocation := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); redirectLocation != "" {
 		if strings.HasPrefix(redirectLocation, "/") || strings.HasPrefix(redirectLocation, "http://") || strings.HasPrefix(redirectLocation, "https://") {
-			http.Redirect(w, r, redirectLocation, http.StatusFound)
-			return authCheckResult{decision: "redirected"}
+			return authCheckPlan{
+				result:           authCheckResult{decision: "redirected"},
+				setCookies:       setCookies,
+				redirectLocation: redirectLocation,
+			}
 		}
 	}
 
@@ -1911,8 +2018,96 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 		loginURL.RawQuery = q.Encode()
 	}
 
-	http.Redirect(w, r, loginURL.String(), http.StatusFound)
-	return authCheckResult{decision: "redirected"}
+	return authCheckPlan{
+		result:           authCheckResult{decision: "redirected"},
+		setCookies:       setCookies,
+		redirectLocation: loginURL.String(),
+	}
+}
+
+func (h *Handler) applyAuthCheckPlan(w http.ResponseWriter, r *http.Request, plan authCheckPlan, clientIP string, upstreamTarget string) authCheckResult {
+	for _, setCookie := range plan.setCookies {
+		w.Header().Add("Set-Cookie", setCookie)
+	}
+	if len(plan.setCookies) > 0 {
+		h.authCacheInvalidateForSetCookieMutation(r, clientIP, plan.setCookies)
+	}
+
+	if plan.errorPage != nil {
+		response.HTML(w, r, plan.errorPage.code, plan.errorPage.message, nil)
+		return plan.result
+	}
+
+	if plan.result.allowed {
+		h.markLoggedInActive(r, clientIP, time.Now())
+		return plan.result
+	}
+
+	if h.fnAppMockService != nil {
+		handled, err := h.fnAppMockService.handleUnauthorizedRequest(w, r, upstreamTarget)
+		if err != nil {
+			log.Printf("Failed to serve unauthorized FN App mock response: %v", err)
+			return authCheckResult{decision: "error"}
+		}
+		if handled {
+			return authCheckResult{decision: "fn_app_prompt"}
+		}
+	}
+
+	if plan.abortConnection {
+		h.abortConnection(w)
+		return plan.result
+	}
+	if plan.redirectLocation != "" {
+		http.Redirect(w, r, plan.redirectLocation, http.StatusFound)
+		return plan.result
+	}
+	return plan.result
+}
+
+func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string) authCheckResult {
+	now := time.Now()
+	useCache := authCacheEnabled(authConfig)
+	lookup, canLookup := buildAuthCacheLookup(r, clientIP, accessMode)
+
+	if useCache && canLookup {
+		if entry, ok := h.authCacheGet(lookup.cacheKey, now); ok {
+			return h.applyAuthCacheEntry(w, r, entry, clientIP)
+		}
+
+		executionAny, _, _ := h.authCache.group.Do(lookup.cacheKey, func() (any, error) {
+			if entry, ok := h.authCacheGet(lookup.cacheKey, time.Now()); ok {
+				return authCheckExecution{entry: &entry}, nil
+			}
+
+			plan := h.performAuthCheck(r, authConfig, clientIP, accessMode)
+			if plan.errorPage == nil && len(plan.setCookies) == 0 {
+				if ttl := authCacheTTL(authConfig, plan.result); ttl > 0 {
+					entry := authCacheEntry{
+						result:           plan.result,
+						setCookies:       copySetCookieHeaders(plan.setCookies),
+						redirectLocation: plan.redirectLocation,
+						abortConnection:  plan.abortConnection,
+						expiresAt:        time.Now().Add(ttl),
+						identityKey:      lookup.identityKey,
+					}
+					h.authCacheStore(lookup.cacheKey, entry, time.Now())
+					return authCheckExecution{entry: &entry}, nil
+				}
+			}
+
+			return authCheckExecution{plan: plan}, nil
+		})
+
+		execution, _ := executionAny.(authCheckExecution)
+		if execution.entry != nil {
+			return h.applyAuthCacheEntry(w, r, *execution.entry, clientIP)
+		}
+		return h.applyAuthCheckPlan(w, r, execution.plan, clientIP, upstreamTarget)
+	}
+
+	plan := h.performAuthCheck(r, authConfig, clientIP, accessMode)
+	return h.applyAuthCheckPlan(w, r, plan, clientIP, upstreamTarget)
 }
 
 func singleJoiningSlash(a, b string) string {

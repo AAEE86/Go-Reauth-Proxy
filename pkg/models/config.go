@@ -31,11 +31,13 @@ type StreamRule struct {
 }
 
 type AuthConfig struct {
-	AuthPort          int    `json:"auth_port" example:"3000"`                    // Local Auth Service Port
-	AuthURL           string `json:"auth_url" example:"/api/auth/verify"`         // Relative Verify URL (default /api/auth/verify)
-	LoginURL          string `json:"login_url" example:"/login"`                  // Relative Login URL (default /login)
-	LogoutURL         string `json:"logout_url" example:"/api/auth/logout"`       // Relative Logout URL (default /api/auth/logout)
-	PreflightURL      string `json:"preflight_url" example:"/api/auth/preflight"` // Relative Preflight URL (default /api/auth/preflight)
+	AuthPort          int    `json:"auth_port" example:"3000"`                                  // Local Auth Service Port
+	AuthURL           string `json:"auth_url" example:"/api/auth/verify"`                       // Relative Verify URL (default /api/auth/verify)
+	LoginURL          string `json:"login_url" example:"/login"`                                // Relative Login URL (default /login)
+	LogoutURL         string `json:"logout_url" example:"/api/auth/logout"`                     // Relative Logout URL (default /api/auth/logout)
+	PreflightURL      string `json:"preflight_url" example:"/api/auth/preflight"`               // Relative Preflight URL (default /api/auth/preflight)
+	AuthCacheTTL      int    `json:"auth_cache_ttl_seconds,omitempty" example:"1"`              // Successful auth-result cache TTL in seconds. 0 disables the cache.
+	AuthCacheFailTTL  int    `json:"auth_cache_unauthorized_ttl_seconds,omitempty" example:"1"` // Unauthorized auth-result cache TTL in seconds. 0 disables the cache.
 	PublicAuthBaseURL string `json:"public_auth_base_url,omitempty" example:"https://auth.example.com"`
 	PublicHTTPPort    int    `json:"public_http_port,omitempty" example:"80"`
 	PublicHTTPSPort   int    `json:"public_https_port,omitempty" example:"443"`
