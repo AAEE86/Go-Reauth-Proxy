@@ -51,8 +51,8 @@ type LoggingConfig struct {
 
 type ReverseProxyThrottleConfig struct {
 	Enabled           bool `json:"enabled,omitempty"`
-	RequestsPerSecond int  `json:"requests_per_second,omitempty" example:"8"`
-	Burst             int  `json:"burst,omitempty" example:"16"`
+	RequestsPerSecond int  `json:"requests_per_second,omitempty" example:"100"`
+	Burst             int  `json:"burst,omitempty" example:"200"`
 	BlockSeconds      int  `json:"block_seconds,omitempty" example:"30"`
 }
 

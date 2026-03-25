@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	defaultReverseProxyThrottleRPS       = 20
-	defaultReverseProxyThrottleBurst     = 50
+	defaultReverseProxyThrottleRPS       = 100
+	defaultReverseProxyThrottleBurst     = 200
 	defaultReverseProxyThrottleBlockSecs = 30
 	reverseProxyThrottleCleanupInterval  = 1 * time.Minute
 	reverseProxyThrottleMinimumEntryTTL  = 2 * time.Minute

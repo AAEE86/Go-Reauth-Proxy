@@ -13,8 +13,8 @@ import (
 const (
 	defaultAuthCacheTTLSeconds             = 1
 	defaultAuthCacheUnauthorizedTTLSeconds = 1
-	defaultReverseProxyThrottleRPS         = 20
-	defaultReverseProxyThrottleBurst       = 50
+	defaultReverseProxyThrottleRPS         = 100
+	defaultReverseProxyThrottleBurst       = 200
 	defaultReverseProxyThrottleBlockSecs   = 30
 )
 

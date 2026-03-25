@@ -115,8 +115,8 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
   "proxy_protocol_force": false,
   "reverse_proxy_throttle": {
     "enabled": true,
-    "requests_per_second": 20,
-    "burst": 50,
+    "requests_per_second": 100,
+    "burst": 200,
     "block_seconds": 30
   },
   "iptables_chain_name": "",
@@ -148,8 +148,8 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 {
   "reverse_proxy_throttle": {
     "enabled": true,
-    "requests_per_second": 20,
-    "burst": 50,
+    "requests_per_second": 100,
+    "burst": 200,
     "block_seconds": 30
   }
 }
