@@ -2131,7 +2131,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	if useCache && canLookup {
 		if entry, ok := h.authCacheGet(lookup.cacheKey, now); ok {
-			return h.applyAuthCacheEntry(w, r, entry, clientIP)
+			return h.applyAuthCacheEntry(w, r, entry, clientIP, upstreamTarget)
 		}
 
 		executionAny, _, _ := h.authCache.group.Do(lookup.cacheKey, func() (any, error) {
@@ -2160,7 +2160,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 		execution, _ := executionAny.(authCheckExecution)
 		if execution.entry != nil {
-			return h.applyAuthCacheEntry(w, r, *execution.entry, clientIP)
+			return h.applyAuthCacheEntry(w, r, *execution.entry, clientIP, upstreamTarget)
 		}
 		return h.applyAuthCheckPlan(w, r, execution.plan, clientIP, upstreamTarget)
 	}

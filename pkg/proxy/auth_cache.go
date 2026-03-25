@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -513,7 +514,7 @@ func (h *Handler) authCacheInvalidateForSetCookieMutation(r *http.Request, clien
 	h.authCacheInvalidateByIdentityKeys(identityKeys...)
 }
 
-func (h *Handler) applyAuthCacheEntry(w http.ResponseWriter, r *http.Request, entry authCacheEntry, clientIP string) authCheckResult {
+func (h *Handler) applyAuthCacheEntry(w http.ResponseWriter, r *http.Request, entry authCacheEntry, clientIP string, upstreamTarget string) authCheckResult {
 	for _, setCookie := range entry.setCookies {
 		w.Header().Add("Set-Cookie", setCookie)
 	}
@@ -521,6 +522,17 @@ func (h *Handler) applyAuthCacheEntry(w http.ResponseWriter, r *http.Request, en
 	if entry.result.allowed && entry.result.authenticated {
 		h.markLoggedInActive(r, clientIP, time.Now())
 		return entry.result
+	}
+
+	if h.fnAppMockService != nil {
+		handled, err := h.fnAppMockService.handleUnauthorizedRequest(w, r, upstreamTarget)
+		if err != nil {
+			log.Printf("Failed to serve unauthorized FN App mock response from auth cache: %v", err)
+			return authCheckResult{decision: "error"}
+		}
+		if handled {
+			return authCheckResult{decision: "fn_app_prompt"}
+		}
 	}
 
 	if entry.abortConnection {
