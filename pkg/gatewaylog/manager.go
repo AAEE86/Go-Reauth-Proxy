@@ -2,12 +2,15 @@ package gatewaylog
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,11 +21,14 @@ import (
 )
 
 const (
-	DefaultMaxDays = 7
-	dateLayout     = "2006-01-02"
-	fileExtension  = ".log"
-	maxScanToken   = 8 * 1024 * 1024
+	DefaultMaxDays  = 7
+	dateLayout      = "2006-01-02"
+	fileExtension   = ".log"
+	maxScanToken    = 8 * 1024 * 1024
+	cursorChunkSize = 64 * 1024
 )
+
+var errStopScan = errors.New("stop scan")
 
 type Entry struct {
 	Time          string `json:"time,omitempty"`
@@ -76,10 +82,21 @@ type QueryResult struct {
 	Date           string   `json:"date"`
 	LogsDir        string   `json:"logs_dir"`
 	AvailableDates []string `json:"available_dates"`
+	Pagination     string   `json:"pagination"`
 	Page           int      `json:"page"`
 	Limit          int      `json:"limit"`
 	Total          int      `json:"total"`
+	Cursor         string   `json:"cursor,omitempty"`
+	NextCursor     string   `json:"next_cursor,omitempty"`
+	HasMore        bool     `json:"has_more"`
 	Items          []Entry  `json:"items"`
+}
+
+type queryFilter struct {
+	search        string
+	exactStatuses map[int]struct{}
+	statusClasses map[int]struct{}
+	loggedIn      *bool
 }
 
 type DeleteResult struct {
@@ -346,7 +363,7 @@ func (m *Manager) GetDates() (DatesResult, error) {
 	}, nil
 }
 
-func (m *Manager) Query(date string, page int, limit int, search string) (QueryResult, error) {
+func (m *Manager) Query(date string, page int, limit int, search string, status string, loggedIn string, cursor string, pagination string) (QueryResult, error) {
 	selectedDate, err := normalizeDate(date)
 	if err != nil {
 		return QueryResult{}, err
@@ -362,50 +379,40 @@ func (m *Manager) Query(date string, page int, limit int, search string) (QueryR
 		limit = 200
 	}
 
-	items := make([]Entry, 0)
 	logPath := filepath.Join(m.logsDir, selectedDate+fileExtension)
-	file, err := os.Open(logPath)
+	filter, err := newQueryFilter(search, status, loggedIn)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return QueryResult{}, err
-		}
-	} else {
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), maxScanToken)
-		search = strings.ToLower(strings.TrimSpace(search))
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if search != "" && !strings.Contains(strings.ToLower(line), search) {
-				continue
-			}
-
-			var entry Entry
-			if err := json.Unmarshal([]byte(line), &entry); err != nil {
-				continue
-			}
-			items = append(items, entry)
-		}
-
-		if err := scanner.Err(); err != nil {
-			return QueryResult{}, err
-		}
-	}
-
-	reverseEntries(items)
-	total := len(items)
-	start := (page - 1) * limit
-	if start > total {
-		start = total
-	}
-	end := start + limit
-	if end > total {
-		end = total
+		return QueryResult{}, err
 	}
 
 	dates, err := m.listDates(true)
+	if err != nil {
+		return QueryResult{}, err
+	}
+
+	mode := normalizePaginationMode(pagination)
+	if mode == "cursor" {
+		items, nextCursor, hasMore, resolvedCursor, err := queryEntriesByCursor(logPath, filter, cursor, limit)
+		if err != nil {
+			return QueryResult{}, err
+		}
+
+		return QueryResult{
+			Date:           selectedDate,
+			LogsDir:        m.logsDir,
+			AvailableDates: dates,
+			Pagination:     mode,
+			Page:           1,
+			Limit:          limit,
+			Total:          0,
+			Cursor:         resolvedCursor,
+			NextCursor:     nextCursor,
+			HasMore:        hasMore,
+			Items:          items,
+		}, nil
+	}
+
+	items, total, hasMore, err := queryEntries(logPath, filter, page, limit)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -414,10 +421,12 @@ func (m *Manager) Query(date string, page int, limit int, search string) (QueryR
 		Date:           selectedDate,
 		LogsDir:        m.logsDir,
 		AvailableDates: dates,
+		Pagination:     mode,
 		Page:           page,
 		Limit:          limit,
 		Total:          total,
-		Items:          items[start:end],
+		HasMore:        hasMore,
+		Items:          items,
 	}, nil
 }
 
@@ -514,8 +523,340 @@ func normalizeDate(raw string) (string, error) {
 	return parsed.Format(dateLayout), nil
 }
 
+func normalizePaginationMode(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), "cursor") {
+		return "cursor"
+	}
+	return "page"
+}
+
 func reverseEntries(items []Entry) {
 	for left, right := 0, len(items)-1; left < right; left, right = left+1, right-1 {
 		items[left], items[right] = items[right], items[left]
 	}
+}
+
+func newQueryFilter(search string, status string, loggedIn string) (queryFilter, error) {
+	filter := queryFilter{
+		search: strings.ToLower(strings.TrimSpace(search)),
+	}
+
+	rawStatus := strings.TrimSpace(status)
+	if rawStatus != "" && !strings.EqualFold(rawStatus, "all") {
+		filter.exactStatuses = make(map[int]struct{})
+		filter.statusClasses = make(map[int]struct{})
+
+		for _, token := range strings.Split(rawStatus, ",") {
+			value := strings.ToLower(strings.TrimSpace(token))
+			if value == "" || value == "all" {
+				continue
+			}
+
+			if len(value) == 3 && strings.HasSuffix(value, "xx") {
+				class := int(value[0] - '0')
+				if class < 1 || class > 5 {
+					return queryFilter{}, fmt.Errorf("invalid status filter: %s", token)
+				}
+				filter.statusClasses[class] = struct{}{}
+				continue
+			}
+
+			code, err := strconv.Atoi(value)
+			if err != nil || code < 100 || code > 599 {
+				return queryFilter{}, fmt.Errorf("invalid status filter: %s", token)
+			}
+			filter.exactStatuses[code] = struct{}{}
+		}
+	}
+
+	if loggedInFilter, err := parseLoggedInFilter(loggedIn); err != nil {
+		return queryFilter{}, err
+	} else {
+		filter.loggedIn = loggedInFilter
+	}
+
+	return filter, nil
+}
+
+func (f queryFilter) matchLine(line string) bool {
+	if f.search == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(line), f.search)
+}
+
+func (f queryFilter) matchStatus(status int) bool {
+	if len(f.exactStatuses) == 0 && len(f.statusClasses) == 0 {
+		return true
+	}
+	if _, ok := f.exactStatuses[status]; ok {
+		return true
+	}
+	_, ok := f.statusClasses[status/100]
+	return ok
+}
+
+func (f queryFilter) matchLoggedIn(loggedIn bool) bool {
+	if f.loggedIn == nil {
+		return true
+	}
+	return *f.loggedIn == loggedIn
+}
+
+func parseLoggedInFilter(raw string) (*bool, error) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "", "all":
+		return nil, nil
+	case "true", "1", "yes", "logged_in":
+		loggedIn := true
+		return &loggedIn, nil
+	case "false", "0", "no", "logged_out":
+		loggedIn := false
+		return &loggedIn, nil
+	default:
+		return nil, fmt.Errorf("invalid logged_in filter: %s", raw)
+	}
+}
+
+func queryEntries(logPath string, filter queryFilter, page int, limit int) ([]Entry, int, bool, error) {
+	return queryEntriesStreaming(logPath, filter, page, limit)
+}
+
+func queryEntriesStreaming(logPath string, filter queryFilter, page int, limit int) ([]Entry, int, bool, error) {
+	total, err := scanMatchingEntries(logPath, filter, nil)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	forwardStart, forwardEnd := resolveForwardWindow(total, page, limit)
+	if forwardStart == forwardEnd {
+		return []Entry{}, total, false, nil
+	}
+
+	items := make([]Entry, 0, forwardEnd-forwardStart)
+	err = collectMatchingEntries(logPath, filter, forwardStart, forwardEnd, func(entry Entry) {
+		items = append(items, entry)
+	})
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	reverseEntries(items)
+	return items, total, forwardStart > 0, nil
+}
+
+func queryEntriesByCursor(logPath string, filter queryFilter, cursor string, limit int) ([]Entry, string, bool, string, error) {
+	file, err := os.Open(logPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []Entry{}, "", false, "", nil
+		}
+		return nil, "", false, "", err
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, "", false, "", err
+	}
+
+	endOffset, resolvedCursor, err := resolveCursorOffset(stat.Size(), cursor)
+	if err != nil {
+		return nil, "", false, "", err
+	}
+	if endOffset == 0 {
+		return []Entry{}, "", false, resolvedCursor, nil
+	}
+
+	items := make([]Entry, 0, limit)
+	oldestReturnedStart := int64(0)
+	hasMore := false
+
+	err = scanLinesBackward(file, endOffset, func(line []byte, lineStart int64) (bool, error) {
+		if !filter.matchLine(string(line)) {
+			return true, nil
+		}
+
+		var entry Entry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return true, nil
+		}
+		if !filter.matchStatus(entry.Status) || !filter.matchLoggedIn(entry.LoggedIn) {
+			return true, nil
+		}
+
+		if len(items) == limit {
+			hasMore = true
+			return false, nil
+		}
+
+		items = append(items, entry)
+		oldestReturnedStart = lineStart
+		return true, nil
+	})
+	if err != nil {
+		return nil, "", false, "", err
+	}
+
+	nextCursor := ""
+	if hasMore && oldestReturnedStart > 0 {
+		nextCursor = strconv.FormatInt(oldestReturnedStart, 10)
+	}
+
+	return items, nextCursor, hasMore, resolvedCursor, nil
+}
+
+func resolveForwardWindow(total int, page int, limit int) (int, int) {
+	startDesc := (page - 1) * limit
+	if startDesc >= total {
+		return total, total
+	}
+
+	endDesc := startDesc + limit
+	if endDesc > total {
+		endDesc = total
+	}
+
+	return total - endDesc, total - startDesc
+}
+
+func scanMatchingEntries(logPath string, filter queryFilter, onMatch func(entry Entry, matchIndex int) error) (int, error) {
+	file, err := os.Open(logPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxScanToken)
+
+	total := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !filter.matchLine(line) {
+			continue
+		}
+
+		var entry Entry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if !filter.matchStatus(entry.Status) {
+			continue
+		}
+		if !filter.matchLoggedIn(entry.LoggedIn) {
+			continue
+		}
+
+		if onMatch != nil {
+			if err := onMatch(entry, total); err != nil {
+				return total, err
+			}
+		}
+		total++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func collectMatchingEntries(logPath string, filter queryFilter, start int, end int, onCollect func(entry Entry)) error {
+	_, err := scanMatchingEntries(logPath, filter, func(entry Entry, matchIndex int) error {
+		if matchIndex < start {
+			return nil
+		}
+		if matchIndex >= end {
+			return errStopScan
+		}
+		onCollect(entry)
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopScan) {
+		return err
+	}
+	return nil
+}
+
+func resolveCursorOffset(fileSize int64, cursor string) (int64, string, error) {
+	trimmed := strings.TrimSpace(cursor)
+	if trimmed == "" {
+		return fileSize, "", nil
+	}
+
+	offset, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid cursor")
+	}
+	if offset < 0 || offset > fileSize {
+		return 0, "", fmt.Errorf("cursor out of range")
+	}
+	return offset, trimmed, nil
+}
+
+func scanLinesBackward(file *os.File, endOffset int64, onLine func(line []byte, lineStart int64) (bool, error)) error {
+	position := endOffset
+	var remainder []byte
+	firstPass := true
+
+	for position > 0 {
+		readSize := int64(cursorChunkSize)
+		if readSize > position {
+			readSize = position
+		}
+
+		start := position - readSize
+		buffer := make([]byte, readSize)
+		n, err := file.ReadAt(buffer, start)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		buffer = buffer[:n]
+
+		combined := append(append([]byte{}, buffer...), remainder...)
+		scanEnd := len(combined)
+		if firstPass {
+			scanEnd = len(bytes.TrimRight(combined[:scanEnd], "\r\n"))
+			firstPass = false
+		}
+
+		for scanEnd > 0 {
+			index := bytes.LastIndexByte(combined[:scanEnd], '\n')
+			if index == -1 {
+				break
+			}
+
+			line := bytes.TrimRight(combined[index+1:scanEnd], "\r")
+			lineStart := start + int64(index+1)
+			scanEnd = index
+
+			if len(line) == 0 {
+				continue
+			}
+
+			keepScanning, err := onLine(line, lineStart)
+			if err != nil {
+				return err
+			}
+			if !keepScanning {
+				return nil
+			}
+		}
+
+		remainder = append(remainder[:0], combined[:scanEnd]...)
+		position = start
+	}
+
+	line := bytes.TrimRight(remainder, "\r\n")
+	if len(line) == 0 {
+		return nil
+	}
+
+	_, err := onLine(line, 0)
+	return err
 }

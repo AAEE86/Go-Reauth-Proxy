@@ -947,11 +947,11 @@ func (h *Handler) GetLogDates() (gatewaylog.DatesResult, error) {
 	return h.gatewayLogManager.GetDates()
 }
 
-func (h *Handler) QueryLogEntries(date string, page int, limit int, search string) (gatewaylog.QueryResult, error) {
+func (h *Handler) QueryLogEntries(date string, page int, limit int, search string, status string, loggedIn string, cursor string, pagination string) (gatewaylog.QueryResult, error) {
 	if h.gatewayLogManager == nil {
 		return gatewaylog.QueryResult{}, nil
 	}
-	return h.gatewayLogManager.Query(date, page, limit, search)
+	return h.gatewayLogManager.Query(date, page, limit, search, status, loggedIn, cursor, pagination)
 }
 
 func (h *Handler) DeleteLogDate(date string) (gatewaylog.DeleteResult, error) {

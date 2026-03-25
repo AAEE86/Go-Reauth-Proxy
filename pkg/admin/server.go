@@ -597,14 +597,24 @@ func (s *Server) handleGetLoggingDates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetLoggingEntries(w http.ResponseWriter, r *http.Request) {
+	pagination := strings.TrimSpace(r.URL.Query().Get("pagination"))
+	paginationMode := "page"
+	if strings.EqualFold(pagination, "cursor") {
+		paginationMode = "cursor"
+	}
 	page := 1
-	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
-		value, err := strconv.Atoi(raw)
-		if err != nil || value <= 0 {
-			response.Error(w, errors.CodeBadRequest, "page must be a positive integer")
-			return
+	if paginationMode == "page" {
+		if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value <= 0 {
+				response.Error(w, errors.CodeBadRequest, "page must be a positive integer")
+				return
+			}
+			page = value
 		}
-		page = value
+	} else if pagination != "" && !strings.EqualFold(pagination, "cursor") {
+		response.Error(w, errors.CodeBadRequest, "pagination must be 'page' or 'cursor'")
+		return
 	}
 
 	limit := 20
@@ -622,6 +632,10 @@ func (s *Server) handleGetLoggingEntries(w http.ResponseWriter, r *http.Request)
 		page,
 		limit,
 		r.URL.Query().Get("search"),
+		r.URL.Query().Get("status"),
+		r.URL.Query().Get("logged_in"),
+		r.URL.Query().Get("cursor"),
+		paginationMode,
 	)
 	if err != nil {
 		response.Error(w, errors.CodeBadRequest, err.Error())
