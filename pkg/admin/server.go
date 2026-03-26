@@ -257,27 +257,24 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.ProxyHandler.FlushHostRules()
-
-	var addedRules []models.HostRule
+	rules := make([]models.HostRule, 0, len(reqs))
 	for _, req := range reqs {
-		rule := models.HostRule{
+		rules = append(rules, models.HostRule{
 			Host:            req.Host,
 			Target:          req.Target,
 			UseAuth:         req.UseAuth == nil || *req.UseAuth,
 			AccessMode:      req.AccessMode,
 			SuppressToolbar: req.SuppressToolbar != nil && *req.SuppressToolbar,
 			PreserveHost:    req.PreserveHost == nil || *req.PreserveHost,
-		}
-
-		if err := s.ProxyHandler.AddHostRule(rule); err != nil {
-			response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to add host rule: %v", err))
-			return
-		}
-		addedRules = append(addedRules, rule)
+		})
 	}
 
-	response.Success(w, addedRules)
+	if err := s.ProxyHandler.SetHostRules(rules); err != nil {
+		response.Error(w, errors.CodeInvalidRule, fmt.Sprintf("Failed to set host rules: %v", err))
+		return
+	}
+
+	response.Success(w, s.ProxyHandler.GetHostRules())
 }
 
 func (s *Server) handleFlushHostRules(w http.ResponseWriter, r *http.Request) {

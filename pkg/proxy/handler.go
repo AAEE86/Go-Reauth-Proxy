@@ -779,22 +779,31 @@ func (h *Handler) GetRules() []models.Rule {
 	return rules
 }
 
-func (h *Handler) AddHostRule(newRule models.HostRule) error {
+func (h *Handler) normalizeHostRule(newRule models.HostRule) (models.HostRule, error) {
 	newRule.Host = normalizeRequestHost(newRule.Host)
 	if newRule.Host == "" {
-		return fmt.Errorf("cannot add host rule with empty host")
+		return models.HostRule{}, fmt.Errorf("cannot add host rule with empty host")
 	}
 	if strings.Contains(newRule.Host, "/") || strings.Contains(newRule.Host, "*") {
-		return fmt.Errorf("host rule must be an exact host without path or wildcard")
+		return models.HostRule{}, fmt.Errorf("host rule must be an exact host without path or wildcard")
 	}
 	if newRule.Target == "" {
-		return fmt.Errorf("cannot add host rule with empty target")
+		return models.HostRule{}, fmt.Errorf("cannot add host rule with empty target")
 	}
 	if err := h.checkSafeTarget(newRule.Target); err != nil {
-		return fmt.Errorf("invalid target: %v", err)
+		return models.HostRule{}, fmt.Errorf("invalid target: %v", err)
 	}
 	if newRule.AccessMode == "" {
 		newRule.AccessMode = "login_first"
+	}
+
+	return newRule, nil
+}
+
+func (h *Handler) AddHostRule(newRule models.HostRule) error {
+	newRule, err := h.normalizeHostRule(newRule)
+	if err != nil {
+		return err
 	}
 
 	h.mu.Lock()
@@ -811,6 +820,33 @@ func (h *Handler) AddHostRule(newRule models.HostRule) error {
 	if !updated {
 		h.HostRules = append(h.HostRules, newRule)
 	}
+	h.saveConfigLocked()
+	return nil
+}
+
+func (h *Handler) SetHostRules(rules []models.HostRule) error {
+	normalizedRules := make([]models.HostRule, 0, len(rules))
+	indexByHost := make(map[string]int, len(rules))
+
+	for _, rule := range rules {
+		normalizedRule, err := h.normalizeHostRule(rule)
+		if err != nil {
+			return err
+		}
+
+		if idx, exists := indexByHost[normalizedRule.Host]; exists {
+			normalizedRules[idx] = normalizedRule
+			continue
+		}
+
+		indexByHost[normalizedRule.Host] = len(normalizedRules)
+		normalizedRules = append(normalizedRules, normalizedRule)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.HostRules = normalizedRules
 	h.saveConfigLocked()
 	return nil
 }
