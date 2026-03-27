@@ -63,6 +63,7 @@ type Handler struct {
 	authCache                  authStateCache
 	preflightCache             preflightStateCache
 	reverseProxyThrottle       *reverseProxyThrottle
+	forwardedHeaderPolicy      *forwardedHeaderPolicyResolver
 }
 
 type requestSnapshot struct {
@@ -220,6 +221,38 @@ func copyUserAgentHeader(dst, src *http.Request) {
 	// Prevent Go's default client UA from leaking into upstream requests
 	// when the original client did not send one.
 	dst.Header.Set("User-Agent", "")
+}
+
+func applyForwardedHeaderPolicy(out *http.Request, in *http.Request, clientIP string, policy forwardedHeaderPolicy) {
+	if out == nil {
+		return
+	}
+
+	out.Header.Set("X-Real-IP", clientIP)
+	if policy == forwardedHeaderPolicyOmit {
+		out.Header.Del("X-Forwarded-For")
+		out.Header.Del("X-Forwarded-Host")
+		out.Header.Del("X-Forwarded-Proto")
+		return
+	}
+
+	if in == nil {
+		return
+	}
+
+	out.Header.Set("X-Forwarded-For", clientIP)
+	out.Header.Set("X-Forwarded-Host", in.Host)
+	out.Header.Set("X-Forwarded-Proto", requestScheme(in))
+}
+
+func (h *Handler) forwardedHeaderPolicyForTarget(r *http.Request, target *url.URL) forwardedHeaderPolicy {
+	if h == nil || h.forwardedHeaderPolicy == nil {
+		return forwardedHeaderPolicyAdd
+	}
+	if r == nil {
+		return h.forwardedHeaderPolicy.Policy(nil, target)
+	}
+	return h.forwardedHeaderPolicy.Policy(r.Context(), target)
 }
 
 func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string) preflightDecision {
@@ -381,9 +414,10 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 			Timeout:   5 * time.Second,
 			Transport: newInternalTransport(),
 		},
-		proxyTransport: newProxyTransport(),
-		authCache:      newAuthStateCache(),
-		preflightCache: newPreflightStateCache(),
+		proxyTransport:        newProxyTransport(),
+		authCache:             newAuthStateCache(),
+		preflightCache:        newPreflightStateCache(),
+		forwardedHeaderPolicy: newForwardedHeaderPolicyResolver(newProxyTransport()),
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
 
@@ -1712,17 +1746,14 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	if transport == nil {
 		transport = newProxyTransport()
 	}
+	forwardedHeaderPolicy := h.forwardedHeaderPolicyForTarget(r, targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetXForwarded()
-			pr.Out.Header.Set("X-Forwarded-For", clientIP)
-			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
-			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
-			pr.Out.Header.Set("X-Real-IP", clientIP)
+			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, forwardedHeaderPolicy)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
 			if matchedRule.PreserveHost {
@@ -1815,15 +1846,12 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	if transport == nil {
 		transport = newProxyTransport()
 	}
+	forwardedHeaderPolicy := h.forwardedHeaderPolicyForTarget(r, targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetXForwarded()
-			pr.Out.Header.Set("X-Forwarded-For", clientIP)
-			pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
-			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
-			pr.Out.Header.Set("X-Real-IP", clientIP)
+			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, forwardedHeaderPolicy)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
 			pr.Out.Host = targetURL.Host
