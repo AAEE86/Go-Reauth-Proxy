@@ -269,7 +269,13 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 
 	if canLookup && ttl > 0 {
 		if entry, ok := h.preflightCacheGet(lookup.cacheKey, now); ok {
-			return entry.decision
+			if shouldBypassFNAppNegativePreflightCache(r, entry.decision) {
+				h.preflightCache.mu.Lock()
+				h.preflightCache.deleteEntryLocked(lookup.cacheKey)
+				h.preflightCache.mu.Unlock()
+			} else {
+				return entry.decision
+			}
 		}
 	}
 	if skipUntil := atomic.LoadInt64(&h.preflightSkipUntilUnixNano); skipUntil > now.UnixNano() {
@@ -279,7 +285,13 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	if canLookup && ttl > 0 {
 		executionAny, _, _ := h.preflightCache.group.Do(lookup.cacheKey, func() (any, error) {
 			if entry, ok := h.preflightCacheGet(lookup.cacheKey, time.Now()); ok {
-				return preflightCacheExecution{entry: &entry}, nil
+				if shouldBypassFNAppNegativePreflightCache(r, entry.decision) {
+					h.preflightCache.mu.Lock()
+					h.preflightCache.deleteEntryLocked(lookup.cacheKey)
+					h.preflightCache.mu.Unlock()
+				} else {
+					return preflightCacheExecution{entry: &entry}, nil
+				}
 			}
 
 			decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
@@ -296,7 +308,9 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 				expiresAt:   time.Now().Add(ttl),
 				identityKey: lookup.identityKey,
 			}
-			h.preflightCacheStore(lookup.cacheKey, entry, time.Now())
+			if !shouldBypassFNAppNegativePreflightCache(r, decision) {
+				h.preflightCacheStore(lookup.cacheKey, entry, time.Now())
+			}
 			return preflightCacheExecution{entry: &entry}, nil
 		})
 
@@ -2195,12 +2209,24 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 
 	if useCache && canLookup {
 		if entry, ok := h.authCacheGet(lookup.cacheKey, now); ok {
-			return h.applyAuthCacheEntry(w, r, entry, clientIP, upstreamTarget)
+			if shouldBypassFNAppUnauthorizedAuthCache(r, entry.result) {
+				h.authCache.mu.Lock()
+				h.authCache.deleteEntryLocked(lookup.cacheKey)
+				h.authCache.mu.Unlock()
+			} else {
+				return h.applyAuthCacheEntry(w, r, entry, clientIP, upstreamTarget)
+			}
 		}
 
 		executionAny, _, _ := h.authCache.group.Do(lookup.cacheKey, func() (any, error) {
 			if entry, ok := h.authCacheGet(lookup.cacheKey, time.Now()); ok {
-				return authCheckExecution{entry: &entry}, nil
+				if shouldBypassFNAppUnauthorizedAuthCache(r, entry.result) {
+					h.authCache.mu.Lock()
+					h.authCache.deleteEntryLocked(lookup.cacheKey)
+					h.authCache.mu.Unlock()
+				} else {
+					return authCheckExecution{entry: &entry}, nil
+				}
 			}
 
 			plan := h.performAuthCheck(r, authConfig, clientIP, accessMode)
@@ -2214,7 +2240,9 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 						expiresAt:        time.Now().Add(ttl),
 						identityKey:      lookup.identityKey,
 					}
-					h.authCacheStore(lookup.cacheKey, entry, time.Now())
+					if !shouldBypassFNAppUnauthorizedAuthCache(r, plan.result) {
+						h.authCacheStore(lookup.cacheKey, entry, time.Now())
+					}
 					return authCheckExecution{entry: &entry}, nil
 				}
 			}

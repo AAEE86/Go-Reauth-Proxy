@@ -97,6 +97,14 @@ func authCacheTTL(authConfig models.AuthConfig, result authCheckResult) time.Dur
 	}
 }
 
+func shouldBypassFNAppUnauthorizedAuthCache(r *http.Request, result authCheckResult) bool {
+	return isFNAppRequest(r) && (!result.allowed || !result.authenticated)
+}
+
+func shouldBypassFNAppNegativePreflightCache(r *http.Request, decision preflightDecision) bool {
+	return isFNAppRequest(r) && (decision.deny || strings.TrimSpace(decision.redirectLocation) != "")
+}
+
 func preflightCacheTTL(authConfig models.AuthConfig) time.Duration {
 	successTTL := authConfig.AuthCacheTTL
 	failTTL := authConfig.AuthCacheFailTTL
