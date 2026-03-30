@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"go-reauth-proxy/pkg/config"
 	"go-reauth-proxy/pkg/errors"
@@ -14,6 +15,7 @@ import (
 	"go-reauth-proxy/pkg/version"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -124,9 +126,6 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/iptables/tcp-redirect", s.IptablesHandler.HandleClearTCPRedirect).Methods("DELETE")
 	r.HandleFunc("/api/iptables/list", s.IptablesHandler.HandleList).Methods("GET")
 
-	addr := fmt.Sprintf("127.0.0.1:%d", s.Port)
-	log.Printf("Admin server listening on %s", addr)
-
 	loggedRouter := middleware.Logger(middleware.CORS(r))
 
 	r.NotFoundHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +135,48 @@ func (s *Server) Start() error {
 		response.Error(w, errors.CodeBadRequest, "Method Not Allowed")
 	})
 
-	return http.ListenAndServe(addr, loggedRouter)
+	server := &http.Server{Handler: loggedRouter}
+
+	listenTargets := []struct {
+		network string
+		host    string
+	}{
+		{network: "tcp4", host: "127.0.0.1"},
+		{network: "tcp6", host: "::1"},
+	}
+
+	var listeners []net.Listener
+	for _, target := range listenTargets {
+		addr := net.JoinHostPort(target.host, strconv.Itoa(s.Port))
+		listener, err := net.Listen(target.network, addr)
+		if err != nil {
+			if target.network == "tcp6" {
+				log.Printf("Admin IPv6 listener unavailable on %s: %v", addr, err)
+				continue
+			}
+			for _, openListener := range listeners {
+				_ = openListener.Close()
+			}
+			return err
+		}
+		listeners = append(listeners, listener)
+		log.Printf("Admin server listening on %s", listener.Addr().String())
+	}
+	if len(listeners) == 0 {
+		return fmt.Errorf("no admin listeners started on port %d", s.Port)
+	}
+
+	errCh := make(chan error, len(listeners))
+	for _, listener := range listeners {
+		go func(l net.Listener) {
+			err := server.Serve(l)
+			if err != nil && err != http.ErrServerClosed && !stderrors.Is(err, net.ErrClosed) {
+				errCh <- err
+			}
+		}(listener)
+	}
+
+	return <-errCh
 }
 
 // handleGetRules returns all proxy rules
