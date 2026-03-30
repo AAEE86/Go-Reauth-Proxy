@@ -41,6 +41,7 @@ type Handler struct {
 	ProxyPort             int
 	ProxyProtocolForce    bool
 	ReverseProxyThrottle  models.ReverseProxyThrottleConfig
+	GatewayVisibility     models.GatewayVisibilityConfig
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
@@ -63,6 +64,7 @@ type Handler struct {
 	authCache                  authStateCache
 	preflightCache             preflightStateCache
 	reverseProxyThrottle       *reverseProxyThrottle
+	gatewayVisibility          *gatewayVisibility
 	forwardedHeaderPolicy      *forwardedHeaderPolicyResolver
 }
 
@@ -416,6 +418,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		ProxyPort:            proxyPort,
 		ProxyProtocolForce:   initialCfg.ProxyProtocolForce,
 		ReverseProxyThrottle: normalizeReverseProxyThrottleConfig(initialCfg.ReverseProxyThrottle),
+		GatewayVisibility:    initialCfg.Visibility,
 		configManager:        cfgManager,
 		sslConfig:            copySSLConfig(initialCfg.SSL),
 		gatewayLogManager:    gatewaylog.NewManager(logsDir, logConfig),
@@ -434,6 +437,16 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		forwardedHeaderPolicy: newForwardedHeaderPolicyResolver(newProxyTransport()),
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
+	visibility, err := newGatewayVisibility(initialCfg.Visibility)
+	if err != nil {
+		log.Printf("Failed to normalize initial gateway visibility: %v", err)
+		visibility, _ = newGatewayVisibility(models.GatewayVisibilityConfig{
+			Enabled:   false,
+			CIDRs:     []string{},
+			UpdatedAt: "",
+		})
+	}
+	h.gatewayVisibility = visibility
 
 	var emptyHook func()
 	h.sslOnChange.Store(emptyHook)
@@ -507,6 +520,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.Logging = h.LoggingConfig
 		conf.ProxyProtocolForce = h.ProxyProtocolForce
 		conf.ReverseProxyThrottle = h.ReverseProxyThrottle
+		conf.Visibility = h.GatewayVisibility
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
 		return nil
@@ -1090,6 +1104,31 @@ func (h *Handler) GetReverseProxyThrottle() models.ReverseProxyThrottleConfig {
 	return h.ReverseProxyThrottle
 }
 
+func (h *Handler) GetGatewayVisibility() models.GatewayVisibilityConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	cidrs := make([]string, len(h.GatewayVisibility.CIDRs))
+	copy(cidrs, h.GatewayVisibility.CIDRs)
+
+	return models.GatewayVisibilityConfig{
+		Enabled:   h.GatewayVisibility.Enabled,
+		CIDRs:     cidrs,
+		UpdatedAt: h.GatewayVisibility.UpdatedAt,
+	}
+}
+
+func (h *Handler) IsClientIPVisible(clientIP string) bool {
+	h.mu.RLock()
+	visibility := h.gatewayVisibility
+	h.mu.RUnlock()
+
+	if visibility == nil {
+		return true
+	}
+	return visibility.contains(clientIP)
+}
+
 func (h *Handler) SetReverseProxyThrottle(cfg models.ReverseProxyThrottleConfig) {
 	normalized := normalizeReverseProxyThrottleConfig(cfg)
 
@@ -1112,6 +1151,30 @@ func (h *Handler) SetReverseProxyThrottle(cfg models.ReverseProxyThrottleConfig)
 	if throttle != nil {
 		throttle.updateConfig(normalized)
 	}
+}
+
+func (h *Handler) SetGatewayVisibility(cfg models.GatewayVisibilityConfig) error {
+	normalized, prefixes, err := normalizeGatewayVisibilityConfig(cfg)
+	if err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	h.GatewayVisibility = normalized
+	h.saveConfigLocked()
+	visibility := h.gatewayVisibility
+	if visibility == nil {
+		visibility = &gatewayVisibility{}
+		h.gatewayVisibility = visibility
+	}
+	h.mu.Unlock()
+
+	visibility.mu.Lock()
+	visibility.config = normalized
+	visibility.prefixes = prefixes
+	visibility.mu.Unlock()
+
+	return nil
 }
 
 type TrafficStats struct {
@@ -1404,6 +1467,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.URL.Path = cleanedPath
 
+	clientIP = resolveClientIP(r, snapshot.proxyProtocolForce)
+	accessEntry.RemoteIP = clientIP
+
+	if !h.IsClientIPVisible(clientIP) {
+		accessEntry.RouteType = "visibility"
+		accessEntry.RouteKey = "cidr"
+		accessEntry.AuthDecision = "visibility_denied"
+		loggedStatusCode = 499
+		h.abortConnection(w)
+		return
+	}
+
 	if response.IsFaviconPath(r.URL.Path) {
 		accessEntry.RouteType = "favicon"
 		accessEntry.RouteKey = r.URL.Path
@@ -1411,9 +1486,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		response.ServeFavicon(w, r)
 		return
 	}
-
-	clientIP = resolveClientIP(r, snapshot.proxyProtocolForce)
-	accessEntry.RemoteIP = clientIP
 
 	isSelectRoute := r.URL.Path == "/__select__"
 	isAuthRoute := strings.HasPrefix(r.URL.Path, "/__auth__/")

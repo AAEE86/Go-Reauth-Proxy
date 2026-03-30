@@ -628,6 +628,12 @@ func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 	entry.AuthRequired = rule.UseAuth
 	entry.Upstream = rule.Target
 
+	if !m.handler.IsClientIPVisible(clientIP) {
+		entry.Status = 499
+		entry.AuthDecision = "visibility_denied"
+		return
+	}
+
 	if rule.UseAuth {
 		allowed, status, decision, err := m.verify(rule, clientIP)
 		entry.AuthDecision = decision
@@ -718,6 +724,13 @@ func (m *Manager) createUDPSession(listener *udpListenerState, packetConn net.Pa
 	entry := newStreamEntry(key, addrString(clientAddr), clientIP)
 	entry.AuthRequired = rule.UseAuth
 	entry.Upstream = rule.Target
+
+	if !m.handler.IsClientIPVisible(clientIP) {
+		entry.Status = 499
+		entry.AuthDecision = "visibility_denied"
+		m.logStreamEntry(entry, start)
+		return nil
+	}
 
 	if rule.UseAuth {
 		allowed, status, decision, err := m.verify(rule, clientIP)

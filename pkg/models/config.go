@@ -56,6 +56,12 @@ type ReverseProxyThrottleConfig struct {
 	BlockSeconds      int  `json:"block_seconds,omitempty" example:"30"`
 }
 
+type GatewayVisibilityConfig struct {
+	Enabled   bool     `json:"enabled,omitempty"`
+	CIDRs     []string `json:"cidrs,omitempty"`
+	UpdatedAt string   `json:"updated_at,omitempty"`
+}
+
 type PortConfig struct {
 	Port  int    `json:"port"`
 	Rules []Rule `json:"rules"`

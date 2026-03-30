@@ -27,6 +27,7 @@ type AppConfig struct {
 	AdminPort            int                               `json:"admin_port,omitempty"`
 	ProxyProtocolForce   bool                              `json:"proxy_protocol_force,omitempty"`
 	ReverseProxyThrottle models.ReverseProxyThrottleConfig `json:"reverse_proxy_throttle,omitempty"`
+	Visibility           models.GatewayVisibilityConfig    `json:"visibility,omitempty"`
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
 	SSL                  models.SSLConfig                  `json:"ssl,omitempty"`
@@ -71,6 +72,11 @@ func defaultConfig() *AppConfig {
 			RequestsPerSecond: defaultReverseProxyThrottleRPS,
 			Burst:             defaultReverseProxyThrottleBurst,
 			BlockSeconds:      defaultReverseProxyThrottleBlockSecs,
+		},
+		Visibility: models.GatewayVisibilityConfig{
+			Enabled:   false,
+			CIDRs:     []string{},
+			UpdatedAt: "",
 		},
 		Logging: models.LoggingConfig{
 			Enabled: false,
@@ -168,6 +174,12 @@ func applyDefaults(cfg *AppConfig) {
 		if cfg.ReverseProxyThrottle.BlockSeconds <= 0 {
 			cfg.ReverseProxyThrottle.BlockSeconds = defaultReverseProxyThrottleBlockSecs
 		}
+	}
+	if cfg.Visibility.CIDRs == nil {
+		cfg.Visibility.CIDRs = []string{}
+	}
+	if cfg.Visibility.UpdatedAt == "" {
+		cfg.Visibility.UpdatedAt = ""
 	}
 	if cfg.Logging.MaxDays <= 0 {
 		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays
