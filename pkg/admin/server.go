@@ -51,6 +51,8 @@ type authConfigPatch struct {
 	AuthHost          *string `json:"auth_host"`
 }
 
+type reverseProxyThrottleExemptIPsRuntimeResponse = models.ReverseProxyThrottleExemptIPsRuntime
+
 func NewServer(handler *proxy.Handler, port int, cfgManager *config.Manager, initialCfg *config.AppConfig, streamManager *stream.Manager) *Server {
 	iptablesChainName := "REAUTH_FW"
 	if initialCfg != nil && initialCfg.IptablesChainName != "" {
@@ -96,6 +98,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/visibility", s.handleSetGatewayVisibility).Methods("POST")
 	r.HandleFunc("/api/config/forwarded-headers", s.handleGetForwardedHeadersConfig).Methods("GET")
 	r.HandleFunc("/api/config/forwarded-headers", s.handleSetForwardedHeadersConfig).Methods("POST")
+	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleGetReverseProxyThrottleExemptIPs).Methods("GET")
+	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleSetReverseProxyThrottleExemptIPs).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
 	r.HandleFunc("/api/auth", s.handleSetAuth).Methods("POST")
 	r.HandleFunc("/api/logging", s.handleGetLoggingConfig).Methods("GET")
@@ -578,6 +582,21 @@ func (s *Server) handleSetForwardedHeadersConfig(w http.ResponseWriter, r *http.
 
 	s.ProxyHandler.SetForwardedHeadersConfig(req)
 	response.Success(w, s.ProxyHandler.GetForwardedHeadersConfig())
+}
+
+func (s *Server) handleGetReverseProxyThrottleExemptIPs(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetReverseProxyThrottleExemptIPs())
+}
+
+func (s *Server) handleSetReverseProxyThrottleExemptIPs(w http.ResponseWriter, r *http.Request) {
+	var req reverseProxyThrottleExemptIPsRuntimeResponse
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	s.ProxyHandler.SetReverseProxyThrottleExemptIPs(req)
+	response.Success(w, s.ProxyHandler.GetReverseProxyThrottleExemptIPs())
 }
 
 // handleGetAuth gets the global auth configuration (port and relative urls)

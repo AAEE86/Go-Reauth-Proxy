@@ -68,6 +68,12 @@ type ForwardedHeadersConfig struct {
 	UpdatedAt   string   `json:"updated_at,omitempty"`
 }
 
+type ReverseProxyThrottleExemptIPsRuntime struct {
+	Enabled   bool     `json:"enabled,omitempty"`
+	IPs       []string `json:"ips,omitempty"`
+	UpdatedAt string   `json:"updated_at,omitempty"`
+}
+
 type PortConfig struct {
 	Port  int    `json:"port"`
 	Rules []Rule `json:"rules"`

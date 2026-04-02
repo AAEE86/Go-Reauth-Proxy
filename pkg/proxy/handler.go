@@ -65,6 +65,7 @@ type Handler struct {
 	authCache                  authStateCache
 	preflightCache             preflightStateCache
 	reverseProxyThrottle       *reverseProxyThrottle
+	reverseProxyThrottleExempt *reverseProxyThrottleExemptIPsRuntime
 	gatewayVisibility          *gatewayVisibility
 	forwardedHeaders           *forwardedHeadersConfig
 }
@@ -437,6 +438,13 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		forwardedHeaders: newForwardedHeadersConfig(normalizedForwardedHeaders),
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
+	h.reverseProxyThrottleExempt = newReverseProxyThrottleExemptIPsRuntime(
+		models.ReverseProxyThrottleExemptIPsRuntime{
+			Enabled:   false,
+			IPs:       []string{},
+			UpdatedAt: "",
+		},
+	)
 	visibility, err := newGatewayVisibility(initialCfg.Visibility)
 	if err != nil {
 		log.Printf("Failed to normalize initial gateway visibility: %v", err)
@@ -553,6 +561,12 @@ func (h *Handler) shouldThrottleReverseProxyRequest(isAuthRoute bool, matchedHos
 		return false
 	}
 	if h.reverseProxyThrottle == nil {
+		return false
+	}
+	h.mu.RLock()
+	exemptRuntime := h.reverseProxyThrottleExempt
+	h.mu.RUnlock()
+	if exemptRuntime != nil && exemptRuntime.shouldBypass(clientIP) {
 		return false
 	}
 	return !h.reverseProxyThrottle.allow(clientIP, time.Now())
@@ -1133,6 +1147,22 @@ func (h *Handler) GetForwardedHeadersConfig() models.ForwardedHeadersConfig {
 	}
 }
 
+func (h *Handler) GetReverseProxyThrottleExemptIPs() models.ReverseProxyThrottleExemptIPsRuntime {
+	h.mu.RLock()
+	runtime := h.reverseProxyThrottleExempt
+	h.mu.RUnlock()
+
+	if runtime == nil {
+		return models.ReverseProxyThrottleExemptIPsRuntime{
+			Enabled:   false,
+			IPs:       []string{},
+			UpdatedAt: "",
+		}
+	}
+
+	return runtime.getConfig()
+}
+
 func (h *Handler) IsClientIPVisible(clientIP string) bool {
 	h.mu.RLock()
 	visibility := h.gatewayVisibility
@@ -1206,6 +1236,20 @@ func (h *Handler) SetForwardedHeadersConfig(cfg models.ForwardedHeadersConfig) {
 	h.mu.Unlock()
 
 	forwardedHeaders.updateConfig(normalized)
+}
+
+func (h *Handler) SetReverseProxyThrottleExemptIPs(cfg models.ReverseProxyThrottleExemptIPsRuntime) {
+	h.mu.Lock()
+	runtime := h.reverseProxyThrottleExempt
+	if runtime == nil {
+		runtime = newReverseProxyThrottleExemptIPsRuntime(
+			models.ReverseProxyThrottleExemptIPsRuntime{},
+		)
+		h.reverseProxyThrottleExempt = runtime
+	}
+	h.mu.Unlock()
+
+	runtime.updateConfig(cfg)
 }
 
 type TrafficStats struct {
