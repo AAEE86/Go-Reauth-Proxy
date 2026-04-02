@@ -45,8 +45,26 @@ definitions:
         example: 192.168.1.100
         type: string
     type: object
+  iptables.tcpRedirectRequest:
+    properties:
+      listen_port:
+        example: 80
+        type: integer
+      target_port:
+        example: 7999
+        type: integer
+    type: object
   models.AuthConfig:
     properties:
+      auth_cache_ttl_seconds:
+        description: Successful auth-result cache TTL in seconds. 0 disables the cache.
+        example: 1
+        type: integer
+      auth_cache_unauthorized_ttl_seconds:
+        description: Unauthorized auth-result cache TTL in seconds. 0 disables the
+          cache.
+        example: 1
+        type: integer
       auth_host:
         example: auth.example.com
         type: string
@@ -79,6 +97,17 @@ definitions:
       public_https_port:
         example: 443
         type: integer
+    type: object
+  models.ForwardedHeadersConfig:
+    properties:
+      enabled:
+        type: boolean
+      omit_targets:
+        items:
+          type: string
+        type: array
+      updated_at:
+        type: string
     type: object
   models.Rule:
     properties:
@@ -203,7 +232,7 @@ definitions:
       timestamp:
         type: integer
     type: object
-host: 127.0.0.1:7996
+host: localhost:7996
 info:
   contact: {}
   description: API for managing proxy rules and iptables.
@@ -297,6 +326,54 @@ paths:
           schema:
             $ref: '#/definitions/response.Response'
       summary: Set default route
+      tags:
+      - config
+  /api/config/forwarded-headers:
+    get:
+      description: Get the current explicit forwarded-headers runtime configuration
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/models.ForwardedHeadersConfig'
+              type: object
+      summary: Get forwarded headers config
+      tags:
+      - config
+    post:
+      consumes:
+      - application/json
+      description: Replace the explicit forwarded-headers runtime configuration
+      parameters:
+      - description: Forwarded headers config
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/models.ForwardedHeadersConfig'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/models.ForwardedHeadersConfig'
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Set forwarded headers config
       tags:
       - config
   /api/config/proxy-protocol:
@@ -570,6 +647,67 @@ paths:
           schema:
             $ref: '#/definitions/response.Response'
       summary: Remove IP rule
+      tags:
+      - iptables
+  /api/iptables/tcp-redirect:
+    delete:
+      consumes:
+      - application/json
+      description: Remove a tcp REDIRECT rule from nat PREROUTING for both iptables
+        and ip6tables
+      parameters:
+      - description: TCP redirect configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/iptables.tcpRedirectRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Response'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Clear TCP redirect
+      tags:
+      - iptables
+    post:
+      consumes:
+      - application/json
+      description: Ensure a tcp REDIRECT rule exists in nat PREROUTING for both iptables
+        and ip6tables
+      parameters:
+      - description: TCP redirect configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/iptables.tcpRedirectRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Response'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Ensure TCP redirect
       tags:
       - iptables
   /api/rules:

@@ -94,6 +94,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/reverse-proxy-throttle", s.handleSetReverseProxyThrottle).Methods("POST")
 	r.HandleFunc("/api/config/visibility", s.handleGetGatewayVisibility).Methods("GET")
 	r.HandleFunc("/api/config/visibility", s.handleSetGatewayVisibility).Methods("POST")
+	r.HandleFunc("/api/config/forwarded-headers", s.handleGetForwardedHeadersConfig).Methods("GET")
+	r.HandleFunc("/api/config/forwarded-headers", s.handleSetForwardedHeadersConfig).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
 	r.HandleFunc("/api/auth", s.handleSetAuth).Methods("POST")
 	r.HandleFunc("/api/logging", s.handleGetLoggingConfig).Methods("GET")
@@ -544,6 +546,38 @@ func (s *Server) handleSetGatewayVisibility(w http.ResponseWriter, r *http.Reque
 	}
 
 	response.Success(w, s.ProxyHandler.GetGatewayVisibility())
+}
+
+// handleGetForwardedHeadersConfig gets the current forwarded-headers runtime config
+// @Summary Get forwarded headers config
+// @Description Get the current explicit forwarded-headers runtime configuration
+// @Tags config
+// @Produce  json
+// @Success 200 {object} response.Response{data=models.ForwardedHeadersConfig}
+// @Router /api/config/forwarded-headers [get]
+func (s *Server) handleGetForwardedHeadersConfig(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetForwardedHeadersConfig())
+}
+
+// handleSetForwardedHeadersConfig sets the forwarded-headers runtime config
+// @Summary Set forwarded headers config
+// @Description Replace the explicit forwarded-headers runtime configuration
+// @Tags config
+// @Accept  json
+// @Produce  json
+// @Param request body models.ForwardedHeadersConfig true "Forwarded headers config"
+// @Success 200 {object} response.Response{data=models.ForwardedHeadersConfig}
+// @Failure 400 {object} response.Response
+// @Router /api/config/forwarded-headers [post]
+func (s *Server) handleSetForwardedHeadersConfig(w http.ResponseWriter, r *http.Request) {
+	var req models.ForwardedHeadersConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	s.ProxyHandler.SetForwardedHeadersConfig(req)
+	response.Success(w, s.ProxyHandler.GetForwardedHeadersConfig())
 }
 
 // handleGetAuth gets the global auth configuration (port and relative urls)

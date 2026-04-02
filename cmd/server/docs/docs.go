@@ -159,6 +159,88 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/config/forwarded-headers": {
+            "get": {
+                "description": "Get the current explicit forwarded-headers runtime configuration",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "config"
+                ],
+                "summary": "Get forwarded headers config",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/models.ForwardedHeadersConfig"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Replace the explicit forwarded-headers runtime configuration",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "config"
+                ],
+                "summary": "Set forwarded headers config",
+                "parameters": [
+                    {
+                        "description": "Forwarded headers config",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/models.ForwardedHeadersConfig"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/models.ForwardedHeadersConfig"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
         "/api/config/proxy-protocol": {
             "get": {
                 "description": "Get whether the proxy port requires Proxy Protocol header",
@@ -595,6 +677,96 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/iptables/tcp-redirect": {
+            "post": {
+                "description": "Ensure a tcp REDIRECT rule exists in nat PREROUTING for both iptables and ip6tables",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "iptables"
+                ],
+                "summary": "Ensure TCP redirect",
+                "parameters": [
+                    {
+                        "description": "TCP redirect configuration",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/iptables.tcpRedirectRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Remove a tcp REDIRECT rule from nat PREROUTING for both iptables and ip6tables",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "iptables"
+                ],
+                "summary": "Clear TCP redirect",
+                "parameters": [
+                    {
+                        "description": "TCP redirect configuration",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/iptables.tcpRedirectRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
         "/api/rules": {
             "get": {
                 "description": "Get all configured proxy rules",
@@ -892,9 +1064,32 @@ const docTemplate = `{
                 }
             }
         },
+        "iptables.tcpRedirectRequest": {
+            "type": "object",
+            "properties": {
+                "listen_port": {
+                    "type": "integer",
+                    "example": 80
+                },
+                "target_port": {
+                    "type": "integer",
+                    "example": 7999
+                }
+            }
+        },
         "models.AuthConfig": {
             "type": "object",
             "properties": {
+                "auth_cache_ttl_seconds": {
+                    "description": "Successful auth-result cache TTL in seconds. 0 disables the cache.",
+                    "type": "integer",
+                    "example": 1
+                },
+                "auth_cache_unauthorized_ttl_seconds": {
+                    "description": "Unauthorized auth-result cache TTL in seconds. 0 disables the cache.",
+                    "type": "integer",
+                    "example": 1
+                },
                 "auth_host": {
                     "type": "string",
                     "example": "auth.example.com"
@@ -935,6 +1130,23 @@ const docTemplate = `{
                 "public_https_port": {
                     "type": "integer",
                     "example": 443
+                }
+            }
+        },
+        "models.ForwardedHeadersConfig": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "omit_targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "updated_at": {
+                    "type": "string"
                 }
             }
         },
@@ -1111,7 +1323,7 @@ const docTemplate = `{
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
 	Version:          "1.0",
-	Host:             "127.0.0.1:7996",
+	Host:             "localhost:7996",
 	BasePath:         "/",
 	Schemes:          []string{},
 	Title:            "Go-Reauth-Proxy",

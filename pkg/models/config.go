@@ -62,6 +62,12 @@ type GatewayVisibilityConfig struct {
 	UpdatedAt string   `json:"updated_at,omitempty"`
 }
 
+type ForwardedHeadersConfig struct {
+	Enabled     bool     `json:"enabled,omitempty"`
+	OmitTargets []string `json:"omit_targets,omitempty"`
+	UpdatedAt   string   `json:"updated_at,omitempty"`
+}
+
 type PortConfig struct {
 	Port  int    `json:"port"`
 	Rules []Rule `json:"rules"`
