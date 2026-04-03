@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"go-reauth-proxy/pkg/admin"
 	"go-reauth-proxy/pkg/config"
+	"go-reauth-proxy/pkg/events"
 	"go-reauth-proxy/pkg/gatewaylog"
 	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/proxy"
@@ -302,7 +303,8 @@ func main() {
 		}
 	}
 
-	proxyHandler := proxy.NewHandler(resolvedAdminPort, *proxyPort, cfgManager, initialCfg, logsDir)
+	systemEventClient := events.NewClient(nil)
+	proxyHandler := proxy.NewHandler(resolvedAdminPort, *proxyPort, cfgManager, initialCfg, logsDir, systemEventClient)
 	configuredStreamRules := proxyHandler.GetStreamRules()
 	normalizedStreamRules := configuredStreamRules
 	if validatedStreamRules, err := proxyHandler.ValidateStreamRules(configuredStreamRules); err != nil {

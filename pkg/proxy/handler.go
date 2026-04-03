@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"go-reauth-proxy/pkg/config"
 	"go-reauth-proxy/pkg/errors"
+	"go-reauth-proxy/pkg/events"
 	"go-reauth-proxy/pkg/gatewaylog"
 
 	"go-reauth-proxy/pkg/models"
@@ -68,6 +70,7 @@ type Handler struct {
 	reverseProxyThrottleExempt *reverseProxyThrottleExemptIPsRuntime
 	gatewayVisibility          *gatewayVisibility
 	forwardedHeaders           *forwardedHeadersConfig
+	systemEventClient          *events.Client
 }
 
 type requestSnapshot struct {
@@ -400,7 +403,7 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 	panic(http.ErrAbortHandler)
 }
 
-func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string) *Handler {
+func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string, systemEventClient *events.Client) *Handler {
 	logConfig := gatewaylog.NormalizeConfig(initialCfg.Logging)
 	normalizedForwardedHeaders, _ := normalizeForwardedHeadersConfig(initialCfg.ForwardedHeaders)
 	if strings.TrimSpace(logsDir) == "" {
@@ -432,10 +435,11 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 			Timeout:   5 * time.Second,
 			Transport: newInternalTransport(),
 		},
-		proxyTransport:   newProxyTransport(),
-		authCache:        newAuthStateCache(),
-		preflightCache:   newPreflightStateCache(),
-		forwardedHeaders: newForwardedHeadersConfig(normalizedForwardedHeaders),
+		proxyTransport:    newProxyTransport(),
+		authCache:         newAuthStateCache(),
+		preflightCache:    newPreflightStateCache(),
+		forwardedHeaders:  newForwardedHeadersConfig(normalizedForwardedHeaders),
+		systemEventClient: systemEventClient,
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
 	h.reverseProxyThrottleExempt = newReverseProxyThrottleExemptIPsRuntime(
@@ -556,20 +560,102 @@ func (h *Handler) SetProxyProtocolForce(force bool) {
 	}
 }
 
-func (h *Handler) shouldThrottleReverseProxyRequest(isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule, clientIP string) bool {
+func (h *Handler) evaluateReverseProxyThrottleRequest(isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule, clientIP string, now time.Time) reverseProxyThrottleDecision {
 	if !isAuthRoute && matchedHostRule == nil && matchedRule == nil {
-		return false
+		return reverseProxyThrottleDecision{Allowed: true}
 	}
 	if h.reverseProxyThrottle == nil {
-		return false
+		return reverseProxyThrottleDecision{Allowed: true}
 	}
 	h.mu.RLock()
 	exemptRuntime := h.reverseProxyThrottleExempt
 	h.mu.RUnlock()
 	if exemptRuntime != nil && exemptRuntime.shouldBypass(clientIP) {
-		return false
+		return reverseProxyThrottleDecision{Allowed: true}
 	}
-	return !h.reverseProxyThrottle.allow(clientIP, time.Now())
+	return h.reverseProxyThrottle.evaluate(clientIP, now)
+}
+
+func classifyReverseProxyRouteType(requestPath string, isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule) string {
+	switch {
+	case isAuthRoute:
+		return "auth_proxy"
+	case requestPath == "/__select__":
+		return "select"
+	case matchedHostRule != nil:
+		return "host_rule"
+	case matchedRule != nil:
+		return "path_rule"
+	default:
+		return "not_found"
+	}
+}
+
+func gatewayThrottleDedupeTTL(now time.Time, blockedUntil time.Time, fallback int) int {
+	if blockedUntil.After(now) {
+		ttlSeconds := int(time.Until(blockedUntil).Seconds()) + 60
+		if ttlSeconds > 0 {
+			return ttlSeconds
+		}
+	}
+	if fallback > 0 {
+		return fallback + 60
+	}
+	return 60
+}
+
+func (h *Handler) emitGatewayThrottleBlockedEvent(args struct {
+	ClientIP     string
+	BlockedUntil time.Time
+	Config       models.ReverseProxyThrottleConfig
+	RouteType    string
+	Host         string
+	RequestPath  string
+	IsAuthRoute  bool
+	HappenedAt   time.Time
+}) {
+	client := h.systemEventClient
+	if client == nil {
+		return
+	}
+
+	normalizedIP := normalizeClientIP(args.ClientIP)
+	if normalizedIP == "" {
+		normalizedIP = strings.TrimSpace(args.ClientIP)
+	}
+	if normalizedIP == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := client.Publish(ctx, 0, events.SystemEventPublishInput{
+		Type:             events.FnEventGatewayThrottleBlocked,
+		Source:           events.SystemEventSourceGoReauthProxy,
+		Level:            events.FnEventLevelWarn,
+		HappenedAt:       args.HappenedAt.UTC().Format(time.RFC3339Nano),
+		DedupeKey:        fmt.Sprintf("gateway-throttle:%s:%d", normalizedIP, args.BlockedUntil.Unix()),
+		DedupeTTLSeconds: gatewayThrottleDedupeTTL(args.HappenedAt, args.BlockedUntil, args.Config.BlockSeconds),
+		Subject: &events.SystemEventSubject{
+			Kind: events.SystemEventSubjectKindIP,
+			ID:   normalizedIP,
+		},
+		Payload: events.GatewayThrottleBlockedPayload{
+			IP:                normalizedIP,
+			BlockedUntil:      args.BlockedUntil.UTC().Format(time.RFC3339Nano),
+			BlockSeconds:      args.Config.BlockSeconds,
+			RequestsPerSecond: args.Config.RequestsPerSecond,
+			Burst:             args.Config.Burst,
+			RouteType:         args.RouteType,
+			Host:              args.Host,
+			Path:              args.RequestPath,
+			IsAuthRoute:       args.IsAuthRoute,
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to publish gateway throttle event for %s: %v", normalizedIP, err)
+	}
 }
 
 func (h *Handler) SetSSLDeployment(config models.SSLConfig) error {
@@ -1584,7 +1670,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if h.shouldThrottleReverseProxyRequest(isAuthRoute, matchedHostRule, matchedRule, clientIP) {
+	throttleCheckedAt := time.Now()
+	throttleDecision := h.evaluateReverseProxyThrottleRequest(
+		isAuthRoute,
+		matchedHostRule,
+		matchedRule,
+		clientIP,
+		throttleCheckedAt,
+	)
+	if !throttleDecision.Allowed {
+		if throttleDecision.NewlyBlocked {
+			go h.emitGatewayThrottleBlockedEvent(struct {
+				ClientIP     string
+				BlockedUntil time.Time
+				Config       models.ReverseProxyThrottleConfig
+				RouteType    string
+				Host         string
+				RequestPath  string
+				IsAuthRoute  bool
+				HappenedAt   time.Time
+			}{
+				ClientIP:     clientIP,
+				BlockedUntil: throttleDecision.BlockedUntil,
+				Config:       throttleDecision.Config,
+				RouteType:    classifyReverseProxyRouteType(r.URL.Path, isAuthRoute, matchedHostRule, matchedRule),
+				Host:         r.Host,
+				RequestPath:  r.URL.Path,
+				IsAuthRoute:  isAuthRoute,
+				HappenedAt:   throttleCheckedAt,
+			})
+		}
 		suppressAccessLog(w)
 		h.abortConnection(w)
 		return

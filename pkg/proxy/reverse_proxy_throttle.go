@@ -23,6 +23,13 @@ type reverseProxyThrottle struct {
 	nextCleanup time.Time
 }
 
+type reverseProxyThrottleDecision struct {
+	Allowed      bool
+	NewlyBlocked bool
+	BlockedUntil time.Time
+	Config       models.ReverseProxyThrottleConfig
+}
+
 type reverseProxyThrottleEntry struct {
 	tokens       float64
 	lastSeen     time.Time
@@ -62,22 +69,24 @@ func (t *reverseProxyThrottle) updateConfig(cfg models.ReverseProxyThrottleConfi
 	t.mu.Unlock()
 }
 
-func (t *reverseProxyThrottle) allow(clientIP string, now time.Time) bool {
+func (t *reverseProxyThrottle) evaluate(clientIP string, now time.Time) reverseProxyThrottleDecision {
+	decision := reverseProxyThrottleDecision{Allowed: true}
 	if t == nil {
-		return true
+		return decision
 	}
 
 	identity := normalizeClientIP(clientIP)
 	if identity == "" {
-		return true
+		return decision
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	cfg := normalizeReverseProxyThrottleConfig(t.config)
+	decision.Config = cfg
 	if !cfg.Enabled {
-		return true
+		return decision
 	}
 
 	if t.entries == nil {
@@ -95,7 +104,9 @@ func (t *reverseProxyThrottle) allow(clientIP string, now time.Time) bool {
 
 	if entry.blockedUntil.After(now) {
 		entry.lastSeen = now
-		return false
+		decision.Allowed = false
+		decision.BlockedUntil = entry.blockedUntil
+		return decision
 	}
 	if !entry.blockedUntil.IsZero() && !entry.blockedUntil.After(now) {
 		entry.blockedUntil = time.Time{}
@@ -117,11 +128,14 @@ func (t *reverseProxyThrottle) allow(clientIP string, now time.Time) bool {
 	entry.lastSeen = now
 	if entry.tokens < 1 {
 		entry.blockedUntil = now.Add(time.Duration(cfg.BlockSeconds) * time.Second)
-		return false
+		decision.Allowed = false
+		decision.NewlyBlocked = true
+		decision.BlockedUntil = entry.blockedUntil
+		return decision
 	}
 
 	entry.tokens -= 1
-	return true
+	return decision
 }
 
 func (t *reverseProxyThrottle) cleanupLocked(now time.Time, cfg models.ReverseProxyThrottleConfig) {
