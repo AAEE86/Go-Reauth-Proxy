@@ -110,7 +110,13 @@ func (h *Handler) snapshotForRequest() requestSnapshot {
 	return s
 }
 
-func resolveClientIP(r *http.Request, proxyProtocolForce bool) string {
+func resolveClientIP(r *http.Request, authConfig models.AuthConfig, proxyProtocolForce bool) string {
+	if authConfig.AliyunESAEnabled {
+		if ip := normalizeIPAddress(r.Header.Get("Ali-Real-Client-IP")); ip != "" {
+			return ip
+		}
+	}
+
 	if proxyProtocolForce {
 		if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
 			return ip
@@ -228,6 +234,34 @@ func copyUserAgentHeader(dst, src *http.Request) {
 	// Prevent Go's default client UA from leaking into upstream requests
 	// when the original client did not send one.
 	dst.Header.Set("User-Agent", "")
+}
+
+func applyInternalAuthProxyHeaders(req *http.Request, source *http.Request, targetURL *url.URL, clientIP string, authConfig models.AuthConfig) {
+	if req == nil {
+		return
+	}
+
+	if targetURL != nil {
+		req.Host = targetURL.Host
+		req.URL.Path = targetURL.Path
+	}
+
+	req.Header.Set("X-Real-IP", clientIP)
+	req.Header.Set("X-Forwarded-For", clientIP)
+	if source != nil {
+		req.Header.Set("X-Forwarded-Host", source.Host)
+		req.Header.Set("X-Forwarded-Proto", requestScheme(source))
+	}
+	if authConfig.AliyunESAEnabled && clientIP != "" {
+		req.Header.Set("Ali-Real-Client-IP", clientIP)
+	} else {
+		req.Header.Del("Ali-Real-Client-IP")
+	}
+
+	// Strip internal routing hints and any client-supplied real-IP header.
+	req.Header.Del("X-Forwarded-Path")
+	req.Header.Del("X-Match")
+	copyUserAgentHeader(req, source)
 }
 
 func applyForwardedHeaderPolicy(out *http.Request, in *http.Request, clientIP string, omitForwardedHeaders bool) {
@@ -1569,21 +1603,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&h.trafficActive, 1)
 	metrics := &requestTrafficMetrics{statusCode: http.StatusOK}
 	accessEntry := gatewaylog.Entry{
-		Method:        r.Method,
-		Scheme:        requestScheme(r),
-		Host:          r.Host,
-		Path:          r.URL.Path,
-		Query:         r.URL.RawQuery,
-		RequestURI:    r.URL.RequestURI(),
-		Protocol:      r.Proto,
-		Status:        http.StatusOK,
-		RemoteAddr:    r.RemoteAddr,
-		UserAgent:     r.UserAgent(),
-		Referer:       r.Referer(),
-		TLS:           r.TLS != nil,
-		WebSocket:     strings.EqualFold(r.Header.Get("Upgrade"), "websocket"),
-		XForwardedFor: firstForwardedValue(r.Header.Get("X-Forwarded-For")),
-		XRealIP:       strings.TrimSpace(r.Header.Get("X-Real-IP")),
+		Method:          r.Method,
+		Scheme:          requestScheme(r),
+		Host:            r.Host,
+		Path:            r.URL.Path,
+		Query:           r.URL.RawQuery,
+		RequestURI:      r.URL.RequestURI(),
+		Protocol:        r.Proto,
+		Status:          http.StatusOK,
+		RemoteAddr:      r.RemoteAddr,
+		UserAgent:       r.UserAgent(),
+		Referer:         r.Referer(),
+		TLS:             r.TLS != nil,
+		WebSocket:       strings.EqualFold(r.Header.Get("Upgrade"), "websocket"),
+		AliRealClientIP: strings.TrimSpace(r.Header.Get("Ali-Real-Client-IP")),
+		XForwardedFor:   firstForwardedValue(r.Header.Get("X-Forwarded-For")),
+		XRealIP:         strings.TrimSpace(r.Header.Get("X-Real-IP")),
 	}
 	var clientIP string
 	loggedStatusCode := 0
@@ -1628,7 +1663,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r.URL.Path = cleanedPath
 
-	clientIP = resolveClientIP(r, snapshot.proxyProtocolForce)
+	clientIP = resolveClientIP(r, snapshot.authConfig, snapshot.proxyProtocolForce)
 	accessEntry.RemoteIP = clientIP
 
 	if !h.IsClientIPVisible(clientIP) {
@@ -1870,17 +1905,7 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
-		req.Host = targetURL.Host
-		req.URL.Path = targetURL.Path
-
-		req.Header.Set("X-Real-IP", clientIP)
-		req.Header.Set("X-Forwarded-For", clientIP)
-		req.Header.Set("X-Forwarded-Host", r.Host)
-		req.Header.Set("X-Forwarded-Proto", requestScheme(r))
-		// Prevent X-Forwarded-Path and X-Match from being passed to the backend
-		req.Header.Del("X-Forwarded-Path")
-		req.Header.Del("X-Match")
-		copyUserAgentHeader(req, r)
+		applyInternalAuthProxyHeaders(req, r, targetURL, clientIP, snapshot.authConfig)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
@@ -2544,7 +2569,7 @@ func mergeQueryValues(dst url.Values, src url.Values) {
 }
 
 func applyRequestPortToPublicAuthBase(baseURL *url.URL, r *http.Request, authConfig models.AuthConfig) {
-	if baseURL == nil || baseURL.Host == "" || baseURL.Port() != "" {
+	if authConfig.AliyunESAEnabled || baseURL == nil || baseURL.Host == "" || baseURL.Port() != "" {
 		return
 	}
 

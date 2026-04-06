@@ -31,35 +31,36 @@ const (
 var errStopScan = errors.New("stop scan")
 
 type Entry struct {
-	Time          string `json:"time,omitempty"`
-	Level         string `json:"level,omitempty"`
-	Method        string `json:"method,omitempty"`
-	Scheme        string `json:"scheme,omitempty"`
-	Host          string `json:"host,omitempty"`
-	Path          string `json:"path,omitempty"`
-	Query         string `json:"query,omitempty"`
-	RequestURI    string `json:"request_uri,omitempty"`
-	Protocol      string `json:"protocol,omitempty"`
-	Status        int    `json:"status"`
-	DurationMs    int64  `json:"duration_ms"`
-	RemoteIP      string `json:"remote_ip,omitempty"`
-	RemoteAddr    string `json:"remote_addr,omitempty"`
-	UserAgent     string `json:"user_agent,omitempty"`
-	Referer       string `json:"referer,omitempty"`
-	LoggedIn      bool   `json:"logged_in"`
-	AuthRequired  bool   `json:"auth_required"`
-	AuthDecision  string `json:"auth_decision,omitempty"`
-	AccessMode    string `json:"access_mode,omitempty"`
-	RouteType     string `json:"route_type,omitempty"`
-	RouteKey      string `json:"route_key,omitempty"`
-	Upstream      string `json:"upstream,omitempty"`
-	Matched       bool   `json:"matched"`
-	BytesIn       uint64 `json:"bytes_in"`
-	BytesOut      uint64 `json:"bytes_out"`
-	TLS           bool   `json:"tls"`
-	WebSocket     bool   `json:"websocket"`
-	XForwardedFor string `json:"x_forwarded_for,omitempty"`
-	XRealIP       string `json:"x_real_ip,omitempty"`
+	Time            string `json:"time,omitempty"`
+	Level           string `json:"level,omitempty"`
+	Method          string `json:"method,omitempty"`
+	Scheme          string `json:"scheme,omitempty"`
+	Host            string `json:"host,omitempty"`
+	Path            string `json:"path,omitempty"`
+	Query           string `json:"query,omitempty"`
+	RequestURI      string `json:"request_uri,omitempty"`
+	Protocol        string `json:"protocol,omitempty"`
+	Status          int    `json:"status"`
+	DurationMs      int64  `json:"duration_ms"`
+	RemoteIP        string `json:"remote_ip,omitempty"`
+	RemoteAddr      string `json:"remote_addr,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
+	Referer         string `json:"referer,omitempty"`
+	LoggedIn        bool   `json:"logged_in"`
+	AuthRequired    bool   `json:"auth_required"`
+	AuthDecision    string `json:"auth_decision,omitempty"`
+	AccessMode      string `json:"access_mode,omitempty"`
+	RouteType       string `json:"route_type,omitempty"`
+	RouteKey        string `json:"route_key,omitempty"`
+	Upstream        string `json:"upstream,omitempty"`
+	Matched         bool   `json:"matched"`
+	BytesIn         uint64 `json:"bytes_in"`
+	BytesOut        uint64 `json:"bytes_out"`
+	TLS             bool   `json:"tls"`
+	WebSocket       bool   `json:"websocket"`
+	AliRealClientIP string `json:"ali_real_client_ip,omitempty"`
+	XForwardedFor   string `json:"x_forwarded_for,omitempty"`
+	XRealIP         string `json:"x_real_ip,omitempty"`
 }
 
 type ConfigInfo struct {
@@ -345,6 +346,7 @@ func (m *Manager) Log(entry Entry) {
 		Uint64("bytes_out", entry.BytesOut).
 		Bool("tls", entry.TLS).
 		Bool("websocket", entry.WebSocket).
+		Str("ali_real_client_ip", entry.AliRealClientIP).
 		Str("x_forwarded_for", entry.XForwardedFor).
 		Str("x_real_ip", entry.XRealIP).
 		Send()

@@ -1080,6 +1080,10 @@ const docTemplate = `{
         "models.AuthConfig": {
             "type": "object",
             "properties": {
+                "aliyun_esa_enabled": {
+                    "type": "boolean",
+                    "example": false
+                },
                 "auth_cache_ttl_seconds": {
                     "description": "Successful auth-result cache TTL in seconds. 0 disables the cache.",
                     "type": "integer",

@@ -61,6 +61,7 @@ func defaultConfig() *AppConfig {
 			PreflightURL:      "/api/auth/preflight",
 			AuthCacheTTL:      defaultAuthCacheTTLSeconds,
 			AuthCacheFailTTL:  defaultAuthCacheUnauthorizedTTLSeconds,
+			AliyunESAEnabled:  false,
 			PublicAuthBaseURL: "",
 			PublicHTTPPort:    0,
 			PublicHTTPSPort:   0,

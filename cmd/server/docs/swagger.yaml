@@ -56,6 +56,9 @@ definitions:
     type: object
   models.AuthConfig:
     properties:
+      aliyun_esa_enabled:
+        example: false
+        type: boolean
       auth_cache_ttl_seconds:
         description: Successful auth-result cache TTL in seconds. 0 disables the cache.
         example: 1

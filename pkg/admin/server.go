@@ -45,6 +45,7 @@ type authConfigPatch struct {
 	PreflightURL      *string `json:"preflight_url"`
 	AuthCacheTTL      *int    `json:"auth_cache_ttl_seconds"`
 	AuthCacheFailTTL  *int    `json:"auth_cache_unauthorized_ttl_seconds"`
+	AliyunESAEnabled  *bool   `json:"aliyun_esa_enabled"`
 	PublicAuthBaseURL *string `json:"public_auth_base_url"`
 	PublicHTTPPort    *int    `json:"public_http_port"`
 	PublicHTTPSPort   *int    `json:"public_https_port"`
@@ -634,6 +635,9 @@ func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) models.Au
 	}
 	if patch.AuthCacheFailTTL != nil {
 		merged.AuthCacheFailTTL = *patch.AuthCacheFailTTL
+	}
+	if patch.AliyunESAEnabled != nil {
+		merged.AliyunESAEnabled = *patch.AliyunESAEnabled
 	}
 	if patch.PublicAuthBaseURL != nil {
 		merged.PublicAuthBaseURL = *patch.PublicAuthBaseURL
