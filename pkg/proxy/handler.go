@@ -115,11 +115,16 @@ func resolveClientIP(r *http.Request, authConfig models.AuthConfig, proxyProtoco
 		if ip := normalizeIPAddress(r.Header.Get("Ali-Real-Client-IP")); ip != "" {
 			return ip
 		}
+		if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+			return ip
+		}
 	}
 
 	if proxyProtocolForce {
-		if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
-			return ip
+		if !authConfig.AliyunESAEnabled {
+			if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+				return ip
+			}
 		}
 		if ip := normalizeIPAddress(r.Header.Get("X-Real-IP")); ip != "" {
 			return ip
@@ -234,6 +239,23 @@ func copyUserAgentHeader(dst, src *http.Request) {
 	// Prevent Go's default client UA from leaking into upstream requests
 	// when the original client did not send one.
 	dst.Header.Set("User-Agent", "")
+}
+
+func applyNoStoreCacheHeaders(headers http.Header) {
+	if headers == nil {
+		return
+	}
+
+	headers.Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	headers.Set("Pragma", "no-cache")
+	headers.Set("Expires", "0")
+	headers.Set("CDN-Cache-Control", "private, no-store")
+	headers.Set("Surrogate-Control", "no-store")
+}
+
+func shouldDisableAuthResponseCaching(requestPath string) bool {
+	cleanPath := path.Clean(ensureLeadingSlash(strings.TrimSpace(requestPath)))
+	return cleanPath == "/api/auth" || strings.HasPrefix(cleanPath, "/api/auth/")
 }
 
 func applyInternalAuthProxyHeaders(req *http.Request, source *http.Request, targetURL *url.URL, clientIP string, authConfig models.AuthConfig) {
@@ -1908,6 +1930,9 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 		applyInternalAuthProxyHeaders(req, r, targetURL, clientIP, snapshot.authConfig)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		if shouldDisableAuthResponseCaching(proxyPath) {
+			applyNoStoreCacheHeaders(resp.Header)
+		}
 		h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
 		return nil
 	}
@@ -2088,6 +2113,9 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		if isAuthHostProxy && shouldDisableAuthResponseCaching(r.URL.Path) {
+			applyNoStoreCacheHeaders(resp.Header)
+		}
 		if isAuthHostProxy {
 			h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
 		}

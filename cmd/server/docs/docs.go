@@ -1081,6 +1081,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "aliyun_esa_enabled": {
+                    "description": "Enables Alibaba Cloud ESA / Tencent EdgeOne client IP handling.",
                     "type": "boolean",
                     "example": false
                 },

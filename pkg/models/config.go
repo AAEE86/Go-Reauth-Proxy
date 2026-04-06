@@ -38,7 +38,7 @@ type AuthConfig struct {
 	PreflightURL      string `json:"preflight_url" example:"/api/auth/preflight"`               // Relative Preflight URL (default /api/auth/preflight)
 	AuthCacheTTL      int    `json:"auth_cache_ttl_seconds,omitempty" example:"1"`              // Successful auth-result cache TTL in seconds. 0 disables the cache.
 	AuthCacheFailTTL  int    `json:"auth_cache_unauthorized_ttl_seconds,omitempty" example:"1"` // Unauthorized auth-result cache TTL in seconds. 0 disables the cache.
-	AliyunESAEnabled  bool   `json:"aliyun_esa_enabled,omitempty" example:"false"`
+	AliyunESAEnabled  bool   `json:"aliyun_esa_enabled,omitempty" example:"false"`              // Enables Alibaba Cloud ESA / Tencent EdgeOne client IP handling.
 	PublicAuthBaseURL string `json:"public_auth_base_url,omitempty" example:"https://auth.example.com"`
 	PublicHTTPPort    int    `json:"public_http_port,omitempty" example:"80"`
 	PublicHTTPSPort   int    `json:"public_https_port,omitempty" example:"443"`

@@ -130,6 +130,7 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 - `rules`: 路由规则数组
 - `default_route`: 根路径 `/` 的默认去向，默认 `"/__select__"`
 - `auth_config`: 全局认证配置
+- `auth_config.aliyun_esa_enabled`: 启用阿里云 ESA / 腾讯 EdgeOne 兼容模式；来源 IP 优先读取 `Ali-Real-Client-IP`，缺失时回退到 `X-Forwarded-For`
 - `auth_config.public_http_port`: 可选，显式指定对外暴露的 HTTP 端口
 - `auth_config.public_https_port`: 可选，显式指定对外暴露的 HTTPS 端口
 - `admin_port`: 管理端口（仅在 `-admin-port=0` 时作为回退）
@@ -211,6 +212,7 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 会透传/注入的关键头：
 - `Cookie`
 - `Authorization`
+- `Ali-Real-Client-IP`（启用 `auth_config.aliyun_esa_enabled` 时）
 - `X-Real-IP`
 - `X-Forwarded-For`
 - `X-Forwarded-Path`
