@@ -195,12 +195,12 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 - `use_root_mode=true`：命中后写入 `__proxy_path` cookie 并 302 到 `/`
 
 未命中时：
-- 请求 `/` 且无规则：返回 Welcome 页面
-- 请求 `/` 且有规则：
+- 请求 `/` 且未配置任何 path/host 规则：返回 Welcome 页面
+- 请求 `/` 且有 path 规则：
   - 若 `__proxy_path` cookie 对应到某条规则，则优先按该规则转发
   - 若 `default_route` 对应到某条规则，则按该规则转发
   - 否则跳转到 `/__select__`
-- 其他路径：返回 404 页面
+- 其他未命中场景（包括 host 未命中，或仅配置 host 规则时访问 `/`）：返回 No Matching Route 页面（404）
 
 ## 认证服务接入契约
 

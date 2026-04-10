@@ -52,6 +52,8 @@ type pageData struct {
 	Rules       []models.Rule
 	HostRules   []models.HostRule
 	ToolbarHTML template.HTML
+	RequestHost string
+	RequestPath string
 }
 
 const baseStyle = `
@@ -126,12 +128,48 @@ var errorTmpl = template.Must(
 		Parse(baseTemplate + footerTemplate + errorContent),
 )
 
-func HTML(w http.ResponseWriter, r *http.Request, code int, message string, rules []models.Rule) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+const routeNotFoundContent = `
+{{define "content"}}
+<div class="text-center px-5 max-w-2xl">
+	<img src="/android-chrome-512x512.png" alt="Logo" style="width:64px;height:64px;margin:0 auto 1.25rem;display:block;border-radius:16px;">
+	<h1 class="text-4xl font-semibold tracking-tight mb-4">{{.Title}}</h1>
+	<p class="text-xl text-gray-600 mb-8">{{.Message}}</p>
 
-	httpStatus := mapHTTPStatus(code)
-	w.WriteHeader(httpStatus)
+	<div style="margin:0 auto 2rem;max-width:32rem;text-align:left;border:1px solid #e5e7eb;border-radius:18px;padding:1rem 1.25rem;background:#fafafa;">
+		<div style="font-size:.75rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.9rem;">Request</div>
+		<div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;margin-bottom:.75rem;">
+			<span style="color:#6b7280;">Host</span>
+			<code style="font-size:.875rem;color:#111;word-break:break-all;text-align:right;">{{if .RequestHost}}{{.RequestHost}}{{else}}-{{end}}</code>
+		</div>
+		<div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;">
+			<span style="color:#6b7280;">Path</span>
+			<code style="font-size:.875rem;color:#111;word-break:break-all;text-align:right;">{{if .RequestPath}}{{.RequestPath}}{{else}}-{{end}}</code>
+		</div>
+	</div>
 
+	{{if .ShowBack}}
+	<a href="/__select__"
+	   class="inline-block px-5 py-2.5 text-sm font-medium 
+	          text-white bg-black hover:bg-gray-900 
+	          transition-colors duration-150 
+	          border border-black">
+		Go to Select
+	</a>
+	{{end}}
+
+	<div class="mt-12">
+		{{template "footer" .}}
+	</div>
+</div>
+{{end}}
+`
+
+var routeNotFoundTmpl = template.Must(
+	template.New("base").
+		Parse(baseTemplate + footerTemplate + routeNotFoundContent),
+)
+
+func buildPageData(r *http.Request, rules []models.Rule) pageData {
 	userAgent := ""
 	if r != nil {
 		userAgent = r.UserAgent()
@@ -143,14 +181,33 @@ func HTML(w http.ResponseWriter, r *http.Request, code int, message string, rule
 	}
 
 	data := pageData{
-		Title:       strconv.Itoa(code),
-		Message:     message,
 		Year:        time.Now().Year(),
-		ShowBack:    true,
 		Version:     version.Version,
 		BodyClass:   "flex items-center justify-center h-screen bg-white",
 		ToolbarHTML: toolbarHTML,
 	}
+
+	if r != nil {
+		data.RequestHost = r.Host
+		data.RequestPath = r.URL.Path
+		if r.URL.RawQuery != "" {
+			data.RequestPath += "?" + r.URL.RawQuery
+		}
+	}
+
+	return data
+}
+
+func HTML(w http.ResponseWriter, r *http.Request, code int, message string, rules []models.Rule) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	httpStatus := mapHTTPStatus(code)
+	w.WriteHeader(httpStatus)
+
+	data := buildPageData(r, rules)
+	data.Title = strconv.Itoa(code)
+	data.Message = message
+	data.ShowBack = true
 
 	_ = errorTmpl.ExecuteTemplate(w, "layout", data)
 }
@@ -159,27 +216,24 @@ func Welcome(w http.ResponseWriter, r *http.Request, rules []models.Rule) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
-	userAgent := ""
-	if r != nil {
-		userAgent = r.UserAgent()
-	}
-
-	var toolbarHTML template.HTML
-	if len(rules) > 0 && !ShouldSuppressToolbarForUserAgent(userAgent) {
-		toolbarHTML = template.HTML(GenerateToolbar(rules, ""))
-	}
-
-	data := pageData{
-		Title:       "It's working!",
-		Message:     "Welcome to Go Reauth Proxy",
-		Year:        time.Now().Year(),
-		ShowBack:    false,
-		Version:     version.Version,
-		BodyClass:   "flex items-center justify-center h-screen bg-white",
-		ToolbarHTML: toolbarHTML,
-	}
+	data := buildPageData(r, rules)
+	data.Title = "It's working!"
+	data.Message = "Welcome to Go Reauth Proxy"
+	data.ShowBack = false
 
 	_ = errorTmpl.ExecuteTemplate(w, "layout", data)
+}
+
+func RouteNotFound(w http.ResponseWriter, r *http.Request, rules []models.Rule) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+
+	data := buildPageData(r, rules)
+	data.Title = "No Matching Route"
+	data.Message = "This request did not match any configured route."
+	data.ShowBack = len(rules) > 0
+
+	_ = routeNotFoundTmpl.ExecuteTemplate(w, "layout", data)
 }
 
 func mapHTTPStatus(code int) int {

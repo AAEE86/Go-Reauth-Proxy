@@ -2044,14 +2044,16 @@ func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
 
 func (h *Handler) handleNoMatchRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) {
 	if r.URL.Path == "/" {
-		if len(snapshot.rules) == 0 {
+		if len(snapshot.rules) == 0 && len(snapshot.hostRules) == 0 {
 			response.Welcome(w, r, nil)
 			return
 		}
-		http.Redirect(w, r, "/__select__", http.StatusFound)
-		return
+		if len(snapshot.rules) > 0 {
+			http.Redirect(w, r, "/__select__", http.StatusFound)
+			return
+		}
 	}
-	response.HTML(w, r, errors.CodeNotFound, "Not Found", snapshot.rules)
+	response.RouteNotFound(w, r, snapshot.rules)
 }
 
 func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult) {
