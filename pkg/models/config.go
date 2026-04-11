@@ -69,6 +69,12 @@ type ForwardedHeadersConfig struct {
 	UpdatedAt   string   `json:"updated_at,omitempty"`
 }
 
+type PreserveHostConfig struct {
+	Enabled     bool     `json:"enabled,omitempty"`
+	OmitTargets []string `json:"omit_targets,omitempty"`
+	UpdatedAt   string   `json:"updated_at,omitempty"`
+}
+
 type ReverseProxyThrottleExemptIPsRuntime struct {
 	Enabled   bool     `json:"enabled,omitempty"`
 	IPs       []string `json:"ips,omitempty"`

@@ -29,6 +29,7 @@ type AppConfig struct {
 	ReverseProxyThrottle models.ReverseProxyThrottleConfig `json:"reverse_proxy_throttle,omitempty"`
 	Visibility           models.GatewayVisibilityConfig    `json:"visibility,omitempty"`
 	ForwardedHeaders     models.ForwardedHeadersConfig     `json:"forwarded_headers,omitempty"`
+	PreserveHost         models.PreserveHostConfig         `json:"preserve_host,omitempty"`
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
 	SSL                  models.SSLConfig                  `json:"ssl,omitempty"`
@@ -82,6 +83,11 @@ func defaultConfig() *AppConfig {
 		},
 		ForwardedHeaders: models.ForwardedHeadersConfig{
 			Enabled:     false,
+			OmitTargets: []string{},
+			UpdatedAt:   "",
+		},
+		PreserveHost: models.PreserveHostConfig{
+			Enabled:     true,
 			OmitTargets: []string{},
 			UpdatedAt:   "",
 		},
@@ -193,6 +199,12 @@ func applyDefaults(cfg *AppConfig) {
 	}
 	if cfg.ForwardedHeaders.UpdatedAt == "" {
 		cfg.ForwardedHeaders.UpdatedAt = ""
+	}
+	if cfg.PreserveHost.OmitTargets == nil {
+		cfg.PreserveHost.OmitTargets = []string{}
+	}
+	if cfg.PreserveHost.UpdatedAt == "" {
+		cfg.PreserveHost.UpdatedAt = ""
 	}
 	if cfg.Logging.MaxDays <= 0 {
 		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays

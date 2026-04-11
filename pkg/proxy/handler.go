@@ -45,6 +45,7 @@ type Handler struct {
 	ReverseProxyThrottle  models.ReverseProxyThrottleConfig
 	GatewayVisibility     models.GatewayVisibilityConfig
 	ForwardedHeaders      models.ForwardedHeadersConfig
+	PreserveHost          models.PreserveHostConfig
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
@@ -70,6 +71,7 @@ type Handler struct {
 	reverseProxyThrottleExempt *reverseProxyThrottleExemptIPsRuntime
 	gatewayVisibility          *gatewayVisibility
 	forwardedHeaders           *forwardedHeadersConfig
+	preserveHost               *preserveHostConfig
 	systemEventClient          *events.Client
 }
 
@@ -308,11 +310,33 @@ func applyForwardedHeaderPolicy(out *http.Request, in *http.Request, clientIP st
 	out.Header.Set("X-Forwarded-Proto", requestScheme(in))
 }
 
+func applyPreserveHostPolicy(out *http.Request, in *http.Request, targetURL *url.URL, preserveHost bool) {
+	if out == nil {
+		return
+	}
+
+	if preserveHost && in != nil {
+		out.Host = in.Host
+		return
+	}
+
+	if targetURL != nil {
+		out.Host = targetURL.Host
+	}
+}
+
 func (h *Handler) shouldOmitForwardedHeaders(target *url.URL) bool {
 	if h == nil || h.forwardedHeaders == nil {
 		return false
 	}
 	return h.forwardedHeaders.shouldOmit(target)
+}
+
+func (h *Handler) shouldOmitPreserveHost(target *url.URL) bool {
+	if h == nil || h.preserveHost == nil {
+		return false
+	}
+	return h.preserveHost.shouldOmit(target)
 }
 
 func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string) preflightDecision {
@@ -462,6 +486,7 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string, systemEventClient *events.Client) *Handler {
 	logConfig := gatewaylog.NormalizeConfig(initialCfg.Logging)
 	normalizedForwardedHeaders, _ := normalizeForwardedHeadersConfig(initialCfg.ForwardedHeaders)
+	normalizedPreserveHost, _ := normalizePreserveHostConfig(initialCfg.PreserveHost)
 	if strings.TrimSpace(logsDir) == "" {
 		logsDir = gatewaylog.DefaultLogsDir(".")
 	}
@@ -479,6 +504,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		ReverseProxyThrottle: normalizeReverseProxyThrottleConfig(initialCfg.ReverseProxyThrottle),
 		GatewayVisibility:    initialCfg.Visibility,
 		ForwardedHeaders:     normalizedForwardedHeaders,
+		PreserveHost:         normalizedPreserveHost,
 		configManager:        cfgManager,
 		sslConfig:            copySSLConfig(initialCfg.SSL),
 		gatewayLogManager:    gatewaylog.NewManager(logsDir, logConfig),
@@ -495,6 +521,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		authCache:         newAuthStateCache(),
 		preflightCache:    newPreflightStateCache(),
 		forwardedHeaders:  newForwardedHeadersConfig(normalizedForwardedHeaders),
+		preserveHost:      newPreserveHostConfig(normalizedPreserveHost),
 		systemEventClient: systemEventClient,
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
@@ -590,6 +617,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.ReverseProxyThrottle = h.ReverseProxyThrottle
 		conf.Visibility = h.GatewayVisibility
 		conf.ForwardedHeaders = h.ForwardedHeaders
+		conf.PreserveHost = h.PreserveHost
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
 		return nil
@@ -1289,6 +1317,20 @@ func (h *Handler) GetForwardedHeadersConfig() models.ForwardedHeadersConfig {
 	}
 }
 
+func (h *Handler) GetPreserveHostConfig() models.PreserveHostConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	omitTargets := make([]string, len(h.PreserveHost.OmitTargets))
+	copy(omitTargets, h.PreserveHost.OmitTargets)
+
+	return models.PreserveHostConfig{
+		Enabled:     h.PreserveHost.Enabled,
+		OmitTargets: omitTargets,
+		UpdatedAt:   h.PreserveHost.UpdatedAt,
+	}
+}
+
 func (h *Handler) GetReverseProxyThrottleExemptIPs() models.ReverseProxyThrottleExemptIPsRuntime {
 	h.mu.RLock()
 	runtime := h.reverseProxyThrottleExempt
@@ -1378,6 +1420,22 @@ func (h *Handler) SetForwardedHeadersConfig(cfg models.ForwardedHeadersConfig) {
 	h.mu.Unlock()
 
 	forwardedHeaders.updateConfig(normalized)
+}
+
+func (h *Handler) SetPreserveHostConfig(cfg models.PreserveHostConfig) {
+	normalized, _ := normalizePreserveHostConfig(cfg)
+
+	h.mu.Lock()
+	h.PreserveHost = normalized
+	h.saveConfigLocked()
+	preserveHost := h.preserveHost
+	if preserveHost == nil {
+		preserveHost = newPreserveHostConfig(normalized)
+		h.preserveHost = preserveHost
+	}
+	h.mu.Unlock()
+
+	preserveHost.updateConfig(normalized)
 }
 
 func (h *Handler) SetReverseProxyThrottleExemptIPs(cfg models.ReverseProxyThrottleExemptIPsRuntime) {
@@ -2075,6 +2133,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		transport = newProxyTransport()
 	}
 	omitForwardedHeaders := h.shouldOmitForwardedHeaders(targetURL)
+	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 
@@ -2084,13 +2143,9 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, omitForwardedHeaders)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
-			if matchedRule.PreserveHost {
-				pr.Out.Host = pr.In.Host
-			} else {
-				pr.Out.Host = targetURL.Host
-			}
+			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
 
-			if !matchedRule.PreserveHost {
+			if !preserveHost {
 				if origin := pr.In.Header.Get("Origin"); origin != "" {
 					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
 				}
@@ -2177,6 +2232,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	if transport == nil {
 		transport = newProxyTransport()
 	}
+	preserveHost := !h.shouldOmitPreserveHost(targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -2184,7 +2240,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, false)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
-			pr.Out.Host = targetURL.Host
+			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
 
 			if matchedRule.StripPath {
 				pr.Out.URL.Path = strings.TrimPrefix(pr.Out.URL.Path, matchedRule.Path)
@@ -2194,25 +2250,27 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				pr.Out.URL.RawPath = ""
 			}
 
-			if origin := pr.In.Header.Get("Origin"); origin != "" {
-				pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
-			}
-			if referer := pr.In.Header.Get("Referer"); referer != "" {
-				ref, err := url.Parse(referer)
-				if err == nil {
-					ref.Scheme = targetURL.Scheme
-					ref.Host = targetURL.Host
-					ref.Path = path.Clean(ref.Path)
+			if !preserveHost {
+				if origin := pr.In.Header.Get("Origin"); origin != "" {
+					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+				}
+				if referer := pr.In.Header.Get("Referer"); referer != "" {
+					ref, err := url.Parse(referer)
+					if err == nil {
+						ref.Scheme = targetURL.Scheme
+						ref.Host = targetURL.Host
+						ref.Path = path.Clean(ref.Path)
 
-					if matchedRule.StripPath {
-						ref.Path = strings.TrimPrefix(ref.Path, matchedRule.Path)
-						if !strings.HasPrefix(ref.Path, "/") {
-							ref.Path = "/" + ref.Path
+						if matchedRule.StripPath {
+							ref.Path = strings.TrimPrefix(ref.Path, matchedRule.Path)
+							if !strings.HasPrefix(ref.Path, "/") {
+								ref.Path = "/" + ref.Path
+							}
 						}
-					}
-					ref.RawPath = ""
+						ref.RawPath = ""
 
-					pr.Out.Header.Set("Referer", ref.String())
+						pr.Out.Header.Set("Referer", ref.String())
+					}
 				}
 			}
 

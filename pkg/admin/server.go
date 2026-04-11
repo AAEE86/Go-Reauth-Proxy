@@ -99,6 +99,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/visibility", s.handleSetGatewayVisibility).Methods("POST")
 	r.HandleFunc("/api/config/forwarded-headers", s.handleGetForwardedHeadersConfig).Methods("GET")
 	r.HandleFunc("/api/config/forwarded-headers", s.handleSetForwardedHeadersConfig).Methods("POST")
+	r.HandleFunc("/api/config/preserve-host", s.handleGetPreserveHostConfig).Methods("GET")
+	r.HandleFunc("/api/config/preserve-host", s.handleSetPreserveHostConfig).Methods("POST")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleGetReverseProxyThrottleExemptIPs).Methods("GET")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleSetReverseProxyThrottleExemptIPs).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
@@ -583,6 +585,38 @@ func (s *Server) handleSetForwardedHeadersConfig(w http.ResponseWriter, r *http.
 
 	s.ProxyHandler.SetForwardedHeadersConfig(req)
 	response.Success(w, s.ProxyHandler.GetForwardedHeadersConfig())
+}
+
+// handleGetPreserveHostConfig gets the current preserve-host runtime config
+// @Summary Get preserve host config
+// @Description Get the current explicit preserve-host runtime configuration
+// @Tags config
+// @Produce  json
+// @Success 200 {object} response.Response{data=models.PreserveHostConfig}
+// @Router /api/config/preserve-host [get]
+func (s *Server) handleGetPreserveHostConfig(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetPreserveHostConfig())
+}
+
+// handleSetPreserveHostConfig sets the preserve-host runtime config
+// @Summary Set preserve host config
+// @Description Replace the explicit preserve-host runtime configuration
+// @Tags config
+// @Accept  json
+// @Produce  json
+// @Param request body models.PreserveHostConfig true "Preserve host config"
+// @Success 200 {object} response.Response{data=models.PreserveHostConfig}
+// @Failure 400 {object} response.Response
+// @Router /api/config/preserve-host [post]
+func (s *Server) handleSetPreserveHostConfig(w http.ResponseWriter, r *http.Request) {
+	var req models.PreserveHostConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	s.ProxyHandler.SetPreserveHostConfig(req)
+	response.Success(w, s.ProxyHandler.GetPreserveHostConfig())
 }
 
 func (s *Server) handleGetReverseProxyThrottleExemptIPs(w http.ResponseWriter, r *http.Request) {
