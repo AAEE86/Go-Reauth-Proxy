@@ -2143,6 +2143,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, omitForwardedHeaders)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
+			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
 			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
 
 			if !preserveHost {
@@ -2240,6 +2241,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, false)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
+			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
 			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
 
 			if matchedRule.StripPath {
