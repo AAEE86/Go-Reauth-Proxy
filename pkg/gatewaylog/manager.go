@@ -59,6 +59,7 @@ type Entry struct {
 	TLS             bool   `json:"tls"`
 	WebSocket       bool   `json:"websocket"`
 	AliRealClientIP string `json:"ali_real_client_ip,omitempty"`
+	EOConnectingIP  string `json:"eo_connecting_ip,omitempty"`
 	XForwardedFor   string `json:"x_forwarded_for,omitempty"`
 	XRealIP         string `json:"x_real_ip,omitempty"`
 }
@@ -347,6 +348,7 @@ func (m *Manager) Log(entry Entry) {
 		Bool("tls", entry.TLS).
 		Bool("websocket", entry.WebSocket).
 		Str("ali_real_client_ip", entry.AliRealClientIP).
+		Str("eo_connecting_ip", entry.EOConnectingIP).
 		Str("x_forwarded_for", entry.XForwardedFor).
 		Str("x_real_ip", entry.XRealIP).
 		Send()

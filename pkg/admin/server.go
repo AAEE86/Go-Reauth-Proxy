@@ -38,18 +38,20 @@ type ServerInfo struct {
 }
 
 type authConfigPatch struct {
-	AuthPort          *int    `json:"auth_port"`
-	AuthURL           *string `json:"auth_url"`
-	LoginURL          *string `json:"login_url"`
-	LogoutURL         *string `json:"logout_url"`
-	PreflightURL      *string `json:"preflight_url"`
-	AuthCacheTTL      *int    `json:"auth_cache_ttl_seconds"`
-	AuthCacheFailTTL  *int    `json:"auth_cache_unauthorized_ttl_seconds"`
-	AliyunESAEnabled  *bool   `json:"aliyun_esa_enabled"`
-	PublicAuthBaseURL *string `json:"public_auth_base_url"`
-	PublicHTTPPort    *int    `json:"public_http_port"`
-	PublicHTTPSPort   *int    `json:"public_https_port"`
-	AuthHost          *string `json:"auth_host"`
+	AuthPort              *int    `json:"auth_port"`
+	AuthURL               *string `json:"auth_url"`
+	LoginURL              *string `json:"login_url"`
+	LogoutURL             *string `json:"logout_url"`
+	PreflightURL          *string `json:"preflight_url"`
+	AuthCacheTTL          *int    `json:"auth_cache_ttl_seconds"`
+	AuthCacheFailTTL      *int    `json:"auth_cache_unauthorized_ttl_seconds"`
+	EdgeClientIPEnabled   *bool   `json:"edge_client_ip_enabled"`
+	AliyunESAEnabled      *bool   `json:"aliyun_esa_enabled"`
+	TencentEdgeOneEnabled *bool   `json:"tencent_edgeone_enabled"`
+	PublicAuthBaseURL     *string `json:"public_auth_base_url"`
+	PublicHTTPPort        *int    `json:"public_http_port"`
+	PublicHTTPSPort       *int    `json:"public_https_port"`
+	AuthHost              *string `json:"auth_host"`
 }
 
 type reverseProxyThrottleExemptIPsRuntimeResponse = models.ReverseProxyThrottleExemptIPsRuntime
@@ -646,8 +648,20 @@ func (s *Server) handleGetAuth(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, config)
 }
 
-func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) models.AuthConfig {
+func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) (models.AuthConfig, error) {
 	merged := current
+
+	if patch.EdgeClientIPEnabled != nil && !*patch.EdgeClientIPEnabled {
+		if patch.AliyunESAEnabled != nil && *patch.AliyunESAEnabled {
+			return models.AuthConfig{}, fmt.Errorf("edge_client_ip_enabled=false conflicts with aliyun_esa_enabled=true")
+		}
+		if patch.TencentEdgeOneEnabled != nil && *patch.TencentEdgeOneEnabled {
+			return models.AuthConfig{}, fmt.Errorf("edge_client_ip_enabled=false conflicts with tencent_edgeone_enabled=true")
+		}
+	}
+	if patch.AliyunESAEnabled != nil && *patch.AliyunESAEnabled && patch.TencentEdgeOneEnabled != nil && *patch.TencentEdgeOneEnabled {
+		return models.AuthConfig{}, fmt.Errorf("aliyun_esa_enabled and tencent_edgeone_enabled cannot both be true")
+	}
 
 	if patch.AuthPort != nil {
 		merged.AuthPort = *patch.AuthPort
@@ -670,8 +684,26 @@ func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) models.Au
 	if patch.AuthCacheFailTTL != nil {
 		merged.AuthCacheFailTTL = *patch.AuthCacheFailTTL
 	}
+	if patch.EdgeClientIPEnabled != nil {
+		merged.EdgeClientIPEnabled = *patch.EdgeClientIPEnabled
+		if !*patch.EdgeClientIPEnabled {
+			merged.AliyunESAEnabled = false
+			merged.TencentEdgeOneEnabled = false
+		}
+	}
 	if patch.AliyunESAEnabled != nil {
 		merged.AliyunESAEnabled = *patch.AliyunESAEnabled
+		if *patch.AliyunESAEnabled {
+			merged.EdgeClientIPEnabled = true
+			merged.TencentEdgeOneEnabled = false
+		}
+	}
+	if patch.TencentEdgeOneEnabled != nil {
+		merged.TencentEdgeOneEnabled = *patch.TencentEdgeOneEnabled
+		if *patch.TencentEdgeOneEnabled {
+			merged.EdgeClientIPEnabled = true
+			merged.AliyunESAEnabled = false
+		}
 	}
 	if patch.PublicAuthBaseURL != nil {
 		merged.PublicAuthBaseURL = *patch.PublicAuthBaseURL
@@ -686,7 +718,8 @@ func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) models.Au
 		merged.AuthHost = *patch.AuthHost
 	}
 
-	return merged
+	merged.NormalizeEdgeClientIPSelection()
+	return merged, nil
 }
 
 // handleSetAuth sets the global auth configuration
@@ -706,7 +739,11 @@ func (s *Server) handleSetAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nextConfig := mergeAuthConfig(s.ProxyHandler.GetAuthConfig(), req)
+	nextConfig, err := mergeAuthConfig(s.ProxyHandler.GetAuthConfig(), req)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
 	if err := s.ProxyHandler.SetAuthConfig(nextConfig); err != nil {
 		response.Error(w, errors.CodeBadRequest, err.Error())
 		return

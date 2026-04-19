@@ -1081,7 +1081,12 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "aliyun_esa_enabled": {
-                    "description": "Enables Alibaba Cloud ESA / Tencent EdgeOne client IP handling.",
+                    "description": "Enables Alibaba Cloud ESA client IP/header handling.",
+                    "type": "boolean",
+                    "example": false
+                },
+                "edge_client_ip_enabled": {
+                    "description": "Master switch for edge vendor client IP/header handling.",
                     "type": "boolean",
                     "example": false
                 },
@@ -1135,6 +1140,11 @@ const docTemplate = `{
                 "public_https_port": {
                     "type": "integer",
                     "example": 443
+                },
+                "tencent_edgeone_enabled": {
+                    "description": "Enables Tencent EdgeOne client IP/header handling.",
+                    "type": "boolean",
+                    "example": false
                 }
             }
         },

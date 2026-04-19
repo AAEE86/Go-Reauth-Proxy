@@ -103,7 +103,7 @@ func resolvedPublicPort(r *http.Request, authConfig models.AuthConfig, scheme st
 		return requestHostPort
 	}
 
-	if authConfig.AliyunESAEnabled {
+	if authConfig.EdgeClientIPActive() {
 		return ""
 	}
 

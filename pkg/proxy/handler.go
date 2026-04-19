@@ -113,7 +113,16 @@ func (h *Handler) snapshotForRequest() requestSnapshot {
 }
 
 func resolveClientIP(r *http.Request, authConfig models.AuthConfig, proxyProtocolForce bool) string {
-	if authConfig.AliyunESAEnabled {
+	if authConfig.TencentEdgeOneActive() {
+		if ip := normalizeIPAddress(r.Header.Get("EO-Connecting-IP")); ip != "" {
+			return ip
+		}
+		if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
+			return ip
+		}
+	}
+
+	if authConfig.AliyunESAActive() {
 		if ip := normalizeIPAddress(r.Header.Get("Ali-Real-Client-IP")); ip != "" {
 			return ip
 		}
@@ -123,7 +132,7 @@ func resolveClientIP(r *http.Request, authConfig models.AuthConfig, proxyProtoco
 	}
 
 	if proxyProtocolForce {
-		if !authConfig.AliyunESAEnabled {
+		if !authConfig.EdgeClientIPActive() {
 			if ip := firstForwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
 				return ip
 			}
@@ -276,10 +285,16 @@ func applyInternalAuthProxyHeaders(req *http.Request, source *http.Request, targ
 		req.Header.Set("X-Forwarded-Host", source.Host)
 		req.Header.Set("X-Forwarded-Proto", requestScheme(source))
 	}
-	if authConfig.AliyunESAEnabled && clientIP != "" {
-		req.Header.Set("Ali-Real-Client-IP", clientIP)
-	} else {
+	switch {
+	case authConfig.TencentEdgeOneActive() && clientIP != "":
+		req.Header.Set("EO-Connecting-IP", clientIP)
 		req.Header.Del("Ali-Real-Client-IP")
+	case authConfig.AliyunESAActive() && clientIP != "":
+		req.Header.Set("Ali-Real-Client-IP", clientIP)
+		req.Header.Del("EO-Connecting-IP")
+	default:
+		req.Header.Del("Ali-Real-Client-IP")
+		req.Header.Del("EO-Connecting-IP")
 	}
 
 	// Strip internal routing hints and any client-supplied real-IP header.
@@ -1274,6 +1289,7 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	}
 	config.PublicAuthBaseURL = strings.TrimSpace(strings.TrimRight(config.PublicAuthBaseURL, "/"))
 	config.AuthHost = normalizeRequestHost(config.AuthHost)
+	config.NormalizeEdgeClientIPSelection()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1697,6 +1713,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		TLS:             r.TLS != nil,
 		WebSocket:       strings.EqualFold(r.Header.Get("Upgrade"), "websocket"),
 		AliRealClientIP: strings.TrimSpace(r.Header.Get("Ali-Real-Client-IP")),
+		EOConnectingIP:  strings.TrimSpace(r.Header.Get("EO-Connecting-IP")),
 		XForwardedFor:   firstForwardedValue(r.Header.Get("X-Forwarded-For")),
 		XRealIP:         strings.TrimSpace(r.Header.Get("X-Real-IP")),
 	}
@@ -2659,7 +2676,7 @@ func mergeQueryValues(dst url.Values, src url.Values) {
 }
 
 func applyRequestPortToPublicAuthBase(baseURL *url.URL, r *http.Request, authConfig models.AuthConfig) {
-	if authConfig.AliyunESAEnabled || baseURL == nil || baseURL.Host == "" || baseURL.Port() != "" {
+	if authConfig.EdgeClientIPActive() || baseURL == nil || baseURL.Host == "" || baseURL.Port() != "" {
 		return
 	}
 

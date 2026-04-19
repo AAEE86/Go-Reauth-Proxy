@@ -55,18 +55,20 @@ func defaultConfig() *AppConfig {
 		StreamRules:  []models.StreamRule{},
 		DefaultRoute: "/__select__",
 		AuthConfig: models.AuthConfig{
-			AuthPort:          7997,
-			AuthURL:           "/api/auth/verify",
-			LoginURL:          "/login",
-			LogoutURL:         "/api/auth/logout",
-			PreflightURL:      "/api/auth/preflight",
-			AuthCacheTTL:      defaultAuthCacheTTLSeconds,
-			AuthCacheFailTTL:  defaultAuthCacheUnauthorizedTTLSeconds,
-			AliyunESAEnabled:  false,
-			PublicAuthBaseURL: "",
-			PublicHTTPPort:    0,
-			PublicHTTPSPort:   0,
-			AuthHost:          "",
+			AuthPort:              7997,
+			AuthURL:               "/api/auth/verify",
+			LoginURL:              "/login",
+			LogoutURL:             "/api/auth/logout",
+			PreflightURL:          "/api/auth/preflight",
+			AuthCacheTTL:          defaultAuthCacheTTLSeconds,
+			AuthCacheFailTTL:      defaultAuthCacheUnauthorizedTTLSeconds,
+			EdgeClientIPEnabled:   false,
+			AliyunESAEnabled:      false,
+			TencentEdgeOneEnabled: false,
+			PublicAuthBaseURL:     "",
+			PublicHTTPPort:        0,
+			PublicHTTPSPort:       0,
+			AuthHost:              "",
 		},
 		AdminPort:          7996,
 		ProxyProtocolForce: false,
@@ -102,20 +104,29 @@ func defaultConfig() *AppConfig {
 	}
 }
 
-func applyDefaults(cfg *AppConfig) {
+func applyDefaults(cfg *AppConfig) bool {
+	changed := false
+
 	if cfg.Rules == nil {
 		cfg.Rules = []models.Rule{}
+		changed = true
 	}
 	if cfg.HostRules == nil {
 		cfg.HostRules = []models.HostRule{}
+		changed = true
 	}
 	if cfg.StreamRules == nil {
 		cfg.StreamRules = []models.StreamRule{}
+		changed = true
 	}
 	if cfg.SSL.Certificates == nil {
 		cfg.SSL.Certificates = []models.SSLDeployedCertificate{}
+		changed = true
 	}
 	if cfg.SSL.DeploymentMode != models.SSLDeploymentModeMultiSNI {
+		if cfg.SSL.DeploymentMode != models.SSLDeploymentModeSingleActive {
+			changed = true
+		}
 		cfg.SSL.DeploymentMode = models.SSLDeploymentModeSingleActive
 	}
 	if len(cfg.SSL.Certificates) == 0 {
@@ -134,97 +145,124 @@ func applyDefaults(cfg *AppConfig) {
 					},
 				},
 			}
+			changed = true
 		}
 	}
 
 	if cfg.DefaultRoute == "" {
 		cfg.DefaultRoute = "/__select__"
+		changed = true
 	}
 	if cfg.AuthConfig.AuthPort <= 0 {
 		cfg.AuthConfig.AuthPort = 7997
+		changed = true
 	}
 	if cfg.AuthConfig.AuthURL == "" {
 		cfg.AuthConfig.AuthURL = "/api/auth/verify"
+		changed = true
 	}
 	if cfg.AuthConfig.LoginURL == "" {
 		cfg.AuthConfig.LoginURL = "/login"
+		changed = true
 	}
 	if cfg.AuthConfig.LogoutURL == "" {
 		cfg.AuthConfig.LogoutURL = "/api/auth/logout"
+		changed = true
 	}
 	if cfg.AuthConfig.PreflightURL == "" {
 		cfg.AuthConfig.PreflightURL = "/api/auth/preflight"
+		changed = true
 	}
 	if cfg.AuthConfig.AuthCacheTTL < 0 {
 		cfg.AuthConfig.AuthCacheTTL = 0
+		changed = true
 	}
 	if cfg.AuthConfig.AuthCacheFailTTL < 0 {
 		cfg.AuthConfig.AuthCacheFailTTL = 0
+		changed = true
 	}
-	if cfg.AuthConfig.PublicAuthBaseURL == "" {
-		cfg.AuthConfig.PublicAuthBaseURL = ""
+	if cfg.AuthConfig.PublicAuthBaseURL != strings.TrimSpace(strings.TrimRight(cfg.AuthConfig.PublicAuthBaseURL, "/")) {
+		cfg.AuthConfig.PublicAuthBaseURL = strings.TrimSpace(strings.TrimRight(cfg.AuthConfig.PublicAuthBaseURL, "/"))
+		changed = true
 	}
 	if cfg.AuthConfig.PublicHTTPPort < 0 {
 		cfg.AuthConfig.PublicHTTPPort = 0
+		changed = true
 	}
 	if cfg.AuthConfig.PublicHTTPSPort < 0 {
 		cfg.AuthConfig.PublicHTTPSPort = 0
+		changed = true
 	}
-	if cfg.AuthConfig.AuthHost == "" {
-		cfg.AuthConfig.AuthHost = ""
+	if cfg.AuthConfig.AuthHost != strings.TrimSpace(cfg.AuthConfig.AuthHost) {
+		cfg.AuthConfig.AuthHost = strings.TrimSpace(cfg.AuthConfig.AuthHost)
+		changed = true
+	}
+	if cfg.AuthConfig.NormalizeEdgeClientIPSelection() {
+		changed = true
 	}
 
 	if cfg.AdminPort <= 0 {
 		cfg.AdminPort = 7996
+		changed = true
 	}
 	if cfg.ReverseProxyThrottle.Enabled {
 		if cfg.ReverseProxyThrottle.RequestsPerSecond <= 0 {
 			cfg.ReverseProxyThrottle.RequestsPerSecond = defaultReverseProxyThrottleRPS
+			changed = true
 		}
 		if cfg.ReverseProxyThrottle.Burst <= 0 {
 			cfg.ReverseProxyThrottle.Burst = defaultReverseProxyThrottleBurst
+			changed = true
 		}
 		if cfg.ReverseProxyThrottle.BlockSeconds <= 0 {
 			cfg.ReverseProxyThrottle.BlockSeconds = defaultReverseProxyThrottleBlockSecs
+			changed = true
 		}
 	}
 	if cfg.Visibility.CIDRs == nil {
 		cfg.Visibility.CIDRs = []string{}
+		changed = true
 	}
 	if cfg.Visibility.UpdatedAt == "" {
 		cfg.Visibility.UpdatedAt = ""
 	}
 	if cfg.ForwardedHeaders.OmitTargets == nil {
 		cfg.ForwardedHeaders.OmitTargets = []string{}
+		changed = true
 	}
 	if cfg.ForwardedHeaders.UpdatedAt == "" {
 		cfg.ForwardedHeaders.UpdatedAt = ""
 	}
 	if cfg.PreserveHost.OmitTargets == nil {
 		cfg.PreserveHost.OmitTargets = []string{}
+		changed = true
 	}
 	if cfg.PreserveHost.UpdatedAt == "" {
 		cfg.PreserveHost.UpdatedAt = ""
 	}
 	if cfg.Logging.MaxDays <= 0 {
 		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays
+		changed = true
 	}
+
+	return changed
 }
 
-func detectAuthCacheFieldPresence(data []byte) (hasAuthCacheTTL bool, hasAuthCacheFailTTL bool) {
+func detectAuthConfigFieldPresence(data []byte) (hasAuthCacheTTL bool, hasAuthCacheFailTTL bool, hasEdgeClientIPEnabled bool) {
 	var raw struct {
 		AuthConfig map[string]json.RawMessage `json:"auth_config"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return false, false
+		return false, false, false
 	}
 	if raw.AuthConfig == nil {
-		return false, false
+		return false, false, false
 	}
 
 	_, hasAuthCacheTTL = raw.AuthConfig["auth_cache_ttl_seconds"]
 	_, hasAuthCacheFailTTL = raw.AuthConfig["auth_cache_unauthorized_ttl_seconds"]
-	return hasAuthCacheTTL, hasAuthCacheFailTTL
+	_, hasEdgeClientIPEnabled = raw.AuthConfig["edge_client_ip_enabled"]
+	return hasAuthCacheTTL, hasAuthCacheFailTTL, hasEdgeClientIPEnabled
 }
 
 func detectReverseProxyThrottleFieldPresence(data []byte) bool {
@@ -279,10 +317,19 @@ func (m *Manager) loadUnlocked() (*AppConfig, bool, bool, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, true, false, err
 	}
-	applyDefaults(&cfg)
-	hasAuthCacheTTL, hasAuthCacheFailTTL := detectAuthCacheFieldPresence(data)
+	hasAuthCacheTTL, hasAuthCacheFailTTL, hasEdgeClientIPEnabled := detectAuthConfigFieldPresence(data)
+	migrated := false
+	if !hasEdgeClientIPEnabled && (cfg.AuthConfig.AliyunESAEnabled || cfg.AuthConfig.TencentEdgeOneEnabled) {
+		cfg.AuthConfig.EdgeClientIPEnabled = true
+		migrated = true
+	}
+	if applyDefaults(&cfg) {
+		migrated = true
+	}
 	hasReverseProxyThrottle := detectReverseProxyThrottleFieldPresence(data)
-	migrated := applyMissingAuthCacheDefaults(&cfg, hasAuthCacheTTL, hasAuthCacheFailTTL)
+	if applyMissingAuthCacheDefaults(&cfg, hasAuthCacheTTL, hasAuthCacheFailTTL) {
+		migrated = true
+	}
 	if applyMissingReverseProxyThrottleDefaults(&cfg, hasReverseProxyThrottle) {
 		migrated = true
 	}

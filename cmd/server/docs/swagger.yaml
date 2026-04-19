@@ -57,7 +57,11 @@ definitions:
   models.AuthConfig:
     properties:
       aliyun_esa_enabled:
-        description: Enables Alibaba Cloud ESA / Tencent EdgeOne client IP handling.
+        description: Enables Alibaba Cloud ESA client IP/header handling.
+        example: false
+        type: boolean
+      edge_client_ip_enabled:
+        description: Master switch for edge vendor client IP/header handling.
         example: false
         type: boolean
       auth_cache_ttl_seconds:
@@ -101,6 +105,10 @@ definitions:
       public_https_port:
         example: 443
         type: integer
+      tencent_edgeone_enabled:
+        description: Enables Tencent EdgeOne client IP/header handling.
+        example: false
+        type: boolean
     type: object
   models.ForwardedHeadersConfig:
     properties:
