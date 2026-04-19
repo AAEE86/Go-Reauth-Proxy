@@ -1993,11 +1993,11 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 	targetURL.Path = singleJoiningSlash(targetURL.Path, proxyPath)
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	if h.proxyTransport != nil {
-		proxy.Transport = h.proxyTransport
-	} else {
-		proxy.Transport = newProxyTransport()
+	transport := h.proxyTransport
+	if transport == nil {
+		transport = newProxyTransport()
 	}
+	proxy.Transport = transport
 
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {

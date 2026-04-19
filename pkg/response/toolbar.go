@@ -668,6 +668,7 @@ func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
 	}
 
 	return strings.Contains(normalized, "com.trim.app") ||
+		strings.Contains(normalized, "com.trim.media") ||
 		strings.Contains(normalized, "fnos")
 }
 

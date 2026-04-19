@@ -147,6 +147,7 @@ func isFNAppRequest(r *http.Request) bool {
 
 	userAgent := strings.ToLower(strings.TrimSpace(r.UserAgent()))
 	if strings.Contains(userAgent, "com.trim.app") ||
+		strings.Contains(userAgent, "com.trim.media") ||
 		strings.Contains(userAgent, "dart:io") ||
 		strings.Contains(userAgent, "flutter/") {
 		return true
