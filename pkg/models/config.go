@@ -119,6 +119,7 @@ type PreserveHostConfig struct {
 type ReverseProxyThrottleExemptIPsRuntime struct {
 	Enabled   bool     `json:"enabled,omitempty"`
 	IPs       []string `json:"ips,omitempty"`
+	CIDRs     []string `json:"cidrs,omitempty"`
 	UpdatedAt string   `json:"updated_at,omitempty"`
 }
 

@@ -544,6 +544,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		models.ReverseProxyThrottleExemptIPsRuntime{
 			Enabled:   false,
 			IPs:       []string{},
+			CIDRs:     []string{},
 			UpdatedAt: "",
 		},
 	)
@@ -1356,6 +1357,7 @@ func (h *Handler) GetReverseProxyThrottleExemptIPs() models.ReverseProxyThrottle
 		return models.ReverseProxyThrottleExemptIPsRuntime{
 			Enabled:   false,
 			IPs:       []string{},
+			CIDRs:     []string{},
 			UpdatedAt: "",
 		}
 	}
