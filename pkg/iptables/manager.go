@@ -20,12 +20,19 @@ type Options struct {
 
 type commandRunner interface {
 	CombinedOutput(command string, args ...string) ([]byte, error)
+	CombinedOutputWithInput(input string, command string, args ...string) ([]byte, error)
 }
 
 type sudoExecRunner struct{}
 
 func (sudoExecRunner) CombinedOutput(command string, args ...string) ([]byte, error) {
 	cmd := exec.Command("sudo", append([]string{command}, args...)...)
+	return cmd.CombinedOutput()
+}
+
+func (sudoExecRunner) CombinedOutputWithInput(input string, command string, args ...string) ([]byte, error) {
+	cmd := exec.Command("sudo", append([]string{command}, args...)...)
+	cmd.Stdin = strings.NewReader(input)
 	return cmd.CombinedOutput()
 }
 
@@ -164,6 +171,39 @@ func (m *Manager) runTableOutput(table string, args ...string) (string, error) {
 		return "", fmt.Errorf("%s command failed: %s, output: %s", table, strings.Join(args, " "), string(output))
 	}
 	return string(output), nil
+}
+
+func restoreCommandForTable(table string) string {
+	switch table {
+	case "iptables":
+		return "iptables-restore"
+	case "ip6tables":
+		return "ip6tables-restore"
+	default:
+		return ""
+	}
+}
+
+func (m *Manager) runTableRestore(table string, input string) error {
+	restoreCommand := restoreCommandForTable(table)
+	if restoreCommand == "" {
+		return fmt.Errorf("unsupported restore table: %s", table)
+	}
+
+	output, err := m.runner.CombinedOutputWithInput(
+		input,
+		restoreCommand,
+		"--noflush",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%s command failed: %s, output: %s",
+			restoreCommand,
+			"--noflush",
+			string(output),
+		)
+	}
+	return nil
 }
 
 func (m *Manager) tableForAddress(address string) (string, error) {
@@ -307,6 +347,10 @@ func (m *Manager) parentChainExists(table string, parent string) bool {
 }
 
 func (m *Manager) deleteParentJumpsToChain(table string, parent string, chain string) {
+	if !m.parentChainExists(table, parent) {
+		return
+	}
+
 	output, err := m.runTableOutput(table, "-S", parent)
 	if err == nil {
 		for _, line := range strings.Split(output, "\n") {
@@ -452,39 +496,75 @@ func (m *Manager) SyncTCPPortAccessPolicy(policy TCPPortAccessPolicy) error {
 			}
 		}
 
-		if err := m.runTable(table, "-F", chain); err != nil {
-			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to flush SSH chain (%s): %v", table, err))
-		}
-		if policy.IncludeLocalCIDRs {
-			for _, cidr := range m.localCIDRsForTable(table) {
-				if err := m.addSourceRule(table, chain, cidr, "ACCEPT"); err != nil {
-					return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add local SSH allow %s (%s): %v", cidr, table, err))
-				}
-			}
-		}
-		for _, source := range blockSources {
-			sourceTable, _ := m.tableForAddress(source)
-			if sourceTable != table {
-				continue
-			}
-			if err := m.addSourceRule(table, chain, source, "DROP"); err != nil {
-				return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add SSH block %s (%s): %v", source, table, err))
-			}
-		}
-		for _, source := range allowSources {
-			sourceTable, _ := m.tableForAddress(source)
-			if sourceTable != table {
-				continue
-			}
-			if err := m.addSourceRule(table, chain, source, "ACCEPT"); err != nil {
-				return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add SSH allow %s (%s): %v", source, table, err))
-			}
-		}
-		if err := m.runTable(table, "-A", chain, "-j", defaultAction); err != nil {
-			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add SSH default %s (%s): %v", defaultAction, table, err))
+		if err := m.applyTCPPortAccessPolicy(table, normalizedPolicy); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+func (m *Manager) applyTCPPortAccessPolicy(table string, policy TCPPortAccessPolicy) error {
+	chain := normalizeChainName(policy.Chain, DefaultSSHFirewallChain)
+	localCIDRs := []string{}
+	if policy.IncludeLocalCIDRs {
+		localCIDRs = m.localCIDRsForTable(table)
+	}
+
+	blockRules := make([]string, 0, len(policy.BlockSources))
+	for _, source := range policy.BlockSources {
+		sourceTable, _ := m.tableForAddress(source)
+		if sourceTable == table {
+			blockRules = append(blockRules, source)
+		}
+	}
+
+	allowRules := make([]string, 0, len(policy.AllowSources))
+	for _, source := range policy.AllowSources {
+		sourceTable, _ := m.tableForAddress(source)
+		if sourceTable == table {
+			allowRules = append(allowRules, source)
+		}
+	}
+
+	var builder strings.Builder
+	builder.WriteString("*filter\n")
+	builder.WriteString("-F ")
+	builder.WriteString(chain)
+	builder.WriteString("\n")
+	for _, cidr := range localCIDRs {
+		builder.WriteString("-A ")
+		builder.WriteString(chain)
+		builder.WriteString(" -s ")
+		builder.WriteString(cidr)
+		builder.WriteString(" -j ACCEPT\n")
+	}
+	for _, source := range blockRules {
+		builder.WriteString("-A ")
+		builder.WriteString(chain)
+		builder.WriteString(" -s ")
+		builder.WriteString(source)
+		builder.WriteString(" -j DROP\n")
+	}
+	for _, source := range allowRules {
+		builder.WriteString("-A ")
+		builder.WriteString(chain)
+		builder.WriteString(" -s ")
+		builder.WriteString(source)
+		builder.WriteString(" -j ACCEPT\n")
+	}
+	builder.WriteString("-A ")
+	builder.WriteString(chain)
+	builder.WriteString(" -j ")
+	builder.WriteString(policy.DefaultAction)
+	builder.WriteString("\nCOMMIT\n")
+
+	if err := m.runTableRestore(table, builder.String()); err != nil {
+		return errors.New(
+			errors.CodeIptablesCommandError,
+			fmt.Sprintf("Failed to batch apply SSH policy (%s): %v", table, err),
+		)
+	}
 	return nil
 }
 
