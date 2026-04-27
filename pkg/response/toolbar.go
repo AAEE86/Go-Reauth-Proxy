@@ -100,6 +100,8 @@ const toolbarTemplate = `
             display: none;
             flex-direction: column;
             overflow: hidden;
+            box-sizing: border-box;
+            max-height: calc(100vh - 96px);
             transform-origin: bottom right;
             opacity: 0;
             transform: scale(0.95) translateY(10px);
@@ -165,6 +167,18 @@ const toolbarTemplate = `
             font-size: 13px;
             background: #fff;
             border-bottom: 1px solid #f3f4f6;
+        }
+        .menu-scroll {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
+        }
+        .menu-divider {
+            height: 4px;
+            background: #f9fafb;
+            flex-shrink: 0;
         }
         .logout-btn {
             color: #ef4444;
@@ -275,36 +289,38 @@ const toolbarTemplate = `
                 <div class="menu-header">
                     <span><i class="dot"></i> Go Reauth Proxy</span>
                 </div>
-                {{if .HasHostRules}}
-                {{range .HostRules}}
-                <a href="/" target="_blank" rel="noopener noreferrer" data-host="{{.Host}}" class="menu-item nav-link host-link{{if isActiveHost .Host $.CurrentHost}} active{{end}}">
-                    <span class="menu-item-path">{{.Host}}</span>
-                    <span class="menu-item-right-content">
-                        {{if isActiveHost .Host $.CurrentHost}}
-                            <i class="dot"></i>
-                        {{else}}
-                            <span class="menu-item-go-text">Go</span>
-                        {{end}}
-                    </span>
-                </a>
-                {{end}}
-                {{else if .HasPathRules}}
-                {{range .Rules}}
-                <a href="{{ensureSlash .Path}}" target="_blank" rel="noopener noreferrer" class="menu-item nav-link rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
-                    <span class="menu-item-path">{{.Path}}</span>
-                    <span class="menu-item-right-content">
-                        {{if isActive .Path $.CurrentPath}}
-                            <i class="dot"></i>
-                        {{else}}
-                            <span class="menu-item-go-text">Go</span>
-                        {{end}}
-                    </span>
-                </a>
-                {{end}}
-                {{else}}
-                <div class="menu-empty">No routes configured</div>
-                {{end}}
-                <div style="height: 4px; background: #f9fafb;"></div>
+                <div class="menu-scroll">
+                    {{if .HasHostRules}}
+                    {{range .HostRules}}
+                    <a href="/" target="_blank" rel="noopener noreferrer" data-host="{{.Host}}" class="menu-item nav-link host-link{{if isActiveHost .Host $.CurrentHost}} active{{end}}">
+                        <span class="menu-item-path">{{.Host}}</span>
+                        <span class="menu-item-right-content">
+                            {{if isActiveHost .Host $.CurrentHost}}
+                                <i class="dot"></i>
+                            {{else}}
+                                <span class="menu-item-go-text">Go</span>
+                            {{end}}
+                        </span>
+                    </a>
+                    {{end}}
+                    {{else if .HasPathRules}}
+                    {{range .Rules}}
+                    <a href="{{ensureSlash .Path}}" target="_blank" rel="noopener noreferrer" class="menu-item nav-link rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
+                        <span class="menu-item-path">{{.Path}}</span>
+                        <span class="menu-item-right-content">
+                            {{if isActive .Path $.CurrentPath}}
+                                <i class="dot"></i>
+                            {{else}}
+                                <span class="menu-item-go-text">Go</span>
+                            {{end}}
+                        </span>
+                    </a>
+                    {{end}}
+                    {{else}}
+                    <div class="menu-empty">No routes configured</div>
+                    {{end}}
+                </div>
+                <div class="menu-divider"></div>
                 <a href="/__auth__/api/auth/logout" class="menu-item logout-btn">Logout</a>
             </div>
             <div id="fab">
@@ -323,6 +339,7 @@ const toolbarTemplate = `
 
     var fab = shadow.getElementById('fab');
     var menu = shadow.getElementById('menu');
+    var menuScroll = shadow.querySelector('.menu-scroll');
 
     function buildHostHref(host) {
         var port = window.location.port ? ':' + window.location.port : '';
@@ -476,6 +493,9 @@ const toolbarTemplate = `
             menu.classList.remove('open');
         } else {
             updateMenuPosition();
+            if (menuScroll) {
+                menuScroll.scrollTop = 0;
+            }
             menu.classList.add('open');
         }
     }
@@ -511,6 +531,17 @@ const toolbarTemplate = `
             menu.style.top = '56px';
             menu.style.bottom = 'auto';
         }
+
+        var viewportPadding = 20;
+        var menuOffset = 56;
+        var menuBottomAnchor = rect.top + rect.height - menuOffset;
+        var menuTopAnchor = rect.top + menuOffset;
+        var availableHeight = isTop ?
+            (vvTop + vvHeight - viewportPadding) - menuTopAnchor :
+            menuBottomAnchor - (vvTop + viewportPadding);
+
+        var constrainedHeight = Math.max(0, Math.floor(availableHeight));
+        menu.style.maxHeight = constrainedHeight + 'px';
     }
 
     var logoutBtn = shadow.querySelector('.logout-btn');
