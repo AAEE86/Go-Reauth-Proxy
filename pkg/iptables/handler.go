@@ -66,6 +66,50 @@ func (p *PortList) UnmarshalJSON(data []byte) error {
 	return errors.New(errors.CodeInvalidJSON, "Invalid exempt_ports")
 }
 
+type IntPortList []int
+
+func (p *IntPortList) UnmarshalJSON(data []byte) error {
+	var numbersValue []int
+	if err := json.Unmarshal(data, &numbersValue); err == nil {
+		ports := make([]int, 0, len(numbersValue))
+		for _, n := range numbersValue {
+			if n > 0 {
+				ports = append(ports, n)
+			}
+		}
+		*p = ports
+		return nil
+	}
+
+	var stringsValue []string
+	if err := json.Unmarshal(data, &stringsValue); err == nil {
+		ports := make([]int, 0, len(stringsValue))
+		for _, s := range stringsValue {
+			for _, part := range splitCommaSeparated(s) {
+				if n, err := strconv.Atoi(part); err == nil && n > 0 {
+					ports = append(ports, n)
+				}
+			}
+		}
+		*p = ports
+		return nil
+	}
+
+	var singleString string
+	if err := json.Unmarshal(data, &singleString); err == nil {
+		ports := make([]int, 0)
+		for _, part := range splitCommaSeparated(singleString) {
+			if n, err := strconv.Atoi(part); err == nil && n > 0 {
+				ports = append(ports, n)
+			}
+		}
+		*p = ports
+		return nil
+	}
+
+	return errors.New(errors.CodeInvalidJSON, "Invalid ports")
+}
+
 // HandleInit initializes the iptables chain
 // @Summary Initialize iptables
 // @Description Initialize the custom iptables chain
@@ -157,6 +201,25 @@ type tcpRedirectRequest struct {
 	TargetPort int `json:"target_port" example:"7999"`
 }
 
+type tcpPortRuleRequest struct {
+	IP   string `json:"ip" example:"192.168.1.100"`
+	Port int    `json:"port" example:"22"`
+}
+
+type sshFirewallSyncRequest struct {
+	ChainName         string      `json:"chain_name" example:"FN-KNOCK-SSH"`
+	ParentChain       interface{} `json:"parent_chain" swaggertype:"array,string" example:"INPUT,DOCKER-USER"`
+	Ports             IntPortList `json:"ports" example:"22"`
+	AllowedCIDRs      []string    `json:"allowed_cidrs" example:"203.0.113.0/24"`
+	BlockedIPs        []string    `json:"blocked_ips" example:"198.51.100.8"`
+	IncludeLocalCIDRs *bool       `json:"include_local_cidrs" example:"true"`
+}
+
+type sshFirewallClearRequest struct {
+	ChainName   string      `json:"chain_name" example:"FN-KNOCK-SSH"`
+	ParentChain interface{} `json:"parent_chain" swaggertype:"array,string" example:"INPUT,DOCKER-USER"`
+}
+
 // HandleAllowIP adds an ALLOW rule for an IP
 // @Summary Allow IP
 // @Description Add an ALLOW rule for a specific IP
@@ -241,6 +304,129 @@ func (h *Handler) HandleRemoveIP(w http.ResponseWriter, r *http.Request) {
 		handleError(w, err)
 		return
 	}
+	response.Success(w, nil)
+}
+
+// HandleBlockTCPPortForIP adds a TCP port DROP rule for a source IP
+// @Summary Block TCP port for IP
+// @Description Add a DROP rule for a specific source IP and TCP destination port
+// @Tags iptables
+// @Accept  json
+// @Produce  json
+// @Param request body tcpPortRuleRequest true "IP and TCP destination port to block"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /api/iptables/tcp-port/block [post]
+func (h *Handler) HandleBlockTCPPortForIP(w http.ResponseWriter, r *http.Request) {
+	var req tcpPortRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.IP) == "" {
+		response.Error(w, errors.CodeBadRequest, "IP is required")
+		return
+	}
+
+	if err := h.Manager.BlockTCPPortForIP(req.IP, req.Port); err != nil {
+		handleError(w, err)
+		return
+	}
+	response.Success(w, nil)
+}
+
+// HandleRemoveTCPPortRule removes a TCP port ACCEPT/DROP rule for a source IP
+// @Summary Remove TCP port rule for IP
+// @Description Remove an ACCEPT/DROP rule for a specific source IP and TCP destination port
+// @Tags iptables
+// @Accept  json
+// @Produce  json
+// @Param request body tcpPortRuleRequest true "IP and TCP destination port rule to remove"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /api/iptables/tcp-port/remove [post]
+func (h *Handler) HandleRemoveTCPPortRule(w http.ResponseWriter, r *http.Request) {
+	var req tcpPortRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.IP) == "" {
+		response.Error(w, errors.CodeBadRequest, "IP is required")
+		return
+	}
+
+	if err := h.Manager.RemoveTCPPortRule(req.IP, req.Port); err != nil {
+		handleError(w, err)
+		return
+	}
+	response.Success(w, nil)
+}
+
+func (h *Handler) HandleSyncSSHFirewall(w http.ResponseWriter, r *http.Request) {
+	var req sshFirewallSyncRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON body")
+		return
+	}
+
+	chainName := req.ChainName
+	if strings.TrimSpace(chainName) == "" {
+		chainName = DefaultSSHFirewallChain
+	}
+	parents := parseParentChains(req.ParentChain)
+	if len(parents) == 0 {
+		parents = []string{"INPUT", "DOCKER-USER"}
+	}
+	includeLocalCIDRs := true
+	if req.IncludeLocalCIDRs != nil {
+		includeLocalCIDRs = *req.IncludeLocalCIDRs
+	}
+	defaultAction := "RETURN"
+	if len(req.AllowedCIDRs) > 0 {
+		defaultAction = "DROP"
+	}
+
+	if err := h.Manager.SyncTCPPortAccessPolicy(TCPPortAccessPolicy{
+		Chain:             chainName,
+		ParentChains:      parents,
+		Ports:             []int(req.Ports),
+		AllowSources:      req.AllowedCIDRs,
+		BlockSources:      req.BlockedIPs,
+		IncludeLocalCIDRs: includeLocalCIDRs,
+		DefaultAction:     defaultAction,
+	}); err != nil {
+		handleError(w, err)
+		return
+	}
+
+	response.Success(w, nil)
+}
+
+func (h *Handler) HandleClearSSHFirewall(w http.ResponseWriter, r *http.Request) {
+	var req sshFirewallClearRequest
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err == nil && len(bodyBytes) > 0 {
+		_ = json.Unmarshal(bodyBytes, &req)
+	}
+	r.Body.Close()
+
+	chainName := req.ChainName
+	if strings.TrimSpace(chainName) == "" {
+		chainName = DefaultSSHFirewallChain
+	}
+	parents := parseParentChains(req.ParentChain)
+	if len(parents) == 0 {
+		parents = []string{"INPUT", "DOCKER-USER"}
+	}
+
+	if err := h.Manager.ClearTCPPortAccessPolicy(chainName, parents); err != nil {
+		handleError(w, err)
+		return
+	}
+
 	response.Success(w, nil)
 }
 

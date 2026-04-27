@@ -5,10 +5,11 @@ import (
 	"go-reauth-proxy/pkg/errors"
 	"net"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 )
+
+const DefaultSSHFirewallChain = "FN-KNOCK-SSH"
 
 type Options struct {
 	ChainName   string
@@ -34,6 +35,16 @@ type Manager struct {
 	ExemptPorts  []string
 	tables       []string
 	runner       commandRunner
+}
+
+type TCPPortAccessPolicy struct {
+	Chain             string
+	ParentChains      []string
+	Ports             []int
+	AllowSources      []string
+	BlockSources      []string
+	IncludeLocalCIDRs bool
+	DefaultAction     string // DROP or RETURN
 }
 
 var localCIDRv4 = []string{
@@ -229,6 +240,268 @@ func (m *Manager) localCIDRsForTable(table string) []string {
 	return localCIDRv4
 }
 
+func normalizeChainName(chain string, fallback string) string {
+	chain = strings.TrimSpace(chain)
+	if chain == "" {
+		return fallback
+	}
+	return chain
+}
+
+func normalizePorts(ports []int) ([]int, error) {
+	out := make([]int, 0, len(ports))
+	seen := map[int]struct{}{}
+	for _, port := range ports {
+		if err := validatePort(port); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[port]; ok {
+			continue
+		}
+		seen[port] = struct{}{}
+		out = append(out, port)
+	}
+	return out, nil
+}
+
+func normalizeSources(sources []string) []string {
+	out := make([]string, 0, len(sources))
+	seen := map[string]struct{}{}
+	for _, source := range sources {
+		source = strings.TrimSpace(source)
+		if source == "" {
+			continue
+		}
+		key := strings.ToLower(source)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, source)
+	}
+	return out
+}
+
+func normalizeDefaultAction(action string) (string, error) {
+	action = strings.ToUpper(strings.TrimSpace(action))
+	if action == "" {
+		return "RETURN", nil
+	}
+	if action != "DROP" && action != "RETURN" {
+		return "", errors.New(errors.CodeBadRequest, "default action must be DROP or RETURN")
+	}
+	return action, nil
+}
+
+func (m *Manager) ensureChain(table string, chain string) error {
+	if err := m.runTable(table, "-L", chain, "-n"); err != nil {
+		if err := m.runTable(table, "-N", chain); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) parentChainExists(table string, parent string) bool {
+	return m.runTable(table, "-L", parent, "-n") == nil
+}
+
+func (m *Manager) deleteParentJumpsToChain(table string, parent string, chain string) {
+	output, err := m.runTableOutput(table, "-S", parent)
+	if err == nil {
+		for _, line := range strings.Split(output, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 || fields[0] != "-A" || fields[1] != parent {
+				continue
+			}
+			hasJump := false
+			for index := 2; index+1 < len(fields); index++ {
+				if fields[index] == "-j" && fields[index+1] == chain {
+					hasJump = true
+					break
+				}
+			}
+			if !hasJump {
+				continue
+			}
+			args := append([]string{"-D", parent}, fields[2:]...)
+			_ = m.runTable(table, args...)
+		}
+	}
+
+	for {
+		if err := m.runTable(table, "-D", parent, "-j", chain); err != nil {
+			break
+		}
+	}
+}
+
+func (m *Manager) clearTCPPortAccessPolicyForTable(table string, chain string, parents []string) {
+	for _, parent := range parents {
+		m.deleteParentJumpsToChain(table, parent, chain)
+	}
+	_ = m.runTable(table, "-F", chain)
+	_ = m.runTable(table, "-X", chain)
+}
+
+func (m *Manager) tablesForAccessPolicy(policy TCPPortAccessPolicy) ([]string, error) {
+	active := map[string]struct{}{}
+	for _, source := range append(policy.AllowSources, policy.BlockSources...) {
+		table, err := m.tableForAddress(source)
+		if err != nil {
+			return nil, err
+		}
+		active[table] = struct{}{}
+	}
+
+	if policy.IncludeLocalCIDRs {
+		for _, table := range m.tables {
+			active[table] = struct{}{}
+		}
+	}
+
+	if strings.ToUpper(strings.TrimSpace(policy.DefaultAction)) == "DROP" {
+		for _, table := range m.tables {
+			active[table] = struct{}{}
+		}
+	}
+
+	out := make([]string, 0, len(m.tables))
+	for _, table := range m.tables {
+		if _, ok := active[table]; ok {
+			out = append(out, table)
+		}
+	}
+	return out, nil
+}
+
+func (m *Manager) addSourceRule(table string, chain string, source string, action string) error {
+	return m.runTable(table, "-A", chain, "-s", source, "-j", action)
+}
+
+func (m *Manager) addTCPPortJump(table string, parent string, chain string, port int) error {
+	portText := strconv.Itoa(port)
+	args := []string{"-p", "tcp", "--dport", portText, "-j", chain}
+	if err := m.runTable(table, append([]string{"-C", parent}, args...)...); err == nil {
+		return nil
+	}
+	return m.runTable(table, append([]string{"-I", parent, "1"}, args...)...)
+}
+
+func (m *Manager) SyncTCPPortAccessPolicy(policy TCPPortAccessPolicy) error {
+	chain := normalizeChainName(policy.Chain, DefaultSSHFirewallChain)
+	parents := policy.ParentChains
+	if len(parents) == 0 {
+		parents = m.ParentChains
+	}
+	if len(parents) == 0 {
+		parents = []string{"INPUT"}
+	}
+
+	ports, err := normalizePorts(policy.Ports)
+	if err != nil {
+		return err
+	}
+
+	allowSources := normalizeSources(policy.AllowSources)
+	blockSources := normalizeSources(policy.BlockSources)
+	defaultAction, err := normalizeDefaultAction(policy.DefaultAction)
+	if err != nil {
+		return err
+	}
+	normalizedPolicy := TCPPortAccessPolicy{
+		Chain:             chain,
+		ParentChains:      parents,
+		Ports:             ports,
+		AllowSources:      allowSources,
+		BlockSources:      blockSources,
+		IncludeLocalCIDRs: policy.IncludeLocalCIDRs,
+		DefaultAction:     defaultAction,
+	}
+
+	tables, err := m.tablesForAccessPolicy(normalizedPolicy)
+	if err != nil {
+		return err
+	}
+	if len(ports) == 0 || len(tables) == 0 {
+		return m.ClearTCPPortAccessPolicy(chain, parents)
+	}
+
+	activeTables := map[string]struct{}{}
+	for _, table := range tables {
+		activeTables[table] = struct{}{}
+	}
+	for _, table := range m.tables {
+		if _, ok := activeTables[table]; !ok {
+			m.clearTCPPortAccessPolicyForTable(table, chain, parents)
+			continue
+		}
+
+		if err := m.ensureChain(table, chain); err != nil {
+			return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to create SSH chain (%s): %v", table, err))
+		}
+		for _, parent := range parents {
+			if !m.parentChainExists(table, parent) {
+				continue
+			}
+			m.deleteParentJumpsToChain(table, parent, chain)
+			for _, port := range ports {
+				if err := m.addTCPPortJump(table, parent, chain, port); err != nil {
+					return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to link SSH chain to %s:%d (%s): %v", parent, port, table, err))
+				}
+			}
+		}
+
+		if err := m.runTable(table, "-F", chain); err != nil {
+			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to flush SSH chain (%s): %v", table, err))
+		}
+		if policy.IncludeLocalCIDRs {
+			for _, cidr := range m.localCIDRsForTable(table) {
+				if err := m.addSourceRule(table, chain, cidr, "ACCEPT"); err != nil {
+					return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add local SSH allow %s (%s): %v", cidr, table, err))
+				}
+			}
+		}
+		for _, source := range blockSources {
+			sourceTable, _ := m.tableForAddress(source)
+			if sourceTable != table {
+				continue
+			}
+			if err := m.addSourceRule(table, chain, source, "DROP"); err != nil {
+				return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add SSH block %s (%s): %v", source, table, err))
+			}
+		}
+		for _, source := range allowSources {
+			sourceTable, _ := m.tableForAddress(source)
+			if sourceTable != table {
+				continue
+			}
+			if err := m.addSourceRule(table, chain, source, "ACCEPT"); err != nil {
+				return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add SSH allow %s (%s): %v", source, table, err))
+			}
+		}
+		if err := m.runTable(table, "-A", chain, "-j", defaultAction); err != nil {
+			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to add SSH default %s (%s): %v", defaultAction, table, err))
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) ClearTCPPortAccessPolicy(chain string, parents []string) error {
+	chain = normalizeChainName(chain, DefaultSSHFirewallChain)
+	if len(parents) == 0 {
+		parents = m.ParentChains
+	}
+	if len(parents) == 0 {
+		parents = []string{"INPUT"}
+	}
+	for _, table := range m.tables {
+		m.clearTCPPortAccessPolicyForTable(table, chain, parents)
+	}
+	return nil
+}
+
 func (m *Manager) baseRuleCountForTable(table string) int {
 	count := 2
 	count += len(m.localCIDRsForTable(table))
@@ -354,6 +627,43 @@ func (m *Manager) BlockIP(ip string) error {
 	return nil
 }
 
+func (m *Manager) BlockTCPPortForIP(ip string, port int) error {
+	return m.ensureTCPPortRule(ip, port, "DROP")
+}
+
+func (m *Manager) ensureTCPPortRule(ip string, port int, action string) error {
+	if action != "ACCEPT" && action != "DROP" {
+		return errors.New(errors.CodeBadRequest, "action must be ACCEPT or DROP")
+	}
+	if err := validatePort(port); err != nil {
+		return err
+	}
+
+	_ = m.RemoveTCPPortRule(ip, port)
+
+	table, err := m.tableForAddress(ip)
+	if err != nil {
+		return err
+	}
+
+	insertPos := strconv.Itoa(m.baseRuleCountForTable(table) + 1)
+	if err := m.runTable(
+		table,
+		"-I", m.Chain, insertPos,
+		"-s", ip,
+		"-p", "tcp",
+		"--dport", strconv.Itoa(port),
+		"-j", action,
+	); err != nil {
+		return errors.New(
+			errors.CodeIptablesCommandError,
+			fmt.Sprintf("Failed to add TCP port rule for IP %s port %d (%s): %v", ip, port, table, err),
+		)
+	}
+
+	return nil
+}
+
 func (m *Manager) RemoveIPRule(ip string) error {
 	table, err := m.tableForAddress(ip)
 	if err != nil {
@@ -361,6 +671,45 @@ func (m *Manager) RemoveIPRule(ip string) error {
 	}
 	_ = m.runTable(table, "-D", m.Chain, "-s", ip, "-j", "ACCEPT")
 	_ = m.runTable(table, "-D", m.Chain, "-s", ip, "-j", "DROP")
+	return nil
+}
+
+func (m *Manager) RemoveTCPPortRule(ip string, port int) error {
+	if err := validatePort(port); err != nil {
+		return err
+	}
+
+	table, err := m.tableForAddress(ip)
+	if err != nil {
+		return err
+	}
+
+	portText := strconv.Itoa(port)
+	for {
+		if err := m.runTable(
+			table,
+			"-D", m.Chain,
+			"-s", ip,
+			"-p", "tcp",
+			"--dport", portText,
+			"-j", "ACCEPT",
+		); err != nil {
+			break
+		}
+	}
+	for {
+		if err := m.runTable(
+			table,
+			"-D", m.Chain,
+			"-s", ip,
+			"-p", "tcp",
+			"--dport", portText,
+			"-j", "DROP",
+		); err != nil {
+			break
+		}
+	}
+
 	return nil
 }
 
@@ -441,13 +790,14 @@ func validatePort(port int) error {
 }
 
 type Rule struct {
-	IP     string `json:"ip"`
-	Action string `json:"action"` // ACCEPT or DROP
+	IP       string `json:"ip"`
+	Action   string `json:"action"`             // ACCEPT or DROP
+	Protocol string `json:"protocol,omitempty"` // tcp when the rule is port-scoped
+	Port     int    `json:"port,omitempty"`
 }
 
 func (m *Manager) ParseRules() ([]Rule, error) {
 	var rules []Rule
-	re := regexp.MustCompile(`-[AI]\s+\S+\s+-s\s+(\S+)\s+-j\s+(ACCEPT|DROP)`)
 
 	for _, table := range m.tables {
 		output, err := m.runTableOutput(table, "-S", m.Chain)
@@ -457,21 +807,62 @@ func (m *Manager) ParseRules() ([]Rule, error) {
 
 		lines := strings.Split(output, "\n")
 		for _, line := range lines {
-			matches := re.FindStringSubmatch(line)
-			if len(matches) != 3 {
+			rule, ok := parseRuleLine(line)
+			if !ok {
 				continue
 			}
 
-			ip := matches[1]
-			ip = strings.TrimSuffix(ip, "/32")
-			ip = strings.TrimSuffix(ip, "/128")
-			action := matches[2]
-
-			if ip == "0.0.0.0/0" || ip == "::/0" {
+			if rule.IP == "0.0.0.0/0" || rule.IP == "::/0" {
 				continue
 			}
-			rules = append(rules, Rule{IP: ip, Action: action})
+			rules = append(rules, rule)
 		}
 	}
 	return rules, nil
+}
+
+func parseRuleLine(line string) (Rule, bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return Rule{}, false
+	}
+
+	var ip string
+	var action string
+	var protocol string
+	var port int
+
+	for index := 0; index < len(fields); index++ {
+		field := fields[index]
+		if index+1 >= len(fields) {
+			continue
+		}
+
+		switch field {
+		case "-s":
+			ip = fields[index+1]
+			ip = strings.TrimSuffix(ip, "/32")
+			ip = strings.TrimSuffix(ip, "/128")
+		case "-p":
+			protocol = strings.ToLower(fields[index+1])
+		case "--dport":
+			parsed, err := strconv.Atoi(fields[index+1])
+			if err == nil {
+				port = parsed
+			}
+		case "-j":
+			action = fields[index+1]
+		}
+	}
+
+	if ip == "" || (action != "ACCEPT" && action != "DROP") {
+		return Rule{}, false
+	}
+
+	return Rule{
+		IP:       ip,
+		Action:   action,
+		Protocol: protocol,
+		Port:     port,
+	}, true
 }
