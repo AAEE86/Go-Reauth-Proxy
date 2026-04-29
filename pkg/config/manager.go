@@ -32,6 +32,7 @@ type AppConfig struct {
 	PreserveHost         models.PreserveHostConfig         `json:"preserve_host,omitempty"`
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
+	WAF                  models.WAFConfig                  `json:"waf,omitempty"`
 	SSL                  models.SSLConfig                  `json:"ssl,omitempty"`
 	SSLCert              string                            `json:"ssl_cert,omitempty"`
 	SSLKey               string                            `json:"ssl_key,omitempty"`
@@ -46,6 +47,13 @@ func NewManager(filePath string) *Manager {
 	return &Manager{
 		filePath: filePath,
 	}
+}
+
+func (m *Manager) RuntimeDir() string {
+	if m == nil || strings.TrimSpace(m.filePath) == "" {
+		return "."
+	}
+	return filepath.Dir(m.filePath)
 }
 
 func defaultConfig() *AppConfig {
@@ -242,6 +250,14 @@ func applyDefaults(cfg *AppConfig) bool {
 	}
 	if cfg.Logging.MaxDays <= 0 {
 		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays
+		changed = true
+	}
+	if cfg.WAF.DisabledHosts == nil {
+		cfg.WAF.DisabledHosts = []string{}
+		changed = true
+	}
+	if cfg.WAF.DisabledPathPrefixes == nil {
+		cfg.WAF.DisabledPathPrefixes = []string{}
 		changed = true
 	}
 

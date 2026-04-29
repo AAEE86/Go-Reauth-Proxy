@@ -16,6 +16,7 @@ import (
 
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/response"
+	proxywaf "go-reauth-proxy/pkg/waf"
 	"io"
 	"log"
 	"net"
@@ -46,6 +47,7 @@ type Handler struct {
 	GatewayVisibility     models.GatewayVisibilityConfig
 	ForwardedHeaders      models.ForwardedHeadersConfig
 	PreserveHost          models.PreserveHostConfig
+	WAFConfig             models.WAFConfig
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
@@ -72,6 +74,7 @@ type Handler struct {
 	gatewayVisibility          *gatewayVisibility
 	forwardedHeaders           *forwardedHeadersConfig
 	preserveHost               *preserveHostConfig
+	wafRuntime                 *proxywaf.Runtime
 	systemEventClient          *events.Client
 }
 
@@ -196,7 +199,9 @@ func newProxyTransport() *http.Transport {
 	// Hardcode skipping upstream TLS verification for reverse-proxy targets.
 	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	transport.TLSHandshakeTimeout = 10 * time.Second
-	transport.ResponseHeaderTimeout = 10 * time.Second
+	// Let long-running admin/API requests such as local service discovery
+	// decide their own deadline instead of failing at the gateway layer.
+	transport.ResponseHeaderTimeout = 0
 	return transport
 }
 
@@ -505,6 +510,12 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 	if strings.TrimSpace(logsDir) == "" {
 		logsDir = gatewaylog.DefaultLogsDir(".")
 	}
+	runtimeDir := "."
+	if cfgManager != nil {
+		runtimeDir = cfgManager.RuntimeDir()
+	}
+	wafRuntime := proxywaf.NewRuntime(initialCfg.WAF, runtimeDir)
+	wafConfig := wafRuntime.Config()
 
 	h := &Handler{
 		Rules:                initialCfg.Rules,
@@ -520,6 +531,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		GatewayVisibility:    initialCfg.Visibility,
 		ForwardedHeaders:     normalizedForwardedHeaders,
 		PreserveHost:         normalizedPreserveHost,
+		WAFConfig:            wafConfig,
 		configManager:        cfgManager,
 		sslConfig:            copySSLConfig(initialCfg.SSL),
 		gatewayLogManager:    gatewaylog.NewManager(logsDir, logConfig),
@@ -537,6 +549,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		preflightCache:    newPreflightStateCache(),
 		forwardedHeaders:  newForwardedHeadersConfig(normalizedForwardedHeaders),
 		preserveHost:      newPreserveHostConfig(normalizedPreserveHost),
+		wafRuntime:        wafRuntime,
 		systemEventClient: systemEventClient,
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
@@ -581,6 +594,11 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		bundle = newEmptySSLRuntimeBundle(h.sslConfig.DeploymentMode)
 	}
 	h.sslBundle.Store(bundle)
+	if proxywaf.IsActive(wafConfig) {
+		if _, err := wafRuntime.Reload(wafConfig, "", ""); err != nil {
+			log.Printf("Failed to load initial WAF rules: %v", err)
+		}
+	}
 	return h
 }
 
@@ -634,6 +652,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.Visibility = h.GatewayVisibility
 		conf.ForwardedHeaders = h.ForwardedHeaders
 		conf.PreserveHost = h.PreserveHost
+		conf.WAF = h.WAFConfig
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
 		return nil
@@ -688,6 +707,30 @@ func classifyReverseProxyRouteType(requestPath string, isAuthRoute bool, matched
 		return "path_rule"
 	default:
 		return "not_found"
+	}
+}
+
+func wafRouteContext(r *http.Request, snapshot requestSnapshot, isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule) (string, string, string) {
+	requestPath := ""
+	if r != nil && r.URL != nil {
+		requestPath = r.URL.Path
+	}
+	routeType := classifyReverseProxyRouteType(requestPath, isAuthRoute, matchedHostRule, matchedRule)
+	switch {
+	case isAuthRoute:
+		upstream := ""
+		if snapshot.authConfig.AuthPort > 0 {
+			upstream = fmt.Sprintf("http://127.0.0.1:%d", snapshot.authConfig.AuthPort)
+		}
+		return routeType, requestPath, upstream
+	case requestPath == "/__select__":
+		return routeType, requestPath, ""
+	case matchedHostRule != nil:
+		return routeType, matchedHostRule.Host, matchedHostRule.Target
+	case matchedRule != nil:
+		return routeType, matchedRule.Path, matchedRule.Target
+	default:
+		return routeType, requestPath, ""
 	}
 }
 
@@ -1260,6 +1303,64 @@ func (h *Handler) DeleteLogDate(date string) (gatewaylog.DeleteResult, error) {
 	return h.gatewayLogManager.DeleteDate(date)
 }
 
+func (h *Handler) GetWAFConfig() models.WAFConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.WAFConfig
+}
+
+func (h *Handler) GetWAFStatus() proxywaf.Status {
+	if h.wafRuntime == nil {
+		return proxywaf.Status{}
+	}
+	return h.wafRuntime.Status()
+}
+
+func (h *Handler) SetWAFConfig(cfg models.WAFConfig) (proxywaf.Status, error) {
+	if h.wafRuntime == nil {
+		return proxywaf.Status{}, fmt.Errorf("WAF runtime is not initialized")
+	}
+	normalized, err := h.wafRuntime.SetConfig(cfg)
+	if err != nil {
+		return h.wafRuntime.Status(), err
+	}
+	h.mu.Lock()
+	h.WAFConfig = normalized
+	h.saveConfigLocked()
+	h.mu.Unlock()
+	return h.wafRuntime.Status(), nil
+}
+
+func (h *Handler) ValidateWAFBundle(cfg models.WAFConfig, bundleID string, bundlePath string) (proxywaf.ValidationResult, error) {
+	if h.wafRuntime == nil {
+		return proxywaf.ValidationResult{}, fmt.Errorf("WAF runtime is not initialized")
+	}
+	return h.wafRuntime.Validate(cfg, bundleID, bundlePath)
+}
+
+func (h *Handler) ReloadWAFBundle(cfg models.WAFConfig, bundleID string, bundlePath string) (proxywaf.Status, error) {
+	if h.wafRuntime == nil {
+		return proxywaf.Status{}, fmt.Errorf("WAF runtime is not initialized")
+	}
+	status, err := h.wafRuntime.Reload(cfg, bundleID, bundlePath)
+	if err != nil {
+		return status, err
+	}
+	normalized := h.wafRuntime.Config()
+	h.mu.Lock()
+	h.WAFConfig = normalized
+	h.saveConfigLocked()
+	h.mu.Unlock()
+	return status, nil
+}
+
+func (h *Handler) DrainWAFEvents(limit int) proxywaf.DrainResult {
+	if h.wafRuntime == nil {
+		return proxywaf.DrainResult{Events: []proxywaf.Event{}}
+	}
+	return h.wafRuntime.Drain(limit)
+}
+
 func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	if config.AuthPort <= 0 {
 		config.AuthPort = 7997
@@ -1696,6 +1797,16 @@ func suppressAccessLog(w http.ResponseWriter) {
 	}
 }
 
+func wrapRequestBodyForTraffic(r *http.Request, h *Handler, metrics *requestTrafficMetrics) {
+	if r == nil || r.Body == nil {
+		return
+	}
+	if _, ok := r.Body.(*trafficReadCloser); ok {
+		return
+	}
+	r.Body = &trafficReadCloser{ReadCloser: r.Body, handler: h, metrics: metrics}
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	atomic.AddInt64(&h.trafficActive, 1)
@@ -1722,9 +1833,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var clientIP string
 	loggedStatusCode := 0
 
-	if r.Body != nil {
-		r.Body = &trafficReadCloser{ReadCloser: r.Body, handler: h, metrics: metrics}
-	}
 	tw := &trafficResponseWriter{ResponseWriter: w, handler: h, metrics: metrics}
 	w = tw
 
@@ -1838,6 +1946,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.abortConnection(w)
 		return
 	}
+	wafRouteType, wafRouteKey, wafUpstream := wafRouteContext(r, snapshot, isAuthRoute, matchedHostRule, matchedRule)
+	if h.wafRuntime != nil {
+		decision := h.wafRuntime.Evaluate(r, proxywaf.EvaluateContext{
+			ClientIP:   clientIP,
+			RouteType:  wafRouteType,
+			RouteKey:   wafRouteKey,
+			Upstream:   wafUpstream,
+			Scheme:     requestScheme(r),
+			RemoteAddr: r.RemoteAddr,
+		})
+		if decision.Enabled && decision.TraceID != "" {
+			accessEntry.WAFTraceID = decision.TraceID
+			accessEntry.WAFMode = decision.Mode
+			accessEntry.WAFRuleIDs = decision.RuleIDs
+			accessEntry.WAFAction = decision.Action
+			accessEntry.WAFBundle = decision.BundleID
+		}
+		if !decision.Allowed {
+			accessEntry.Matched = true
+			accessEntry.RouteType = wafRouteType
+			accessEntry.RouteKey = wafRouteKey
+			accessEntry.Upstream = wafUpstream
+			accessEntry.AuthDecision = "waf_blocked"
+			accessEntry.WAFBlocked = true
+			loggedStatusCode = decision.Status
+			response.WAFBlocked(w, r, response.WAFBlockPageOptions{
+				Status:  decision.Status,
+				TraceID: decision.TraceID,
+			})
+			return
+		}
+	}
+	wrapRequestBodyForTraffic(r, h, metrics)
 	isMatch := isSelectRoute || isAuthRoute || matchedHostRule != nil || matchedRule != nil || r.URL.Path == "/"
 	accessEntry.Matched = isMatch
 	accessEntry.AccessMode = accessMode

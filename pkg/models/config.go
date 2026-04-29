@@ -91,6 +91,24 @@ type LoggingConfig struct {
 	MaxDays int  `json:"max_days,omitempty"`
 }
 
+type WAFConfig struct {
+	Enabled                       bool     `json:"enabled,omitempty"`
+	Mode                          string   `json:"mode,omitempty"`
+	RulesDir                      string   `json:"rules_dir,omitempty"`
+	ActiveBundleID                string   `json:"active_bundle_id,omitempty"`
+	ParanoiaLevel                 int      `json:"paranoia_level,omitempty"`
+	ExecutingParanoiaLevel        int      `json:"executing_paranoia_level,omitempty"`
+	InboundAnomalyThreshold       int      `json:"inbound_anomaly_threshold,omitempty"`
+	OutboundAnomalyThreshold      int      `json:"outbound_anomaly_threshold,omitempty"`
+	RequestBodyAccess             bool     `json:"request_body_access,omitempty"`
+	RequestBodyLimitBytes         int      `json:"request_body_limit_bytes,omitempty"`
+	RequestBodyInMemoryLimitBytes int      `json:"request_body_in_memory_limit_bytes,omitempty"`
+	ResponseBodyAccess            bool     `json:"response_body_access,omitempty"`
+	DisabledHosts                 []string `json:"disabled_hosts,omitempty"`
+	DisabledPathPrefixes          []string `json:"disabled_path_prefixes,omitempty"`
+	UpdatedAt                     string   `json:"updated_at,omitempty"`
+}
+
 type ReverseProxyThrottleConfig struct {
 	Enabled           bool `json:"enabled,omitempty"`
 	RequestsPerSecond int  `json:"requests_per_second,omitempty" example:"100"`

@@ -62,6 +62,12 @@ type Entry struct {
 	EOConnectingIP  string `json:"eo_connecting_ip,omitempty"`
 	XForwardedFor   string `json:"x_forwarded_for,omitempty"`
 	XRealIP         string `json:"x_real_ip,omitempty"`
+	WAFBlocked      bool   `json:"waf_blocked,omitempty"`
+	WAFTraceID      string `json:"waf_trace_id,omitempty"`
+	WAFMode         string `json:"waf_mode,omitempty"`
+	WAFRuleIDs      []int  `json:"waf_rule_ids,omitempty"`
+	WAFAction       string `json:"waf_action,omitempty"`
+	WAFBundle       string `json:"waf_bundle,omitempty"`
 }
 
 type ConfigInfo struct {
@@ -351,6 +357,12 @@ func (m *Manager) Log(entry Entry) {
 		Str("eo_connecting_ip", entry.EOConnectingIP).
 		Str("x_forwarded_for", entry.XForwardedFor).
 		Str("x_real_ip", entry.XRealIP).
+		Bool("waf_blocked", entry.WAFBlocked).
+		Str("waf_trace_id", entry.WAFTraceID).
+		Str("waf_mode", entry.WAFMode).
+		Ints("waf_rule_ids", entry.WAFRuleIDs).
+		Str("waf_action", entry.WAFAction).
+		Str("waf_bundle", entry.WAFBundle).
 		Send()
 }
 

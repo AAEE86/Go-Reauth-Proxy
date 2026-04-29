@@ -113,6 +113,11 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/logging/dates", s.handleGetLoggingDates).Methods("GET")
 	r.HandleFunc("/api/logging/entries", s.handleGetLoggingEntries).Methods("GET")
 	r.HandleFunc("/api/logging/entries", s.handleDeleteLoggingEntries).Methods("DELETE")
+	r.HandleFunc("/api/waf/status", s.handleGetWAFStatus).Methods("GET")
+	r.HandleFunc("/api/waf/config", s.handleSetWAFConfig).Methods("POST")
+	r.HandleFunc("/api/waf/validate", s.handleValidateWAFBundle).Methods("POST")
+	r.HandleFunc("/api/waf/reload", s.handleReloadWAFBundle).Methods("POST")
+	r.HandleFunc("/api/waf/events/drain", s.handleDrainWAFEvents).Methods("POST")
 	r.HandleFunc("/api/ssl", s.handleGetSSL).Methods("GET")
 	r.HandleFunc("/api/ssl", s.handleSetSSL).Methods("POST")
 	r.HandleFunc("/api/ssl", s.handleClearSSL).Methods("DELETE")
@@ -775,6 +780,88 @@ func (s *Server) handleSetLoggingConfig(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleGetLoggingDirectory(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, s.ProxyHandler.GetLoggingDirectory())
+}
+
+func (s *Server) handleGetWAFStatus(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetWAFStatus())
+}
+
+func (s *Server) handleSetWAFConfig(w http.ResponseWriter, r *http.Request) {
+	var req models.WAFConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+	status, err := s.ProxyHandler.SetWAFConfig(req)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, status)
+}
+
+type wafBundleRequest struct {
+	BundleID   string            `json:"bundle_id"`
+	BundlePath string            `json:"bundle_path"`
+	Config     *models.WAFConfig `json:"config,omitempty"`
+}
+
+func (s *Server) handleValidateWAFBundle(w http.ResponseWriter, r *http.Request) {
+	var req wafBundleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+	cfg := s.ProxyHandler.GetWAFConfig()
+	if req.Config != nil {
+		cfg = *req.Config
+	}
+	result, err := s.ProxyHandler.ValidateWAFBundle(cfg, req.BundleID, req.BundlePath)
+	if err != nil {
+		response.JSON(w, false, errors.CodeBadRequest, result.Error, result)
+		return
+	}
+	response.Success(w, result)
+}
+
+func (s *Server) handleReloadWAFBundle(w http.ResponseWriter, r *http.Request) {
+	var req wafBundleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+	cfg := s.ProxyHandler.GetWAFConfig()
+	if req.Config != nil {
+		cfg = *req.Config
+	}
+	if strings.TrimSpace(req.BundleID) == "" {
+		req.BundleID = cfg.ActiveBundleID
+	}
+	status, err := s.ProxyHandler.ReloadWAFBundle(cfg, req.BundleID, req.BundlePath)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, status)
+}
+
+func (s *Server) handleDrainWAFEvents(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Limit int `json:"limit"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+			return
+		}
+	}
+	if req.Limit <= 0 {
+		req.Limit = 500
+	}
+	if req.Limit > 5000 {
+		req.Limit = 5000
+	}
+	response.Success(w, s.ProxyHandler.DrainWAFEvents(req.Limit))
 }
 
 func (s *Server) handleGetLoggingDates(w http.ResponseWriter, r *http.Request) {
