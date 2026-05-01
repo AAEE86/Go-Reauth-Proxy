@@ -7,11 +7,12 @@ tasks:
       - task: build
 
   build:
-    desc: "Build binaries for all platforms (macOS ARM64 & Linux AMD64/ARM64)"
+    desc: "Build binaries for all platforms (macOS ARM64 & Linux AMD64/ARM64/ARM32)"
     cmds:
       - task: build:mac
       - task: build:linux
       - task: build:linux-arm64
+      - task: build:linux-arm
 
   build:mac:
     desc: "Build the go-reauth-proxy binary for macOS (ARM64)"
@@ -44,6 +45,18 @@ tasks:
       - go build -ldflags="-s -w" -trimpath -o build/go-reauth-proxy-linux-arm64 cmd/server/main.go
       - upx --best --lzma build/go-reauth-proxy-linux-arm64 || echo "UPX compression skipped"
       - echo "Built Linux ARM64 binary at build/go-reauth-proxy-linux-arm64"
+
+  build:linux-arm:
+    desc: "Build the go-reauth-proxy binary for Linux (ARM32/ARMv7)"
+    env:
+      GOOS: linux
+      GOARCH: arm
+      GOARM: "7"
+    cmds:
+      - mkdir -p build
+      - go build -ldflags="-s -w" -trimpath -o build/go-reauth-proxy-linux-arm cmd/server/main.go
+      - upx --best --lzma build/go-reauth-proxy-linux-arm || echo "UPX compression skipped"
+      - echo "Built Linux ARM32 binary at build/go-reauth-proxy-linux-arm"
 
   run:
     desc: "Run the go-reauth-proxy server (usage: task run -- -proxy-port 8090 -admin-port 8091)"
