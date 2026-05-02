@@ -2128,6 +2128,8 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 		if proxyPath == "" {
 			proxyPath = "/api/auth/logout"
 		}
+	case "/__auth__/oidc/bind", "/__auth__/oidc/bind/":
+		proxyPath = "/api/auth/oidc/bind"
 	default:
 		rawProxyPath := strings.TrimPrefix(r.URL.Path, "/__auth__")
 		proxyPath = path.Clean(ensureLeadingSlash(rawProxyPath))
