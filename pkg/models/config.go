@@ -134,6 +134,11 @@ type PreserveHostConfig struct {
 	UpdatedAt   string   `json:"updated_at,omitempty"`
 }
 
+type FnosPortIconHijackConfig struct {
+	Enabled   bool   `json:"enabled,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
 type ReverseProxyThrottleExemptIPsRuntime struct {
 	Enabled   bool     `json:"enabled,omitempty"`
 	IPs       []string `json:"ips,omitempty"`

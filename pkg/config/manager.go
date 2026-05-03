@@ -30,6 +30,7 @@ type AppConfig struct {
 	Visibility           models.GatewayVisibilityConfig    `json:"visibility,omitempty"`
 	ForwardedHeaders     models.ForwardedHeadersConfig     `json:"forwarded_headers,omitempty"`
 	PreserveHost         models.PreserveHostConfig         `json:"preserve_host,omitempty"`
+	FnosPortIconHijack   models.FnosPortIconHijackConfig   `json:"fnos_port_icon_hijack,omitempty"`
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
 	WAF                  models.WAFConfig                  `json:"waf,omitempty"`
@@ -100,6 +101,10 @@ func defaultConfig() *AppConfig {
 			Enabled:     true,
 			OmitTargets: []string{},
 			UpdatedAt:   "",
+		},
+		FnosPortIconHijack: models.FnosPortIconHijackConfig{
+			Enabled:   false,
+			UpdatedAt: "",
 		},
 		Logging: models.LoggingConfig{
 			Enabled: false,

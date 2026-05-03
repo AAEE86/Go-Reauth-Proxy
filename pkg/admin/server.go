@@ -103,6 +103,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/forwarded-headers", s.handleSetForwardedHeadersConfig).Methods("POST")
 	r.HandleFunc("/api/config/preserve-host", s.handleGetPreserveHostConfig).Methods("GET")
 	r.HandleFunc("/api/config/preserve-host", s.handleSetPreserveHostConfig).Methods("POST")
+	r.HandleFunc("/api/config/fnos-port-icon-hijack", s.handleGetFnosPortIconHijackConfig).Methods("GET")
+	r.HandleFunc("/api/config/fnos-port-icon-hijack", s.handleSetFnosPortIconHijackConfig).Methods("POST")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleGetReverseProxyThrottleExemptIPs).Methods("GET")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleSetReverseProxyThrottleExemptIPs).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
@@ -628,6 +630,20 @@ func (s *Server) handleSetPreserveHostConfig(w http.ResponseWriter, r *http.Requ
 
 	s.ProxyHandler.SetPreserveHostConfig(req)
 	response.Success(w, s.ProxyHandler.GetPreserveHostConfig())
+}
+
+func (s *Server) handleGetFnosPortIconHijackConfig(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetFnosPortIconHijackConfig())
+}
+
+func (s *Server) handleSetFnosPortIconHijackConfig(w http.ResponseWriter, r *http.Request) {
+	var req models.FnosPortIconHijackConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	response.Success(w, s.ProxyHandler.SetFnosPortIconHijackConfig(req))
 }
 
 func (s *Server) handleGetReverseProxyThrottleExemptIPs(w http.ResponseWriter, r *http.Request) {

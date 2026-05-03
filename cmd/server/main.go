@@ -242,11 +242,25 @@ func startProxyServers(host string, proxyPort int, proxyHandler *proxy.Handler, 
 	return stop, strings.Join(listenAddrs, ", "), nil
 }
 
+func envPortDefault(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 || value > 65535 {
+		log.Printf("Invalid %s=%q; using default port %d", name, raw, fallback)
+		return fallback
+	}
+	return value
+}
+
 func main() {
 	logger.Setup()
 
 	adminPort := flag.Int("admin-port", 7996, "Port for the Admin API (0 uses config or default 7996, binds to localhost on 127.0.0.1 and ::1)")
-	proxyPort := flag.Int("proxy-port", 7999, "Port for the Reverse Proxy (binds to 0.0.0.0/:: or 127.0.0.1/::1 based on proxy_protocol_force)")
+	proxyPort := flag.Int("proxy-port", envPortDefault("GO_REPROXY_PORT", 7999), "Port for the Reverse Proxy (defaults to GO_REPROXY_PORT or 7999; binds to 0.0.0.0/:: or 127.0.0.1/::1 based on proxy_protocol_force)")
 	configFlag := flag.String("c", "", "Path to config file (default: config.json in executable directory)")
 	flag.Parse()
 

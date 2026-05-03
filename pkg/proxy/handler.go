@@ -47,6 +47,7 @@ type Handler struct {
 	GatewayVisibility     models.GatewayVisibilityConfig
 	ForwardedHeaders      models.ForwardedHeadersConfig
 	PreserveHost          models.PreserveHostConfig
+	FnosPortIconHijack    models.FnosPortIconHijackConfig
 	WAFConfig             models.WAFConfig
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
@@ -531,6 +532,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		GatewayVisibility:    initialCfg.Visibility,
 		ForwardedHeaders:     normalizedForwardedHeaders,
 		PreserveHost:         normalizedPreserveHost,
+		FnosPortIconHijack:   initialCfg.FnosPortIconHijack,
 		WAFConfig:            wafConfig,
 		configManager:        cfgManager,
 		sslConfig:            copySSLConfig(initialCfg.SSL),
@@ -652,6 +654,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.Visibility = h.GatewayVisibility
 		conf.ForwardedHeaders = h.ForwardedHeaders
 		conf.PreserveHost = h.PreserveHost
+		conf.FnosPortIconHijack = h.FnosPortIconHijack
 		conf.WAF = h.WAFConfig
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
@@ -1449,6 +1452,13 @@ func (h *Handler) GetPreserveHostConfig() models.PreserveHostConfig {
 	}
 }
 
+func (h *Handler) GetFnosPortIconHijackConfig() models.FnosPortIconHijackConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return h.FnosPortIconHijack
+}
+
 func (h *Handler) GetReverseProxyThrottleExemptIPs() models.ReverseProxyThrottleExemptIPsRuntime {
 	h.mu.RLock()
 	runtime := h.reverseProxyThrottleExempt
@@ -1555,6 +1565,20 @@ func (h *Handler) SetPreserveHostConfig(cfg models.PreserveHostConfig) {
 	h.mu.Unlock()
 
 	preserveHost.updateConfig(normalized)
+}
+
+func (h *Handler) SetFnosPortIconHijackConfig(cfg models.FnosPortIconHijackConfig) models.FnosPortIconHijackConfig {
+	normalized := models.FnosPortIconHijackConfig{
+		Enabled:   cfg.Enabled,
+		UpdatedAt: strings.TrimSpace(cfg.UpdatedAt),
+	}
+
+	h.mu.Lock()
+	h.FnosPortIconHijack = normalized
+	h.saveConfigLocked()
+	h.mu.Unlock()
+
+	return normalized
 }
 
 func (h *Handler) SetReverseProxyThrottleExemptIPs(cfg models.ReverseProxyThrottleExemptIPsRuntime) {
@@ -2374,6 +2398,19 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		return nil
 	}
 
+	if h.maybeProxyFnosPortIconHijackWebSocket(w, r, fnosPortIconHijackWebSocketOptions{
+		targetURL:            targetURL,
+		hostRules:            snapshot.hostRules,
+		clientIP:             clientIP,
+		omitForwardedHeaders: omitForwardedHeaders,
+		preserveHost:         preserveHost,
+		rewriteOriginReferer: !preserveHost,
+		stripPath:            false,
+		pathPrefix:           "",
+	}) {
+		return
+	}
+
 	proxy.ServeHTTP(w, r)
 }
 
@@ -2512,6 +2549,19 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		resp.ContentLength = int64(len(newBody))
 		resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
 		return nil
+	}
+
+	if h.maybeProxyFnosPortIconHijackWebSocket(w, r, fnosPortIconHijackWebSocketOptions{
+		targetURL:            targetURL,
+		hostRules:            snapshot.hostRules,
+		clientIP:             clientIP,
+		omitForwardedHeaders: false,
+		preserveHost:         preserveHost,
+		rewriteOriginReferer: !preserveHost,
+		stripPath:            matchedRule.StripPath,
+		pathPrefix:           matchedRule.Path,
+	}) {
+		return
 	}
 
 	proxy.ServeHTTP(w, r)
