@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,13 @@ import (
 )
 
 const defaultFnosPortIconHijackGatewayPort = 7999
+const fnosPortIconHijackWebSocketPath = "/websocket"
+const fnosPortIconHijackServiceListPath = "/app-center/v1/service/list"
+
+type fnosPortIconHijackPublicEndpoint struct {
+	protocol string
+	port     int
+}
 
 type fnosPortIconHijackWebSocketOptions struct {
 	targetURL            *url.URL
@@ -52,10 +60,10 @@ func (h *Handler) shouldProxyFnosPortIconHijackWebSocket(r *http.Request) bool {
 	if r == nil || r.URL == nil || !isFNAppWebSocketRequest(r) {
 		return false
 	}
-	if path.Clean(r.URL.Path) != "/websocket" {
+	if cleanFnosPortIconHijackPath(r.URL.Path) != fnosPortIconHijackWebSocketPath {
 		return false
 	}
-	if r.URL.Query().Get("type") != "main" {
+	if requestType := strings.TrimSpace(r.URL.Query().Get("type")); requestType != "" && !strings.EqualFold(requestType, "main") {
 		return false
 	}
 	return h.GetFnosPortIconHijackConfig().Enabled
@@ -104,7 +112,7 @@ func (h *Handler) proxyFnosPortIconHijackWebSocket(w http.ResponseWriter, r *htt
 	}
 	defer clientConn.Close()
 
-	responsePort := h.fnosPortIconHijackResponsePort()
+	responseEndpoint := h.fnosPortIconHijackPublicEndpoint()
 
 	errCh := make(chan error, 2)
 	go func() {
@@ -113,7 +121,7 @@ func (h *Handler) proxyFnosPortIconHijackWebSocket(w http.ResponseWriter, r *htt
 				return messageType, payload, nil
 			}
 
-			rewritten, changed, err := rewriteFnosPortIconHijackMessage(payload, targets, responsePort)
+			rewritten, changed, err := rewriteFnosPortIconHijackMessage(payload, targets, responseEndpoint)
 			if err != nil {
 				log.Printf("Failed to rewrite FNOS port icon payload: %v", err)
 				return messageType, payload, nil
@@ -135,18 +143,38 @@ func (h *Handler) proxyFnosPortIconHijackWebSocket(w http.ResponseWriter, r *htt
 }
 
 func (h *Handler) fnosPortIconHijackResponsePort() int {
+	return h.fnosPortIconHijackPublicEndpoint().port
+}
+
+func (h *Handler) fnosPortIconHijackPublicEndpoint() fnosPortIconHijackPublicEndpoint {
+	sslEnabled := h.HasSSLCertificates()
+
 	h.mu.RLock()
 	edgeClientIPEnabled := h.AuthConfig.EdgeClientIPEnabled
 	proxyPort := h.ProxyPort
 	h.mu.RUnlock()
 
+	protocol := "http"
+	if sslEnabled {
+		protocol = "https"
+	}
+
+	port := proxyPort
+	if port <= 0 {
+		port = defaultFnosPortIconHijackGatewayPort
+	}
 	if edgeClientIPEnabled {
-		return 80
+		if sslEnabled {
+			port = 443
+		} else {
+			port = 80
+		}
 	}
-	if proxyPort > 0 {
-		return proxyPort
+
+	return fnosPortIconHijackPublicEndpoint{
+		protocol: protocol,
+		port:     port,
 	}
-	return defaultFnosPortIconHijackGatewayPort
 }
 
 func buildFnosPortIconHijackWebSocketURL(targetURL *url.URL, incomingURL *url.URL, stripPath bool, pathPrefix string) *url.URL {
@@ -227,6 +255,76 @@ func buildFnosPortIconHijackWebSocketHeader(r *http.Request, options fnosPortIco
 	return headers
 }
 
+func (h *Handler) maybePrepareFnosPortIconHijackHTTPProxyRequest(r *http.Request) {
+	if h.shouldHijackFnosPortIconHijackServiceList(r) {
+		r.Header.Del("Accept-Encoding")
+	}
+}
+
+func (h *Handler) maybeRewriteFnosPortIconHijackHTTPResponse(resp *http.Response, hostRules []models.HostRule) error {
+	if resp == nil || !h.shouldHijackFnosPortIconHijackServiceList(resp.Request) {
+		return nil
+	}
+	if resp.Body == nil {
+		return nil
+	}
+
+	targets := buildFnosPortIconHijackTargets(hostRules)
+	if len(targets) == 0 {
+		return nil
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	rewritten, changed, err := rewriteFnosPortIconHijackMessage(bodyBytes, targets, h.fnosPortIconHijackPublicEndpoint())
+	if err != nil {
+		resetFnosPortIconHijackResponseBody(resp, bodyBytes)
+		log.Printf("Failed to rewrite FNOS port icon HTTP response: %v", err)
+		return nil
+	}
+	if !changed {
+		resetFnosPortIconHijackResponseBody(resp, bodyBytes)
+		return nil
+	}
+
+	resetFnosPortIconHijackResponseBody(resp, rewritten)
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Content-MD5")
+	resp.Header.Del("ETag")
+	return nil
+}
+
+func resetFnosPortIconHijackResponseBody(resp *http.Response, body []byte) {
+	if resp.Header == nil {
+		resp.Header = http.Header{}
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+}
+
+func (h *Handler) shouldHijackFnosPortIconHijackServiceList(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	if cleanFnosPortIconHijackPath(r.URL.Path) != fnosPortIconHijackServiceListPath {
+		return false
+	}
+	return h.GetFnosPortIconHijackConfig().Enabled
+}
+
+func cleanFnosPortIconHijackPath(rawPath string) string {
+	cleanPath := path.Clean(rawPath)
+	if cleanPath == "." {
+		return "/"
+	}
+	return cleanPath
+}
+
 func relayWebSocketMessages(dst *websocket.Conn, src *websocket.Conn, transform func(int, []byte) (int, []byte, error)) error {
 	for {
 		messageType, payload, err := src.ReadMessage()
@@ -288,8 +386,9 @@ func hostRuleTargetPort(rawTarget string) (int, bool) {
 	}
 }
 
-func rewriteFnosPortIconHijackMessage(payload []byte, hostByPort map[int]string, gatewayPort int) ([]byte, bool, error) {
-	if len(hostByPort) == 0 || gatewayPort <= 0 {
+func rewriteFnosPortIconHijackMessage(payload []byte, hostByPort map[int]string, endpoint fnosPortIconHijackPublicEndpoint) ([]byte, bool, error) {
+	endpoint = normalizeFnosPortIconHijackPublicEndpoint(endpoint)
+	if len(hostByPort) == 0 || endpoint.port <= 0 {
 		return payload, false, nil
 	}
 
@@ -298,7 +397,7 @@ func rewriteFnosPortIconHijackMessage(payload []byte, hostByPort map[int]string,
 		return payload, false, nil
 	}
 
-	if !rewriteFnosPortIconHijackValue(value, hostByPort, gatewayPort) {
+	if !rewriteFnosPortIconHijackValue(value, hostByPort, endpoint) {
 		return payload, false, nil
 	}
 
@@ -309,12 +408,22 @@ func rewriteFnosPortIconHijackMessage(payload []byte, hostByPort map[int]string,
 	return rewritten, true, nil
 }
 
-func rewriteFnosPortIconHijackValue(value any, hostByPort map[int]string, gatewayPort int) bool {
+func normalizeFnosPortIconHijackPublicEndpoint(endpoint fnosPortIconHijackPublicEndpoint) fnosPortIconHijackPublicEndpoint {
+	switch strings.ToLower(strings.TrimSpace(endpoint.protocol)) {
+	case "https":
+		endpoint.protocol = "https"
+	default:
+		endpoint.protocol = "http"
+	}
+	return endpoint
+}
+
+func rewriteFnosPortIconHijackValue(value any, hostByPort map[int]string, endpoint fnosPortIconHijackPublicEndpoint) bool {
 	switch typed := value.(type) {
 	case map[string]any:
-		changed := rewriteFnosPortIconHijackObject(typed, hostByPort, gatewayPort)
+		changed := rewriteFnosPortIconHijackObject(typed, hostByPort, endpoint)
 		for _, child := range typed {
-			if rewriteFnosPortIconHijackValue(child, hostByPort, gatewayPort) {
+			if rewriteFnosPortIconHijackValue(child, hostByPort, endpoint) {
 				changed = true
 			}
 		}
@@ -322,7 +431,7 @@ func rewriteFnosPortIconHijackValue(value any, hostByPort map[int]string, gatewa
 	case []any:
 		changed := false
 		for _, child := range typed {
-			if rewriteFnosPortIconHijackValue(child, hostByPort, gatewayPort) {
+			if rewriteFnosPortIconHijackValue(child, hostByPort, endpoint) {
 				changed = true
 			}
 		}
@@ -332,7 +441,7 @@ func rewriteFnosPortIconHijackValue(value any, hostByPort map[int]string, gatewa
 	}
 }
 
-func rewriteFnosPortIconHijackObject(object map[string]any, hostByPort map[int]string, gatewayPort int) bool {
+func rewriteFnosPortIconHijackObject(object map[string]any, hostByPort map[int]string, endpoint fnosPortIconHijackPublicEndpoint) bool {
 	rawHost, hasHost := object["host"]
 	if !hasHost {
 		return false
@@ -353,7 +462,8 @@ func rewriteFnosPortIconHijackObject(object map[string]any, hostByPort map[int]s
 	}
 
 	object["host"] = nextHost
-	object["port"] = strconv.Itoa(gatewayPort)
+	object["port"] = strconv.Itoa(endpoint.port)
+	object["protocol"] = endpoint.protocol
 	object["path"] = ""
 	return true
 }

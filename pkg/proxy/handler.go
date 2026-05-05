@@ -2331,6 +2331,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			pr.SetURL(targetURL)
 			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
 			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
+			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
 
 			if !preserveHost {
 				if origin := pr.In.Header.Get("Origin"); origin != "" {
@@ -2362,6 +2363,9 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 		if isAuthHostProxy {
 			h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
+		}
+		if err := h.maybeRewriteFnosPortIconHijackHTTPResponse(resp, snapshot.hostRules); err != nil {
+			return err
 		}
 
 		needsToolbar := matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
@@ -2478,6 +2482,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			if matchedRule.RewriteHTML || (matchedRule.UseAuth && !authResult.suppressToolbar && !suppressToolbarForUA) {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
+			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Printf("Proxy error: %v", err)
@@ -2492,6 +2497,9 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			Path:  "/",
 		}
 		resp.Header.Add("Set-Cookie", cookie.String())
+		if err := h.maybeRewriteFnosPortIconHijackHTTPResponse(resp, snapshot.hostRules); err != nil {
+			return err
+		}
 
 		needsRewrite := matchedRule.RewriteHTML && !matchedRule.UseRootMode
 		needsToolbar := matchedRule.UseAuth && !authResult.suppressToolbar && !suppressToolbarForUA
