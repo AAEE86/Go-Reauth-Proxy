@@ -26,6 +26,24 @@ func writeTestRule(t *testing.T, rulesDir string, customRule string) {
 	}
 }
 
+func writeSystemTestRule(t *testing.T, rulesDir string, filename string, content string) {
+	t.Helper()
+	systemDir := filepath.Join(rulesDir, "system")
+	if err := os.MkdirAll(systemDir, 0o755); err != nil {
+		t.Fatalf("create system dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemDir, filename), []byte(content+"\n"), 0o644); err != nil {
+		t.Fatalf("write system rule: %v", err)
+	}
+}
+
+func writeRulesState(t *testing.T, rulesDir string, state string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(rulesDir, rulesStateFilename), []byte(state), 0o644); err != nil {
+		t.Fatalf("write rules state: %v", err)
+	}
+}
+
 func testConfig(rulesDir string, mode string) models.WAFConfig {
 	return models.WAFConfig{
 		Enabled:           true,
@@ -59,6 +77,79 @@ func TestDynamicDirectivesInitializeCRSSetup(t *testing.T) {
 		if !strings.Contains(directives, item) {
 			t.Fatalf("expected dynamic directives to include %q, got %s", item, directives)
 		}
+	}
+}
+
+func TestRuntimeSkipsUpdateTargetForDisabledSystemRule(t *testing.T) {
+	rulesDir := t.TempDir()
+	writeSystemTestRule(t, rulesDir, "REQUEST-930-APPLICATION-ATTACK-LFI.conf", `SecRule ARGS:test "@streq attack" "id:930120,phase:2,deny,status:403,msg:'lfi block',log"`)
+	writeSystemTestRule(t, rulesDir, "REQUEST-999-COMMON-EXCEPTIONS-AFTER.conf", `SecRuleUpdateTargetById 930120 "!ARGS_NAMES:json.profile"`)
+	writeRulesState(t, rulesDir, `{
+  "system_enabled": {
+    "REQUEST-930-APPLICATION-ATTACK-LFI.conf": false,
+    "REQUEST-999-COMMON-EXCEPTIONS-AFTER.conf": true
+  },
+  "custom_enabled": {}
+}`)
+
+	rt := NewRuntime(testConfig(rulesDir, ModeBlocking), t.TempDir())
+	if _, err := rt.Reload(rt.Config(), "", ""); err != nil {
+		t.Fatalf("reload WAF with disabled update target: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "https://app.example.test/search?test=attack", nil)
+	decision := rt.Evaluate(req, EvaluateContext{ClientIP: "203.0.113.10"})
+	if !decision.Allowed {
+		t.Fatalf("expected disabled system rule to allow request, got %#v", decision)
+	}
+}
+
+func TestRuntimeUsesAdminDefaultDisabledSystemRules(t *testing.T) {
+	rulesDir := t.TempDir()
+	writeSystemTestRule(t, rulesDir, "REQUEST-930-APPLICATION-ATTACK-LFI.conf", `SecRule ARGS:test "@streq attack" "id:930120,phase:2,deny,status:403,msg:'lfi block',log"`)
+	writeRulesState(t, rulesDir, `{"system_enabled": {}, "custom_enabled": {}}`)
+
+	rt := NewRuntime(testConfig(rulesDir, ModeBlocking), t.TempDir())
+	if _, err := rt.Reload(rt.Config(), "", ""); err != nil {
+		t.Fatalf("reload WAF: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "https://app.example.test/search?test=attack", nil)
+	decision := rt.Evaluate(req, EvaluateContext{ClientIP: "203.0.113.10"})
+	if !decision.Allowed {
+		t.Fatalf("expected omitted default-disabled system rule to be inactive, got %#v", decision)
+	}
+}
+
+func TestRuntimeLoadsSystemDataFilesFromRuleDirectory(t *testing.T) {
+	rulesDir := t.TempDir()
+	systemDir := filepath.Join(rulesDir, "system")
+	if err := os.MkdirAll(systemDir, 0o755); err != nil {
+		t.Fatalf("create system dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemDir, "test-patterns.data"), []byte("attack\n"), 0o644); err != nil {
+		t.Fatalf("write data file: %v", err)
+	}
+	writeSystemTestRule(t, rulesDir, "REQUEST-913-SCANNER-DETECTION.conf", `SecRule ARGS:test "@pmFromFile test-patterns.data" "id:913120,phase:2,deny,status:403,msg:'data file block',log"`)
+	writeRulesState(t, rulesDir, `{
+  "system_enabled": {
+    "REQUEST-913-SCANNER-DETECTION.conf": true
+  },
+  "custom_enabled": {}
+}`)
+
+	rt := NewRuntime(testConfig(rulesDir, ModeBlocking), t.TempDir())
+	if _, err := rt.Reload(rt.Config(), "", ""); err != nil {
+		t.Fatalf("reload WAF: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "https://app.example.test/search?test=attack", nil)
+	decision := rt.Evaluate(req, EvaluateContext{ClientIP: "203.0.113.10"})
+	if decision.Allowed {
+		t.Fatalf("expected rule using @pmFromFile to block request")
+	}
+	if !slices.Contains(decision.RuleIDs, 913120) {
+		t.Fatalf("expected data-file rule id, got %#v", decision.RuleIDs)
 	}
 }
 

@@ -1,14 +1,18 @@
 package waf
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +29,18 @@ const (
 	rulesStateFilename         = "rules-state.json"
 	systemRulesDirName         = "system"
 	customRulesDirName         = "custom"
+)
+
+var (
+	defaultDisabledSystemRuleFilenames = map[string]struct{}{
+		"REQUEST-920-PROTOCOL-ENFORCEMENT.conf":    {},
+		"REQUEST-930-APPLICATION-ATTACK-LFI.conf":  {},
+		"REQUEST-932-APPLICATION-ATTACK-RCE.conf":  {},
+		"REQUEST-941-APPLICATION-ATTACK-XSS.conf":  {},
+		"REQUEST-942-APPLICATION-ATTACK-SQLI.conf": {},
+	}
+	ruleIDActionRe            = regexp.MustCompile(`(?i)\bid\s*:\s*(\d+)\b`)
+	secRuleUpdateTargetByIDRe = regexp.MustCompile(`(?i)^SecRuleUpdateTargetById\s+(\d+)\b`)
 )
 
 type CompiledRuntime struct {
@@ -62,8 +78,16 @@ func buildCompiledRuntime(cfg models.WAFConfig, defaultRulesDir string, bundleID
 	if err != nil {
 		return nil, err
 	}
+	definedRuleIDs, err := collectDefinedRuleIDs(targets)
+	if err != nil {
+		return nil, err
+	}
 
 	wafConfig := coraza.NewWAFConfig().
+		WithRootFS(updateTargetFilteringFS{
+			root:           os.DirFS(rulesDir),
+			definedRuleIDs: definedRuleIDs,
+		}).
 		WithRequestBodyLimit(cfg.RequestBodyLimitBytes).
 		WithRequestBodyInMemoryLimit(cfg.RequestBodyInMemoryLimitBytes).
 		WithDirectives(dynamicDirectives(cfg))
@@ -78,7 +102,11 @@ func buildCompiledRuntime(cfg models.WAFConfig, defaultRulesDir string, bundleID
 		if file.path == "" {
 			continue
 		}
-		wafConfig = wafConfig.WithDirectivesFromFile(file.path)
+		rel, err := filepath.Rel(rulesDir, file.path)
+		if err != nil {
+			return nil, err
+		}
+		wafConfig = wafConfig.WithDirectivesFromFile(filepath.ToSlash(rel))
 	}
 
 	compiledWAF, err := coraza.NewWAF(wafConfig)
@@ -108,23 +136,41 @@ type loadTarget struct {
 }
 
 func loadOrder(rulesDir string, state rulesState) []loadTarget {
-	targets := globEnabledTargets(filepath.Join(rulesDir, systemRulesDirName), state.SystemEnabled)
-	targets = append(targets, globEnabledTargets(filepath.Join(rulesDir, customRulesDirName), state.CustomEnabled)...)
+	targets := globEnabledTargets(filepath.Join(rulesDir, systemRulesDirName), state.SystemEnabled, isSystemRuleEnabledByDefault)
+	targets = append(targets, globEnabledTargets(filepath.Join(rulesDir, customRulesDirName), state.CustomEnabled, func(string) bool {
+		return true
+	})...)
 	return targets
 }
 
-func globEnabledTargets(dir string, enabled map[string]bool) []loadTarget {
+func globEnabledTargets(dir string, enabled map[string]bool, enabledByDefault func(string) bool) []loadTarget {
 	matches, _ := filepath.Glob(filepath.Join(dir, "*.conf"))
 	sort.Strings(matches)
 	targets := make([]loadTarget, 0, len(matches))
 	for _, match := range matches {
 		filename := filepath.Base(match)
-		if value, ok := enabled[filename]; ok && !value {
+		if filename == initializationRuleFilename {
+			targets = append(targets, loadTarget{kind: loadFile, path: match})
+			continue
+		}
+		if value, ok := enabled[filename]; ok {
+			if !value {
+				continue
+			}
+		} else if enabledByDefault != nil && !enabledByDefault(filename) {
 			continue
 		}
 		targets = append(targets, loadTarget{kind: loadFile, path: match})
 	}
 	return targets
+}
+
+func isSystemRuleEnabledByDefault(filename string) bool {
+	if filename == initializationRuleFilename {
+		return true
+	}
+	_, disabled := defaultDisabledSystemRuleFilenames[filename]
+	return !disabled
 }
 
 func dynamicDirectives(cfg models.WAFConfig) string {
@@ -234,6 +280,148 @@ func readRulesState(rulesDir string) (rulesState, error) {
 		state.CustomEnabled = map[string]bool{}
 	}
 	return state, nil
+}
+
+func collectDefinedRuleIDs(targets []loadTarget) (map[int]struct{}, error) {
+	ids := map[int]struct{}{}
+	for _, target := range targets {
+		if target.path == "" || !strings.EqualFold(filepath.Ext(target.path), ".conf") {
+			continue
+		}
+		raw, err := os.ReadFile(target.path)
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			for _, match := range ruleIDActionRe.FindAllStringSubmatch(line, -1) {
+				id, err := strconv.Atoi(match[1])
+				if err == nil {
+					ids[id] = struct{}{}
+				}
+			}
+		}
+	}
+	return ids, nil
+}
+
+type updateTargetFilteringFS struct {
+	root           fs.FS
+	definedRuleIDs map[int]struct{}
+}
+
+func (f updateTargetFilteringFS) Open(name string) (fs.File, error) {
+	if !strings.EqualFold(filepath.Ext(name), ".conf") {
+		return f.root.Open(name)
+	}
+
+	file, err := f.root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	filtered, changed := filterMissingUpdateTargetDirectives(raw, f.definedRuleIDs)
+	if !changed {
+		return f.root.Open(name)
+	}
+	return &filteredRuleFile{
+		Reader: bytes.NewReader(filtered),
+		info: filteredRuleFileInfo{
+			name:    info.Name(),
+			size:    int64(len(filtered)),
+			mode:    info.Mode(),
+			modTime: info.ModTime(),
+			sys:     info.Sys(),
+		},
+	}, nil
+}
+
+func filterMissingUpdateTargetDirectives(raw []byte, definedRuleIDs map[int]struct{}) ([]byte, bool) {
+	var out strings.Builder
+	changed := false
+	for _, line := range strings.SplitAfter(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			out.WriteString(line)
+			continue
+		}
+		match := secRuleUpdateTargetByIDRe.FindStringSubmatch(trimmed)
+		if len(match) == 2 {
+			id, err := strconv.Atoi(match[1])
+			if err == nil {
+				if _, ok := definedRuleIDs[id]; !ok {
+					changed = true
+					out.WriteString("# fn-knock skipped SecRuleUpdateTargetById ")
+					out.WriteString(match[1])
+					out.WriteString(" because the target rule is not enabled")
+					if strings.HasSuffix(line, "\n") {
+						out.WriteString("\n")
+					}
+					continue
+				}
+			}
+		}
+		out.WriteString(line)
+	}
+	return []byte(out.String()), changed
+}
+
+type filteredRuleFile struct {
+	*bytes.Reader
+	info filteredRuleFileInfo
+}
+
+func (f *filteredRuleFile) Stat() (fs.FileInfo, error) {
+	return f.info, nil
+}
+
+func (f *filteredRuleFile) Close() error {
+	return nil
+}
+
+type filteredRuleFileInfo struct {
+	name    string
+	size    int64
+	mode    fs.FileMode
+	modTime time.Time
+	sys     any
+}
+
+func (i filteredRuleFileInfo) Name() string {
+	return i.name
+}
+
+func (i filteredRuleFileInfo) Size() int64 {
+	return i.size
+}
+
+func (i filteredRuleFileInfo) Mode() fs.FileMode {
+	return i.mode
+}
+
+func (i filteredRuleFileInfo) ModTime() time.Time {
+	return i.modTime
+}
+
+func (i filteredRuleFileInfo) IsDir() bool {
+	return false
+}
+
+func (i filteredRuleFileInfo) Sys() any {
+	return i.sys
 }
 
 func hashRuleSet(rulesDir string, targets []loadTarget) (string, error) {
