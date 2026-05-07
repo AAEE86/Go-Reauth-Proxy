@@ -52,6 +52,7 @@ type Handler struct {
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
 	proxyProtocolOnChange atomic.Value
+	requestState          atomic.Value
 
 	configManager     *config.Manager
 	sslConfig         models.SSLConfig
@@ -82,8 +83,12 @@ type Handler struct {
 
 type requestSnapshot struct {
 	rules              []models.Rule
+	rulesByLength      []models.Rule
+	rulesByPath        map[string]models.Rule
 	hostRules          []models.HostRule
+	hostRulesByHost    map[string]models.HostRule
 	defaultRoute       string
+	defaultRule        *models.Rule
 	authConfig         models.AuthConfig
 	proxyProtocolForce bool
 }
@@ -101,20 +106,73 @@ type authCheckResult struct {
 }
 
 func (h *Handler) snapshotForRequest() requestSnapshot {
+	if h == nil {
+		return requestSnapshot{}
+	}
+	if value := h.requestState.Load(); value != nil {
+		if snapshot, ok := value.(*requestSnapshot); ok && snapshot != nil {
+			return *snapshot
+		}
+	}
+
 	h.mu.RLock()
-	rules := make([]models.Rule, len(h.Rules))
-	copy(rules, h.Rules)
-	hostRules := make([]models.HostRule, len(h.HostRules))
-	copy(hostRules, h.HostRules)
-	s := requestSnapshot{
+	s := h.buildRequestSnapshotLocked()
+	h.mu.RUnlock()
+	return *s
+}
+
+func (h *Handler) buildRequestSnapshotLocked() *requestSnapshot {
+	rules := append([]models.Rule(nil), h.Rules...)
+	rulesByLength := append([]models.Rule(nil), rules...)
+	sort.SliceStable(rulesByLength, func(i, j int) bool {
+		return len(rulesByLength[i].Path) > len(rulesByLength[j].Path)
+	})
+	rulesByPath := make(map[string]models.Rule, len(rules))
+	for _, rule := range rules {
+		if rule.Path == "" {
+			continue
+		}
+		if _, exists := rulesByPath[rule.Path]; exists {
+			continue
+		}
+		rulesByPath[rule.Path] = rule
+	}
+
+	hostRules := append([]models.HostRule(nil), h.HostRules...)
+	hostRulesByHost := make(map[string]models.HostRule, len(hostRules))
+	for _, rule := range hostRules {
+		host := normalizeRequestHost(rule.Host)
+		if host == "" {
+			continue
+		}
+		if _, exists := hostRulesByHost[host]; exists {
+			continue
+		}
+		hostRulesByHost[host] = rule
+	}
+	var defaultRule *models.Rule
+	if h.DefaultRoute != "" && h.DefaultRoute != "/__select__" {
+		if rule, ok := rulesByPath[h.DefaultRoute]; ok {
+			ruleCopy := rule
+			defaultRule = &ruleCopy
+		}
+	}
+
+	return &requestSnapshot{
 		rules:              rules,
+		rulesByLength:      rulesByLength,
+		rulesByPath:        rulesByPath,
 		hostRules:          hostRules,
+		hostRulesByHost:    hostRulesByHost,
 		defaultRoute:       h.DefaultRoute,
+		defaultRule:        defaultRule,
 		authConfig:         h.AuthConfig,
 		proxyProtocolForce: h.ProxyProtocolForce,
 	}
-	h.mu.RUnlock()
-	return s
+}
+
+func (h *Handler) publishRequestSnapshotLocked() {
+	h.requestState.Store(h.buildRequestSnapshotLocked())
 }
 
 func resolveClientIP(r *http.Request, authConfig models.AuthConfig, proxyProtocolForce bool) string {
@@ -578,6 +636,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 	var emptyHook func()
 	h.sslOnChange.Store(emptyHook)
 	h.proxyProtocolOnChange.Store(emptyHook)
+	h.publishRequestSnapshotLocked()
 
 	if len(h.sslConfig.Certificates) == 0 && initialCfg.SSLCert != "" && initialCfg.SSLKey != "" {
 		h.sslConfig = buildLegacySSLConfig(initialCfg.SSLCert, initialCfg.SSLKey)
@@ -675,6 +734,7 @@ func (h *Handler) SetProxyProtocolForce(force bool) {
 	h.mu.Lock()
 	changed := h.ProxyProtocolForce != force
 	h.ProxyProtocolForce = force
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	hook := h.getProxyProtocolForceChangeHook()
 	h.mu.Unlock()
@@ -920,16 +980,20 @@ func (h *Handler) AddRule(newRule models.Rule) error {
 	defer h.mu.Unlock()
 
 	updated := false
-	for i, rule := range h.Rules {
-		if rule.Path == newRule.Path {
-			h.Rules[i] = newRule
+	nextRules := make([]models.Rule, 0, len(h.Rules)+1)
+	for _, rule := range h.Rules {
+		if rule.Path == newRule.Path && !updated {
+			nextRules = append(nextRules, newRule)
 			updated = true
-			break
+			continue
 		}
+		nextRules = append(nextRules, rule)
 	}
 	if !updated {
-		h.Rules = append(h.Rules, newRule)
+		nextRules = append(nextRules, newRule)
 	}
+	h.Rules = nextRules
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	return nil
 }
@@ -1069,6 +1133,7 @@ func (h *Handler) RemoveRule(path string) {
 		}
 	}
 	h.Rules = newRules
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 }
 
@@ -1077,6 +1142,7 @@ func (h *Handler) FlushRules() {
 	defer h.mu.Unlock()
 
 	h.Rules = make([]models.Rule, 0)
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 }
 
@@ -1120,16 +1186,20 @@ func (h *Handler) AddHostRule(newRule models.HostRule) error {
 	defer h.mu.Unlock()
 
 	updated := false
-	for i, rule := range h.HostRules {
-		if normalizeRequestHost(rule.Host) == newRule.Host {
-			h.HostRules[i] = newRule
+	nextRules := make([]models.HostRule, 0, len(h.HostRules)+1)
+	for _, rule := range h.HostRules {
+		if normalizeRequestHost(rule.Host) == newRule.Host && !updated {
+			nextRules = append(nextRules, newRule)
 			updated = true
-			break
+			continue
 		}
+		nextRules = append(nextRules, rule)
 	}
 	if !updated {
-		h.HostRules = append(h.HostRules, newRule)
+		nextRules = append(nextRules, newRule)
 	}
+	h.HostRules = nextRules
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	return nil
 }
@@ -1157,6 +1227,7 @@ func (h *Handler) SetHostRules(rules []models.HostRule) error {
 	defer h.mu.Unlock()
 
 	h.HostRules = normalizedRules
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	return nil
 }
@@ -1166,6 +1237,7 @@ func (h *Handler) FlushHostRules() {
 	defer h.mu.Unlock()
 
 	h.HostRules = make([]models.HostRule, 0)
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 }
 
@@ -1243,6 +1315,7 @@ func (h *Handler) SetDefaultRoute(route string) {
 	} else {
 		h.DefaultRoute = route
 	}
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 }
 
@@ -1400,6 +1473,7 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.AuthConfig = config
+	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	h.clearAuthCache()
 	return nil
@@ -1710,6 +1784,7 @@ func (h *Handler) LogGatewayEntry(entry gatewaylog.Entry) {
 }
 
 const loggedInActiveWindow = 2 * time.Minute
+const proxyPathCookieName = "__proxy_path"
 
 func canonicalCookieIdentity(r *http.Request) string {
 	cookies := r.Cookies()
@@ -1722,7 +1797,7 @@ func canonicalCookieIdentity(r *http.Request) string {
 		if c == nil {
 			continue
 		}
-		if c.Name == "__proxy_path" {
+		if c.Name == proxyPathCookieName {
 			continue
 		}
 		if c.Name == "" || c.Value == "" {
@@ -2034,7 +2109,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	isSelectRoute := r.URL.Path == "/__select__"
 	isAuthRoute := strings.HasPrefix(r.URL.Path, "/__auth__/")
-	matchedHostRule := matchHostRule(r, snapshot.hostRules)
+	matchedHostRule := matchHostRule(r, snapshot)
 	if matchedHostRule != nil {
 		metrics.bindHost(h, matchedHostRule.Host)
 	}
@@ -2043,19 +2118,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessMode = matchedHostRule.AccessMode
 	}
 
-	matchedRule, needsSlashRedirect := matchRule(r, snapshot.rules)
+	matchedRule, needsSlashRedirect := matchRule(r, snapshot)
 	if matchedHostRule != nil {
 		matchedRule = nil
 		needsSlashRedirect = ""
 	}
 
-	if matchedRule == nil && snapshot.defaultRoute != "" && snapshot.defaultRoute != "/__select__" {
-		for _, rule := range snapshot.rules {
-			if rule.Path == snapshot.defaultRoute {
-				matchedRule = copyRule(rule)
-				break
-			}
-		}
+	if matchedRule == nil && snapshot.defaultRule != nil {
+		matchedRule = copyRule(*snapshot.defaultRule)
 	}
 	throttleCheckedAt := time.Now()
 	throttleDecision := h.evaluateReverseProxyThrottleRequest(
@@ -2208,7 +2278,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if matchedRule.UseRootMode && matchedRule.Path != "/" && strings.HasPrefix(r.URL.Path, matchedRule.Path) {
 		accessEntry.AuthDecision = "root_mode_redirect"
 		http.SetCookie(w, &http.Cookie{
-			Name:  "__proxy_path",
+			Name:  proxyPathCookieName,
 			Value: matchedRule.Path,
 			Path:  "/",
 		})
@@ -2306,13 +2376,17 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 	return true
 }
 
-func matchRuleFromProxyPathCookie(r *http.Request, rules []models.Rule) *models.Rule {
-	cookie, err := r.Cookie("__proxy_path")
+func matchRuleFromProxyPathCookie(r *http.Request, snapshot requestSnapshot) *models.Rule {
+	cookie, err := r.Cookie(proxyPathCookieName)
 	if err != nil || cookie.Value == "" {
 		return nil
 	}
 
-	for _, rule := range rules {
+	if rule, ok := snapshot.rulesByPath[cookie.Value]; ok {
+		return copyRule(rule)
+	}
+
+	for _, rule := range snapshot.rules {
 		if cookie.Value == rule.Path {
 			return copyRule(rule)
 		}
@@ -2321,8 +2395,55 @@ func matchRuleFromProxyPathCookie(r *http.Request, rules []models.Rule) *models.
 	return nil
 }
 
-func matchHostRule(r *http.Request, rules []models.HostRule) *models.HostRule {
-	if len(rules) == 0 {
+func addProxyPathCookieIfChanged(resp *http.Response, r *http.Request, proxyPath string) {
+	if resp == nil || strings.TrimSpace(proxyPath) == "" {
+		return
+	}
+	if resp.Header == nil {
+		resp.Header = http.Header{}
+	}
+	stripProxyPathSetCookies(resp.Header)
+	if r != nil {
+		if cookie, err := r.Cookie(proxyPathCookieName); err == nil && cookie.Value == proxyPath {
+			return
+		}
+	}
+	cookie := &http.Cookie{
+		Name:  proxyPathCookieName,
+		Value: proxyPath,
+		Path:  "/",
+	}
+	resp.Header.Add("Set-Cookie", cookie.String())
+}
+
+func stripProxyPathSetCookies(headers http.Header) {
+	if headers == nil {
+		return
+	}
+	values := headers.Values("Set-Cookie")
+	if len(values) == 0 {
+		return
+	}
+
+	headers.Del("Set-Cookie")
+	for _, value := range values {
+		if isProxyPathSetCookie(value) {
+			continue
+		}
+		headers.Add("Set-Cookie", value)
+	}
+}
+
+func isProxyPathSetCookie(value string) bool {
+	if cookie, err := http.ParseSetCookie(value); err == nil {
+		return cookie.Name == proxyPathCookieName
+	}
+	name, _, ok := strings.Cut(value, "=")
+	return ok && strings.TrimSpace(name) == proxyPathCookieName
+}
+
+func matchHostRule(r *http.Request, snapshot requestSnapshot) *models.HostRule {
+	if len(snapshot.hostRules) == 0 && len(snapshot.hostRulesByHost) == 0 {
 		return nil
 	}
 
@@ -2334,7 +2455,11 @@ func matchHostRule(r *http.Request, rules []models.HostRule) *models.HostRule {
 		return nil
 	}
 
-	for _, rule := range rules {
+	if rule, ok := snapshot.hostRulesByHost[host]; ok {
+		return copyHostRule(rule)
+	}
+
+	for _, rule := range snapshot.hostRules {
 		if normalizeRequestHost(rule.Host) == host {
 			return copyHostRule(rule)
 		}
@@ -2343,25 +2468,37 @@ func matchHostRule(r *http.Request, rules []models.HostRule) *models.HostRule {
 	return nil
 }
 
-func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
+func matchRule(r *http.Request, snapshot requestSnapshot) (*models.Rule, string) {
 	var matchedRule *models.Rule
 	var longestMatch int
 	var needsSlashRedirect string
 	var rootPathCookieRule *models.Rule
+	rulesByLength := snapshot.rulesByLength
+	if len(rulesByLength) == 0 {
+		rulesByLength = snapshot.rules
+	}
 
 	// When the user returns to "/", prefer the last root-mode selection
 	// before falling back to a catch-all "/" rule or the configured default route.
 	if r.URL.Path == "/" {
-		rootPathCookieRule = matchRuleFromProxyPathCookie(r, rules)
+		rootPathCookieRule = matchRuleFromProxyPathCookie(r, snapshot)
 	}
 
-	for _, rule := range rules {
-		if strings.HasPrefix(r.URL.Path, rule.Path) && len(rule.Path) > longestMatch {
+	for _, rule := range rulesByLength {
+		if rule.Path != "" && strings.HasPrefix(r.URL.Path, rule.Path) {
 			matchedRule = copyRule(rule)
 			longestMatch = len(rule.Path)
+			break
 		}
-		if r.URL.Path+"/" == rule.Path {
-			needsSlashRedirect = rule.Path
+	}
+	if rule, ok := snapshot.rulesByPath[r.URL.Path+"/"]; ok {
+		needsSlashRedirect = rule.Path
+	} else {
+		for _, rule := range snapshot.rules {
+			if r.URL.Path+"/" == rule.Path {
+				needsSlashRedirect = rule.Path
+				break
+			}
 		}
 	}
 
@@ -2384,7 +2521,7 @@ func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
 		isWebSocket := strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
 		canUseCookie := r.URL.Path == "/" || r.Header.Get("Referer") != "" || r.Header.Get("Origin") != "" || isWebSocket
 		if canUseCookie {
-			matchedRule = matchRuleFromProxyPathCookie(r, rules)
+			matchedRule = matchRuleFromProxyPathCookie(r, snapshot)
 		}
 
 		if matchedRule == nil {
@@ -2392,11 +2529,10 @@ func matchRule(r *http.Request, rules []models.Rule) (*models.Rule, string) {
 			if referer != "" {
 				refURL, err := url.Parse(referer)
 				if err == nil {
-					var longestRefMatch int
-					for _, rule := range rules {
-						if strings.HasPrefix(refURL.Path, rule.Path) && len(rule.Path) > longestRefMatch {
+					for _, rule := range rulesByLength {
+						if rule.Path != "" && strings.HasPrefix(refURL.Path, rule.Path) {
 							matchedRule = copyRule(rule)
-							longestRefMatch = len(rule.Path)
+							break
 						}
 					}
 				}
@@ -2505,8 +2641,8 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 		resp.Body.Close()
 
-		bodyStr := injectToolbarIntoHTML(
-			string(bodyBytes),
+		bodyBytes = injectToolbarIntoHTMLBytes(
+			bodyBytes,
 			response.GenerateToolbarWithHosts(
 				snapshot.rules,
 				snapshot.hostRules,
@@ -2516,10 +2652,9 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			),
 		)
 
-		newBody := []byte(bodyStr)
-		resp.Body = io.NopCloser(bytes.NewReader(newBody))
-		resp.ContentLength = int64(len(newBody))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
 		return nil
 	}
 
@@ -2612,12 +2747,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		cookie := &http.Cookie{
-			Name:  "__proxy_path",
-			Value: matchedRule.Path,
-			Path:  "/",
-		}
-		resp.Header.Add("Set-Cookie", cookie.String())
+		addProxyPathCookieIfChanged(resp, r, matchedRule.Path)
 		if err := h.maybeRewriteFnosPortIconHijackHTTPResponse(resp, snapshot.hostRules); err != nil {
 			return err
 		}
@@ -2647,36 +2777,21 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 		resp.Body.Close()
 
-		bodyStr := string(bodyBytes)
-
 		if needsRewrite {
 			prefix := strings.TrimSuffix(matchedRule.Path, "/")
-			replacements := []struct {
-				old string
-				new string
-			}{
-				{`href="/`, `href="` + prefix + `/`},
-				{`src="/`, `src="` + prefix + `/`},
-				{`action="/`, `action="` + prefix + `/`},
-				{`<base href="/">`, `<base href="` + prefix + `/">`},
-			}
-
-			for _, rep := range replacements {
-				bodyStr = strings.ReplaceAll(bodyStr, rep.old, rep.new)
-			}
+			bodyBytes = rewriteHTMLAbsolutePaths(bodyBytes, prefix)
 		}
 
 		if needsToolbar {
-			bodyStr = injectToolbarIntoHTML(
-				bodyStr,
+			bodyBytes = injectToolbarIntoHTMLBytes(
+				bodyBytes,
 				response.GenerateToolbar(snapshot.rules, matchedRule.Path),
 			)
 		}
 
-		newBody := []byte(bodyStr)
-		resp.Body = io.NopCloser(bytes.NewReader(newBody))
-		resp.ContentLength = int64(len(newBody))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
 		return nil
 	}
 
@@ -2696,24 +2811,102 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	proxy.ServeHTTP(w, r)
 }
 
-func injectToolbarIntoHTML(bodyStr string, toolbarHTML string) string {
-	if toolbarHTML == "" || bodyStr == "" {
-		return bodyStr
+func rewriteHTMLAbsolutePaths(body []byte, prefix string) []byte {
+	if len(body) == 0 || prefix == "" {
+		return body
 	}
 
-	lowerBody := strings.ToLower(bodyStr)
-	if idx := strings.LastIndex(lowerBody, "</body>"); idx != -1 {
-		return bodyStr[:idx] + toolbarHTML + bodyStr[idx:]
+	replacements := []struct {
+		old []byte
+		new []byte
+	}{
+		{[]byte(`href="/`), []byte(`href="` + prefix + `/`)},
+		{[]byte(`src="/`), []byte(`src="` + prefix + `/`)},
+		{[]byte(`action="/`), []byte(`action="` + prefix + `/`)},
+		{[]byte(`<base href="/">`), []byte(`<base href="` + prefix + `/">`)},
 	}
 
-	if strings.Contains(lowerBody, "<html") ||
-		strings.Contains(lowerBody, "<head") ||
-		strings.Contains(lowerBody, "<body") ||
-		strings.Contains(lowerBody, "<!doctype") {
-		return bodyStr + toolbarHTML
+	for _, rep := range replacements {
+		body = bytes.ReplaceAll(body, rep.old, rep.new)
+	}
+	return body
+}
+
+func injectToolbarIntoHTMLBytes(body []byte, toolbarHTML string) []byte {
+	if toolbarHTML == "" || len(body) == 0 {
+		return body
 	}
 
-	return bodyStr
+	toolbar := []byte(toolbarHTML)
+	if idx := lastIndexFoldASCII(body, []byte("</body>")); idx != -1 {
+		out := make([]byte, 0, len(body)+len(toolbar))
+		out = append(out, body[:idx]...)
+		out = append(out, toolbar...)
+		out = append(out, body[idx:]...)
+		return out
+	}
+
+	if containsFoldASCII(body, []byte("<html")) ||
+		containsFoldASCII(body, []byte("<head")) ||
+		containsFoldASCII(body, []byte("<body")) ||
+		containsFoldASCII(body, []byte("<!doctype")) {
+		return append(body, toolbar...)
+	}
+
+	return body
+}
+
+func containsFoldASCII(s []byte, substr []byte) bool {
+	return indexFoldASCII(s, substr) != -1
+}
+
+func indexFoldASCII(s []byte, substr []byte) int {
+	if len(substr) == 0 {
+		return 0
+	}
+	if len(substr) > len(s) {
+		return -1
+	}
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if equalFoldASCIIBytes(s[i:i+len(substr)], substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+func lastIndexFoldASCII(s []byte, substr []byte) int {
+	if len(substr) == 0 {
+		return len(s)
+	}
+	if len(substr) > len(s) {
+		return -1
+	}
+	for i := len(s) - len(substr); i >= 0; i-- {
+		if equalFoldASCIIBytes(s[i:i+len(substr)], substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+func equalFoldASCIIBytes(a []byte, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }
 
 type authCheckErrorPage struct {

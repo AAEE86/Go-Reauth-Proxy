@@ -385,7 +385,7 @@ func requestCookieMap(r *http.Request) map[string]string {
 
 	values := make(map[string]string, len(cookies))
 	for _, cookie := range cookies {
-		if cookie == nil || cookie.Name == "" || cookie.Name == "__proxy_path" {
+		if cookie == nil || cookie.Name == "" || cookie.Name == proxyPathCookieName {
 			continue
 		}
 		if cookie.Value == "" {
@@ -407,7 +407,7 @@ func canonicalCookieIdentityFromMap(values map[string]string) string {
 
 	names := make([]string, 0, len(values))
 	for name, value := range values {
-		if name == "" || value == "" || name == "__proxy_path" {
+		if name == "" || value == "" || name == proxyPathCookieName {
 			continue
 		}
 		names = append(names, name)

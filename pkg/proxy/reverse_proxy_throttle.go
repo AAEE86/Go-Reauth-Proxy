@@ -14,11 +14,17 @@ const (
 	defaultReverseProxyThrottleBlockSecs = 30
 	reverseProxyThrottleCleanupInterval  = 1 * time.Minute
 	reverseProxyThrottleMinimumEntryTTL  = 2 * time.Minute
+	reverseProxyThrottleShardCount       = 64
 )
 
 type reverseProxyThrottle struct {
+	configMu sync.RWMutex
+	config   models.ReverseProxyThrottleConfig
+	shards   [reverseProxyThrottleShardCount]reverseProxyThrottleShard
+}
+
+type reverseProxyThrottleShard struct {
 	mu          sync.Mutex
-	config      models.ReverseProxyThrottleConfig
 	entries     map[string]*reverseProxyThrottleEntry
 	nextCleanup time.Time
 }
@@ -37,10 +43,13 @@ type reverseProxyThrottleEntry struct {
 }
 
 func newReverseProxyThrottle(cfg models.ReverseProxyThrottleConfig) *reverseProxyThrottle {
-	return &reverseProxyThrottle{
-		config:  normalizeReverseProxyThrottleConfig(cfg),
-		entries: make(map[string]*reverseProxyThrottleEntry),
+	throttle := &reverseProxyThrottle{
+		config: normalizeReverseProxyThrottleConfig(cfg),
 	}
+	for i := range throttle.shards {
+		throttle.shards[i].entries = make(map[string]*reverseProxyThrottleEntry)
+	}
+	return throttle
 }
 
 func normalizeReverseProxyThrottleConfig(cfg models.ReverseProxyThrottleConfig) models.ReverseProxyThrottleConfig {
@@ -61,12 +70,21 @@ func normalizeReverseProxyThrottleConfig(cfg models.ReverseProxyThrottleConfig) 
 }
 
 func (t *reverseProxyThrottle) updateConfig(cfg models.ReverseProxyThrottleConfig) {
-	t.mu.Lock()
+	t.configMu.Lock()
 	t.config = normalizeReverseProxyThrottleConfig(cfg)
-	if !t.config.Enabled {
-		t.entries = make(map[string]*reverseProxyThrottleEntry)
+	if t.config.Enabled {
+		t.configMu.Unlock()
+		return
 	}
-	t.mu.Unlock()
+
+	for i := range t.shards {
+		shard := &t.shards[i]
+		shard.mu.Lock()
+		shard.entries = make(map[string]*reverseProxyThrottleEntry)
+		shard.nextCleanup = time.Time{}
+		shard.mu.Unlock()
+	}
+	t.configMu.Unlock()
 }
 
 func (t *reverseProxyThrottle) evaluate(clientIP string, now time.Time) reverseProxyThrottleDecision {
@@ -80,26 +98,32 @@ func (t *reverseProxyThrottle) evaluate(clientIP string, now time.Time) reverseP
 		return decision
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
+	t.configMu.RLock()
 	cfg := normalizeReverseProxyThrottleConfig(t.config)
 	decision.Config = cfg
 	if !cfg.Enabled {
+		t.configMu.RUnlock()
 		return decision
 	}
 
-	if t.entries == nil {
-		t.entries = make(map[string]*reverseProxyThrottleEntry)
-	}
-	t.cleanupLocked(now, cfg)
+	shard := t.shardForIdentity(identity)
+	shard.mu.Lock()
+	defer func() {
+		shard.mu.Unlock()
+		t.configMu.RUnlock()
+	}()
 
-	entry := t.entries[identity]
+	if shard.entries == nil {
+		shard.entries = make(map[string]*reverseProxyThrottleEntry)
+	}
+	shard.cleanupLocked(now, cfg)
+
+	entry := shard.entries[identity]
 	if entry == nil {
 		entry = &reverseProxyThrottleEntry{
 			tokens: float64(cfg.Burst),
 		}
-		t.entries[identity] = entry
+		shard.entries[identity] = entry
 	}
 
 	if entry.blockedUntil.After(now) {
@@ -138,25 +162,42 @@ func (t *reverseProxyThrottle) evaluate(clientIP string, now time.Time) reverseP
 	return decision
 }
 
-func (t *reverseProxyThrottle) cleanupLocked(now time.Time, cfg models.ReverseProxyThrottleConfig) {
-	if now.Before(t.nextCleanup) {
+func (t *reverseProxyThrottle) shardForIdentity(identity string) *reverseProxyThrottleShard {
+	return &t.shards[int(reverseProxyThrottleHash(identity)%reverseProxyThrottleShardCount)]
+}
+
+func reverseProxyThrottleHash(identity string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	hash := uint32(offset32)
+	for i := 0; i < len(identity); i++ {
+		hash ^= uint32(identity[i])
+		hash *= prime32
+	}
+	return hash
+}
+
+func (s *reverseProxyThrottleShard) cleanupLocked(now time.Time, cfg models.ReverseProxyThrottleConfig) {
+	if now.Before(s.nextCleanup) {
 		return
 	}
 
 	entryTTL := reverseProxyThrottleEntryTTL(cfg)
-	for identity, entry := range t.entries {
+	for identity, entry := range s.entries {
 		if entry == nil {
-			delete(t.entries, identity)
+			delete(s.entries, identity)
 			continue
 		}
 		if entry.blockedUntil.After(now) {
 			continue
 		}
 		if entry.lastSeen.IsZero() || now.Sub(entry.lastSeen) > entryTTL {
-			delete(t.entries, identity)
+			delete(s.entries, identity)
 		}
 	}
-	t.nextCleanup = now.Add(reverseProxyThrottleCleanupInterval)
+	s.nextCleanup = now.Add(reverseProxyThrottleCleanupInterval)
 }
 
 func reverseProxyThrottleEntryTTL(cfg models.ReverseProxyThrottleConfig) time.Duration {
