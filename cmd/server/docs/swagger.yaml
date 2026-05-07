@@ -221,10 +221,25 @@ definitions:
       enabled:
         type: boolean
     type: object
+  proxy.HostTrafficStats:
+    properties:
+      error_5xx:
+        type: integer
+      host:
+        type: string
+      total_in:
+        type: integer
+      total_out:
+        type: integer
+    type: object
   proxy.TrafficStats:
     properties:
       active_conns:
         type: integer
+      by_host:
+        items:
+          $ref: '#/definitions/proxy.HostTrafficStats'
+        type: array
       error_5xx:
         type: integer
       total_in:

@@ -61,6 +61,7 @@ type Handler struct {
 	trafficTotalOut uint64
 	trafficActive   int64
 	trafficError5xx uint64
+	trafficByHost   sync.Map
 
 	fnAppMockService           *fnAppMockService
 	loggedInActive             sync.Map
@@ -1596,18 +1597,97 @@ func (h *Handler) SetReverseProxyThrottleExemptIPs(cfg models.ReverseProxyThrott
 }
 
 type TrafficStats struct {
-	TotalIn     uint64 `json:"total_in"`
-	TotalOut    uint64 `json:"total_out"`
-	ActiveConns int64  `json:"active_conns"`
-	Error5xx    uint64 `json:"error_5xx"`
+	TotalIn     uint64             `json:"total_in"`
+	TotalOut    uint64             `json:"total_out"`
+	ActiveConns int64              `json:"active_conns"`
+	Error5xx    uint64             `json:"error_5xx"`
+	ByHost      []HostTrafficStats `json:"by_host,omitempty"`
+}
+
+type HostTrafficStats struct {
+	Host     string `json:"host"`
+	TotalIn  uint64 `json:"total_in"`
+	TotalOut uint64 `json:"total_out"`
+	Error5xx uint64 `json:"error_5xx"`
+}
+
+type hostTrafficCounters struct {
+	totalIn  uint64
+	totalOut uint64
+	error5xx uint64
+}
+
+func normalizeTrafficHost(host string) string {
+	return strings.TrimSuffix(normalizeRequestHost(host), ".")
+}
+
+func (h *Handler) getHostTrafficCounters(host string) *hostTrafficCounters {
+	normalizedHost := normalizeTrafficHost(host)
+	if normalizedHost == "" {
+		return nil
+	}
+	if value, ok := h.trafficByHost.Load(normalizedHost); ok {
+		if counters, ok := value.(*hostTrafficCounters); ok {
+			return counters
+		}
+	}
+	counters := &hostTrafficCounters{}
+	actual, _ := h.trafficByHost.LoadOrStore(normalizedHost, counters)
+	if existing, ok := actual.(*hostTrafficCounters); ok {
+		return existing
+	}
+	return counters
+}
+
+func (h *Handler) activeTrafficHosts() map[string]struct{} {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	hosts := make(map[string]struct{}, len(h.HostRules))
+	for _, rule := range h.HostRules {
+		host := normalizeTrafficHost(rule.Host)
+		if host == "" {
+			continue
+		}
+		hosts[host] = struct{}{}
+	}
+	return hosts
 }
 
 func (h *Handler) GetTrafficStats(timestamp time.Time) TrafficStats {
+	byHost := make([]HostTrafficStats, 0)
+	activeHosts := h.activeTrafficHosts()
+	h.trafficByHost.Range(func(key, value any) bool {
+		host, ok := key.(string)
+		if !ok || host == "" {
+			return true
+		}
+		if _, ok := activeHosts[host]; !ok {
+			h.trafficByHost.Delete(host)
+			return true
+		}
+		counters, ok := value.(*hostTrafficCounters)
+		if !ok || counters == nil {
+			return true
+		}
+		byHost = append(byHost, HostTrafficStats{
+			Host:     host,
+			TotalIn:  atomic.LoadUint64(&counters.totalIn),
+			TotalOut: atomic.LoadUint64(&counters.totalOut),
+			Error5xx: atomic.LoadUint64(&counters.error5xx),
+		})
+		return true
+	})
+	sort.Slice(byHost, func(i, j int) bool {
+		return byHost[i].Host < byHost[j].Host
+	})
+
 	return TrafficStats{
 		TotalIn:     atomic.LoadUint64(&h.trafficTotalIn),
 		TotalOut:    atomic.LoadUint64(&h.trafficTotalOut),
 		ActiveConns: h.activeLoggedInCount(timestamp),
 		Error5xx:    atomic.LoadUint64(&h.trafficError5xx),
+		ByHost:      byHost,
 	}
 }
 
@@ -1741,6 +1821,41 @@ type requestTrafficMetrics struct {
 	outBytes    uint64
 	statusCode  int
 	wroteHeader bool
+	host        string
+	hostTraffic *hostTrafficCounters
+}
+
+func (m *requestTrafficMetrics) bindHost(handler *Handler, host string) {
+	if m == nil || handler == nil {
+		return
+	}
+	normalizedHost := normalizeTrafficHost(host)
+	if normalizedHost == "" || normalizedHost == m.host {
+		return
+	}
+	m.host = normalizedHost
+	m.hostTraffic = handler.getHostTrafficCounters(normalizedHost)
+}
+
+func (m *requestTrafficMetrics) addIn(bytes uint64) {
+	if m == nil || bytes == 0 || m.hostTraffic == nil {
+		return
+	}
+	atomic.AddUint64(&m.hostTraffic.totalIn, bytes)
+}
+
+func (m *requestTrafficMetrics) addOut(bytes uint64) {
+	if m == nil || bytes == 0 || m.hostTraffic == nil {
+		return
+	}
+	atomic.AddUint64(&m.hostTraffic.totalOut, bytes)
+}
+
+func (m *requestTrafficMetrics) add5xx() {
+	if m == nil || m.hostTraffic == nil {
+		return
+	}
+	atomic.AddUint64(&m.hostTraffic.error5xx, 1)
 }
 
 type trafficReadCloser struct {
@@ -1754,6 +1869,7 @@ func (trc *trafficReadCloser) Read(p []byte) (int, error) {
 	if n > 0 {
 		trc.metrics.inBytes += uint64(n)
 		atomic.AddUint64(&trc.handler.trafficTotalIn, uint64(n))
+		trc.metrics.addIn(uint64(n))
 	}
 	return n, err
 }
@@ -1781,6 +1897,7 @@ func (tw *trafficResponseWriter) Write(p []byte) (int, error) {
 	if n > 0 {
 		tw.metrics.outBytes += uint64(n)
 		atomic.AddUint64(&tw.handler.trafficTotalOut, uint64(n))
+		tw.metrics.addOut(uint64(n))
 	}
 	return n, err
 }
@@ -1864,6 +1981,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&h.trafficActive, -1)
 		if metrics.statusCode >= 500 {
 			atomic.AddUint64(&h.trafficError5xx, 1)
+			metrics.add5xx()
 		}
 		accessEntry.Path = r.URL.Path
 		accessEntry.Query = r.URL.RawQuery
@@ -1917,6 +2035,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isSelectRoute := r.URL.Path == "/__select__"
 	isAuthRoute := strings.HasPrefix(r.URL.Path, "/__auth__/")
 	matchedHostRule := matchHostRule(r, snapshot.hostRules)
+	if matchedHostRule != nil {
+		metrics.bindHost(h, matchedHostRule.Host)
+	}
 	accessMode := ""
 	if matchedHostRule != nil {
 		accessMode = matchedHostRule.AccessMode

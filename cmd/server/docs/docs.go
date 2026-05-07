@@ -1297,11 +1297,34 @@ const docTemplate = `{
                 }
             }
         },
+        "proxy.HostTrafficStats": {
+            "type": "object",
+            "properties": {
+                "error_5xx": {
+                    "type": "integer"
+                },
+                "host": {
+                    "type": "string"
+                },
+                "total_in": {
+                    "type": "integer"
+                },
+                "total_out": {
+                    "type": "integer"
+                }
+            }
+        },
         "proxy.TrafficStats": {
             "type": "object",
             "properties": {
                 "active_conns": {
                     "type": "integer"
+                },
+                "by_host": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/proxy.HostTrafficStats"
+                    }
                 },
                 "error_5xx": {
                     "type": "integer"
