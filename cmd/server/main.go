@@ -268,7 +268,7 @@ func main() {
 
 	execPath, err := os.Executable()
 	if err != nil {
-		log.Fatalf("Failed to get executable path: %v", err)
+		logger.Fatalf("Failed to get executable path: %v", err)
 	}
 
 	execDir := filepath.Dir(execPath)
@@ -299,14 +299,14 @@ func main() {
 
 	configDir := filepath.Dir(configPath)
 	if err := os.MkdirAll(configDir, 0755); err != nil {
-		log.Fatalf("Failed to create config directory %s: %v", configDir, err)
+		logger.Fatalf("Failed to create config directory %s: %v", configDir, err)
 	}
 	logsDir := gatewaylog.DefaultLogsDir(configDir)
 
 	cfgManager := config.NewManager(configPath)
 	initialCfg, err := cfgManager.Load()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		logger.Fatalf("Failed to load config: %v", err)
 	}
 
 	resolvedAdminPort := *adminPort
@@ -349,7 +349,7 @@ func main() {
 	adminServer := admin.NewServer(proxyHandler, resolvedAdminPort, cfgManager, initialCfg, streamManager)
 	go func() {
 		if err := adminServer.Start(); err != nil {
-			log.Fatalf("Admin server failed: %v", err)
+			logger.Fatalf("Admin server failed: %v", err)
 		}
 	}()
 
@@ -423,7 +423,7 @@ func main() {
 
 	proxyStack := newProxyStack(*proxyPort, proxyHandler, httpServer, httpsServer)
 	if err := proxyStack.Start(); err != nil {
-		log.Fatalf("Failed to start proxy stack: %v", err)
+		logger.Fatalf("Failed to start proxy stack: %v", err)
 	}
 
 	proxyHandler.SetProxyProtocolForceChangeHook(func() {

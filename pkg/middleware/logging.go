@@ -3,12 +3,15 @@ package middleware
 import (
 	"bufio"
 	"fmt"
+	"go-reauth-proxy/pkg/logger"
 	"net"
 	"net/http"
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
 )
+
+const AdminHTTPLogEnv = logger.AdminHTTPLogEnv
 
 type LogEntry struct {
 	Time      string `json:"time"`
@@ -46,6 +49,10 @@ func (rw *responseWriter) Flush() {
 }
 
 func Logger(next http.Handler) http.Handler {
+	if !adminHTTPLoggingEnabled() {
+		return next
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
@@ -76,4 +83,8 @@ func Logger(next http.Handler) http.Handler {
 			Str("remote_ip", remoteIP).
 			Send()
 	})
+}
+
+func adminHTTPLoggingEnabled() bool {
+	return logger.ConsoleLoggingEnabled() || logger.BoolEnv(AdminHTTPLogEnv)
 }

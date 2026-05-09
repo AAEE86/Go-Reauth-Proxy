@@ -345,7 +345,9 @@ curl -X POST http://127.0.0.1:7996/api/ssl \
 
 ## 日志与可观测性
 
-- HTTP 请求日志为 JSON 行（method/path/status/duration/user_agent/remote_ip）
+- 控制台常规日志默认不输出，避免管理 API 轮询和反代运行日志刷屏；需要排查时可设置 `GO_REPROXY_LOG=1` 开启
+- 管理 API 访问日志也可单独设置 `GO_REPROXY_ADMIN_HTTP_LOG=1` 开启 JSON 行日志（method/path/status/duration/user_agent/remote_ip）
+- 反代访问明细写入日志文件，由配置项 `logging.enabled` 控制，默认关闭
 - `GET /api/traffic` 返回：
   - `total_in` / `total_out`
   - `active_conns`（最近 2 分钟活跃已登录身份）
