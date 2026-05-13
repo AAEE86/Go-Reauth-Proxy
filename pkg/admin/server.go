@@ -91,6 +91,7 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/stream-rules", s.handleFlushStreamRules).Methods("DELETE")
 	r.HandleFunc("/api/info", s.handleInfo).Methods("GET")
 	r.HandleFunc("/api/traffic", s.handleTraffic).Methods("GET")
+	r.HandleFunc("/api/traffic/active-ips", s.handleTrafficActiveIPs).Methods("GET")
 	r.HandleFunc("/api/config/default-route", s.handleGetDefaultRoute).Methods("GET")
 	r.HandleFunc("/api/config/default-route", s.handleSetDefaultRoute).Methods("POST")
 	r.HandleFunc("/api/config/proxy-protocol", s.handleGetProxyProtocolForce).Methods("GET")
@@ -436,6 +437,24 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 // @Router /api/traffic [get]
 func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, s.ProxyHandler.GetTrafficStats(time.Now()))
+}
+
+// handleTrafficActiveIPs returns recently active client IPs for one host mapping
+// @Summary Get active IPs for host traffic
+// @Description Get recently active client IPs for one proxy host mapping
+// @Tags traffic
+// @Produce  json
+// @Param host query string true "Host mapping"
+// @Success 200 {object} response.Response{data=proxy.HostActiveIPsStats}
+// @Failure 400 {object} response.Response
+// @Router /api/traffic/active-ips [get]
+func (s *Server) handleTrafficActiveIPs(w http.ResponseWriter, r *http.Request) {
+	host := strings.TrimSpace(r.URL.Query().Get("host"))
+	if host == "" {
+		response.Error(w, errors.CodeBadRequest, "host is required")
+		return
+	}
+	response.Success(w, s.ProxyHandler.GetHostActiveIPs(host, time.Now()))
 }
 
 // handleGetDefaultRoute gets the default route

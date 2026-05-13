@@ -61,3 +61,60 @@ func TestTrafficStatsIncludesHostBreakdown(t *testing.T) {
 		t.Fatalf("host Error5xx = %d, want 1", hostStats.Error5xx)
 	}
 }
+
+func TestHostActiveIPsTracksRecentClients(t *testing.T) {
+	now := time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
+	handler := &Handler{
+		HostRules: []models.HostRule{{Host: "app.example.com"}},
+	}
+	metrics := &requestTrafficMetrics{statusCode: http.StatusOK}
+	metrics.bindHost(handler, "app.example.com")
+
+	release := metrics.markActiveIP("192.0.2.10:4321", now)
+	if release == nil {
+		t.Fatal("expected active IP release function")
+	}
+
+	active := handler.GetHostActiveIPs("App.Example.COM:443", now)
+	if active.Host != "app.example.com" {
+		t.Fatalf("Host = %q, want app.example.com", active.Host)
+	}
+	if active.WindowSeconds != int(hostActiveIPWindow.Seconds()) {
+		t.Fatalf("WindowSeconds = %d, want %d", active.WindowSeconds, int(hostActiveIPWindow.Seconds()))
+	}
+	if len(active.Items) != 1 {
+		t.Fatalf("active IP count = %d, want 1: %#v", len(active.Items), active.Items)
+	}
+	if active.Items[0].IP != "192.0.2.10" {
+		t.Fatalf("IP = %q, want 192.0.2.10", active.Items[0].IP)
+	}
+	if active.Items[0].ActiveConns != 1 {
+		t.Fatalf("ActiveConns = %d, want 1", active.Items[0].ActiveConns)
+	}
+	if !active.Items[0].LastSeenAt.Equal(now) {
+		t.Fatalf("LastSeenAt = %s, want %s", active.Items[0].LastSeenAt, now)
+	}
+
+	stats := handler.GetTrafficStats(now)
+	if len(stats.ByHost) != 1 || stats.ByHost[0].ActiveIPCount != 1 {
+		t.Fatalf("host ActiveIPCount = %#v, want 1", stats.ByHost)
+	}
+
+	release()
+	releasedAt := time.Now()
+	stillRecent := handler.GetHostActiveIPs("app.example.com", releasedAt.Add(hostActiveIPWindow-time.Second))
+	if len(stillRecent.Items) != 1 {
+		t.Fatalf("recent active IP count = %d, want 1", len(stillRecent.Items))
+	}
+	if stillRecent.Items[0].ActiveConns != 0 {
+		t.Fatalf("recent ActiveConns = %d, want 0", stillRecent.Items[0].ActiveConns)
+	}
+	if stillRecent.Items[0].LastSeenAt.Before(releasedAt.Add(-time.Second)) {
+		t.Fatalf("recent LastSeenAt = %s, want refreshed around release time %s", stillRecent.Items[0].LastSeenAt, releasedAt)
+	}
+
+	expired := handler.GetHostActiveIPs("app.example.com", releasedAt.Add(hostActiveIPWindow+time.Second))
+	if len(expired.Items) != 0 {
+		t.Fatalf("expired active IP count = %d, want 0: %#v", len(expired.Items), expired.Items)
+	}
+}

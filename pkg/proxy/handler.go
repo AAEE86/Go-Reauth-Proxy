@@ -1679,20 +1679,198 @@ type TrafficStats struct {
 }
 
 type HostTrafficStats struct {
-	Host     string `json:"host"`
-	TotalIn  uint64 `json:"total_in"`
-	TotalOut uint64 `json:"total_out"`
-	Error5xx uint64 `json:"error_5xx"`
+	Host          string `json:"host"`
+	TotalIn       uint64 `json:"total_in"`
+	TotalOut      uint64 `json:"total_out"`
+	Error5xx      uint64 `json:"error_5xx"`
+	ActiveIPCount int    `json:"active_ip_count"`
+}
+
+type HostActiveIPStats struct {
+	IP          string    `json:"ip"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+	ActiveConns int64     `json:"active_conns"`
+}
+
+type HostActiveIPsStats struct {
+	Host          string              `json:"host"`
+	WindowSeconds int                 `json:"window_seconds"`
+	Items         []HostActiveIPStats `json:"items"`
 }
 
 type hostTrafficCounters struct {
-	totalIn  uint64
-	totalOut uint64
-	error5xx uint64
+	totalIn                     uint64
+	totalOut                    uint64
+	error5xx                    uint64
+	activeIPs                   sync.Map
+	activeIPLastCleanupUnixNano int64
+}
+
+type hostActiveIPRecord struct {
+	ip               string
+	lastSeenUnixNano int64
+	activeConns      int64
 }
 
 func normalizeTrafficHost(host string) string {
 	return strings.TrimSuffix(normalizeRequestHost(host), ".")
+}
+
+const (
+	hostActiveIPWindow          = 2 * time.Minute
+	hostActiveIPCleanupInterval = 30 * time.Second
+	hostActiveIPMaxItems        = 256
+)
+
+func (c *hostTrafficCounters) cleanupActiveIPs(now time.Time) {
+	if c == nil {
+		return
+	}
+	cutoff := now.Add(-hostActiveIPWindow).UnixNano()
+	c.activeIPs.Range(func(key, value any) bool {
+		record, ok := value.(*hostActiveIPRecord)
+		if !ok || record == nil {
+			c.activeIPs.Delete(key)
+			return true
+		}
+		lastSeen := atomic.LoadInt64(&record.lastSeenUnixNano)
+		activeConns := atomic.LoadInt64(&record.activeConns)
+		if activeConns <= 0 && lastSeen < cutoff {
+			c.activeIPs.Delete(key)
+		}
+		return true
+	})
+}
+
+func (c *hostTrafficCounters) cleanupActiveIPsIfNeeded(now time.Time) {
+	if c == nil {
+		return
+	}
+	nowUnixNano := now.UnixNano()
+	lastCleanup := atomic.LoadInt64(&c.activeIPLastCleanupUnixNano)
+	if lastCleanup > 0 && nowUnixNano-lastCleanup < int64(hostActiveIPCleanupInterval) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&c.activeIPLastCleanupUnixNano, lastCleanup, nowUnixNano) {
+		return
+	}
+	c.cleanupActiveIPs(now)
+}
+
+func (c *hostTrafficCounters) markActiveIP(clientIP string, now time.Time) func() {
+	if c == nil {
+		return nil
+	}
+	ip := normalizeIPAddress(clientIP)
+	if ip == "" {
+		return nil
+	}
+
+	c.cleanupActiveIPsIfNeeded(now)
+	record := &hostActiveIPRecord{ip: ip}
+	actual, _ := c.activeIPs.LoadOrStore(ip, record)
+	if existing, ok := actual.(*hostActiveIPRecord); ok {
+		record = existing
+	}
+
+	atomic.StoreInt64(&record.lastSeenUnixNano, now.UnixNano())
+	atomic.AddInt64(&record.activeConns, 1)
+
+	return func() {
+		atomic.StoreInt64(&record.lastSeenUnixNano, time.Now().UnixNano())
+		if atomic.AddInt64(&record.activeConns, -1) < 0 {
+			atomic.StoreInt64(&record.activeConns, 0)
+		}
+	}
+}
+
+func (c *hostTrafficCounters) activeIPCount(now time.Time) int {
+	if c == nil {
+		return 0
+	}
+	c.cleanupActiveIPs(now)
+
+	cutoff := now.Add(-hostActiveIPWindow).UnixNano()
+	count := 0
+	c.activeIPs.Range(func(key, value any) bool {
+		record, ok := value.(*hostActiveIPRecord)
+		if !ok || record == nil {
+			c.activeIPs.Delete(key)
+			return true
+		}
+		lastSeen := atomic.LoadInt64(&record.lastSeenUnixNano)
+		activeConns := atomic.LoadInt64(&record.activeConns)
+		if activeConns <= 0 && lastSeen < cutoff {
+			c.activeIPs.Delete(key)
+			return true
+		}
+		if lastSeen > 0 {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
+func (c *hostTrafficCounters) activeIPStats(now time.Time) []HostActiveIPStats {
+	if c == nil {
+		return []HostActiveIPStats{}
+	}
+	c.cleanupActiveIPs(now)
+
+	cutoff := now.Add(-hostActiveIPWindow).UnixNano()
+	items := make([]HostActiveIPStats, 0)
+	c.activeIPs.Range(func(key, value any) bool {
+		record, ok := value.(*hostActiveIPRecord)
+		if !ok || record == nil {
+			c.activeIPs.Delete(key)
+			return true
+		}
+
+		lastSeen := atomic.LoadInt64(&record.lastSeenUnixNano)
+		activeConns := atomic.LoadInt64(&record.activeConns)
+		if activeConns <= 0 && lastSeen < cutoff {
+			c.activeIPs.Delete(key)
+			return true
+		}
+		if lastSeen <= 0 {
+			return true
+		}
+
+		items = append(items, HostActiveIPStats{
+			IP:          record.ip,
+			LastSeenAt:  time.Unix(0, lastSeen).UTC(),
+			ActiveConns: activeConns,
+		})
+		return true
+	})
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].LastSeenAt.Equal(items[j].LastSeenAt) {
+			return items[i].IP < items[j].IP
+		}
+		return items[i].LastSeenAt.After(items[j].LastSeenAt)
+	})
+	if len(items) > hostActiveIPMaxItems {
+		items = items[:hostActiveIPMaxItems]
+	}
+	return items
+}
+
+func (h *Handler) lookupHostTrafficCounters(host string) (*hostTrafficCounters, string) {
+	normalizedHost := normalizeTrafficHost(host)
+	if normalizedHost == "" {
+		return nil, ""
+	}
+	value, ok := h.trafficByHost.Load(normalizedHost)
+	if !ok {
+		return nil, normalizedHost
+	}
+	counters, ok := value.(*hostTrafficCounters)
+	if !ok || counters == nil {
+		return nil, normalizedHost
+	}
+	return counters, normalizedHost
 }
 
 func (h *Handler) getHostTrafficCounters(host string) *hostTrafficCounters {
@@ -1745,10 +1923,11 @@ func (h *Handler) GetTrafficStats(timestamp time.Time) TrafficStats {
 			return true
 		}
 		byHost = append(byHost, HostTrafficStats{
-			Host:     host,
-			TotalIn:  atomic.LoadUint64(&counters.totalIn),
-			TotalOut: atomic.LoadUint64(&counters.totalOut),
-			Error5xx: atomic.LoadUint64(&counters.error5xx),
+			Host:          host,
+			TotalIn:       atomic.LoadUint64(&counters.totalIn),
+			TotalOut:      atomic.LoadUint64(&counters.totalOut),
+			Error5xx:      atomic.LoadUint64(&counters.error5xx),
+			ActiveIPCount: counters.activeIPCount(timestamp),
 		})
 		return true
 	})
@@ -1763,6 +1942,32 @@ func (h *Handler) GetTrafficStats(timestamp time.Time) TrafficStats {
 		Error5xx:    atomic.LoadUint64(&h.trafficError5xx),
 		ByHost:      byHost,
 	}
+}
+
+func (h *Handler) GetHostActiveIPs(host string, timestamp time.Time) HostActiveIPsStats {
+	normalizedHost := normalizeTrafficHost(host)
+	result := HostActiveIPsStats{
+		Host:          normalizedHost,
+		WindowSeconds: int(hostActiveIPWindow.Seconds()),
+		Items:         []HostActiveIPStats{},
+	}
+	if normalizedHost == "" {
+		return result
+	}
+
+	activeHosts := h.activeTrafficHosts()
+	if _, ok := activeHosts[normalizedHost]; !ok {
+		h.trafficByHost.Delete(normalizedHost)
+		return result
+	}
+
+	counters, _ := h.lookupHostTrafficCounters(normalizedHost)
+	if counters == nil {
+		return result
+	}
+
+	result.Items = counters.activeIPStats(timestamp)
+	return result
 }
 
 func (h *Handler) AddStreamTraffic(bytesIn, bytesOut uint64, status int) {
@@ -1910,6 +2115,13 @@ func (m *requestTrafficMetrics) bindHost(handler *Handler, host string) {
 	}
 	m.host = normalizedHost
 	m.hostTraffic = handler.getHostTrafficCounters(normalizedHost)
+}
+
+func (m *requestTrafficMetrics) markActiveIP(clientIP string, now time.Time) func() {
+	if m == nil || m.hostTraffic == nil {
+		return nil
+	}
+	return m.hostTraffic.markActiveIP(clientIP, now)
 }
 
 func (m *requestTrafficMetrics) addIn(bytes uint64) {
@@ -2112,6 +2324,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	matchedHostRule := matchHostRule(r, snapshot)
 	if matchedHostRule != nil {
 		metrics.bindHost(h, matchedHostRule.Host)
+		if releaseHostActiveIP := metrics.markActiveIP(clientIP, time.Now()); releaseHostActiveIP != nil {
+			defer releaseHostActiveIP()
+		}
 	}
 	accessMode := ""
 	if matchedHostRule != nil {

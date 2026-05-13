@@ -261,6 +261,7 @@ go run ./cmd/server/main.go -proxy-port 7999 -admin-port 7996 -c ./config.json
 
 - `GET /api/info`
 - `GET /api/traffic`
+- `GET /api/traffic/active-ips?host=app.example.com`
 - `GET /api/rules`
 - `POST /api/rules`（全量替换）
 - `DELETE /api/rules`
@@ -352,6 +353,8 @@ curl -X POST http://127.0.0.1:7996/api/ssl \
   - `total_in` / `total_out`
   - `active_conns`（最近 2 分钟活跃已登录身份）
   - `error_5xx`
+  - `by_host[].active_ip_count`（子域名最近 2 分钟活跃 IP 数）
+- `GET /api/traffic/active-ips?host=...` 返回单个子域名最近 2 分钟活跃 IP 列表，包含 IP、最近活跃时间和当前未结束请求数
 
 ## 项目结构
 
