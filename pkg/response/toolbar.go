@@ -1,10 +1,9 @@
 package response
 
 import (
-	"bytes"
+	"encoding/json"
 	"go-reauth-proxy/pkg/models"
 	"strings"
-	"text/template"
 )
 
 const toolbarTemplate = `
@@ -283,46 +282,17 @@ const toolbarTemplate = `
         }
     ` + "`" + `;
 
-    var html = ` + "`" + `
-        <div id="wrapper" style="position: relative;">
-            <div id="menu">
-                <div class="menu-header">
-                    <span><i class="dot"></i> Go Reauth Proxy</span>
-                </div>
-                <div class="menu-scroll">
-                    {{if .HasHostRules}}
-                    {{range .HostRules}}
-                    <a href="/" target="_blank" rel="noopener noreferrer" data-host="{{.Host}}" class="menu-item nav-link host-link{{if isActiveHost .Host $.CurrentHost}} active{{end}}">
-                        <span class="menu-item-path">{{.Host}}</span>
-                        <span class="menu-item-right-content">
-                            {{if isActiveHost .Host $.CurrentHost}}
-                                <i class="dot"></i>
-                            {{else}}
-                                <span class="menu-item-go-text">Go</span>
-                            {{end}}
-                        </span>
-                    </a>
-                    {{end}}
-                    {{else if .HasPathRules}}
-                    {{range .Rules}}
-                    <a href="{{ensureSlash .Path}}" target="_blank" rel="noopener noreferrer" class="menu-item nav-link rule-link{{if isActive .Path $.CurrentPath}} active{{end}}">
-                        <span class="menu-item-path">{{.Path}}</span>
-                        <span class="menu-item-right-content">
-                            {{if isActive .Path $.CurrentPath}}
-                                <i class="dot"></i>
-                            {{else}}
-                                <span class="menu-item-go-text">Go</span>
-                            {{end}}
-                        </span>
-                    </a>
-                    {{end}}
-                    {{else}}
-                    <div class="menu-empty">No routes configured</div>
-                    {{end}}
-                </div>
-                <div class="menu-divider"></div>
-                <a href="/__auth__/api/auth/logout" class="menu-item logout-btn">Logout</a>
-            </div>
+	var toolbarData = __REAUTH_TOOLBAR_DATA__;
+	var html = ` + "`" + `
+	    <div id="wrapper" style="position: relative;">
+	        <div id="menu">
+	            <div class="menu-header">
+	                <span><i class="dot"></i> Go Reauth Proxy</span>
+	            </div>
+	            <div class="menu-scroll"></div>
+	            <div class="menu-divider"></div>
+	            <a href="/__auth__/api/auth/logout" class="menu-item logout-btn">Logout</a>
+	        </div>
             <div id="fab">
                 <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
@@ -337,14 +307,114 @@ const toolbarTemplate = `
     div.innerHTML = html;
     shadow.appendChild(div);
 
-    var fab = shadow.getElementById('fab');
-    var menu = shadow.getElementById('menu');
-    var menuScroll = shadow.querySelector('.menu-scroll');
+	var fab = shadow.getElementById('fab');
+	var menu = shadow.getElementById('menu');
+	var menuScroll = shadow.querySelector('.menu-scroll');
 
-    function buildHostHref(host) {
-        var port = window.location.port ? ':' + window.location.port : '';
-        return window.location.protocol + '//' + host + port + '/';
-    }
+	function asString(value) {
+	    return typeof value === 'string' ? value : '';
+	}
+
+	function ensureSlash(path) {
+	    path = asString(path);
+	    return path.endsWith('/') ? path : path + '/';
+	}
+
+	function normalizeHost(host) {
+	    return asString(host).trim().toLowerCase().replace(/\.$/, '');
+	}
+
+	function isActivePath(rulePath, currentPath) {
+	    currentPath = asString(currentPath);
+	    if (!currentPath) return false;
+	    var rp = asString(rulePath).replace(/\/$/, '');
+	    var cp = currentPath.replace(/\/$/, '');
+	    return rp === cp || cp.indexOf(rp + '/') === 0 || cp.indexOf(rp) === 0;
+	}
+
+	function isActiveHost(ruleHost, currentHost) {
+	    var rh = normalizeHost(ruleHost);
+	    var ch = normalizeHost(currentHost);
+	    return !!rh && rh === ch;
+	}
+
+	function appendRightContent(anchor, active) {
+	    var right = document.createElement('span');
+	    right.className = 'menu-item-right-content';
+	    if (active) {
+	        var dot = document.createElement('i');
+	        dot.className = 'dot';
+	        right.appendChild(dot);
+	    } else {
+	        var go = document.createElement('span');
+	        go.className = 'menu-item-go-text';
+	        go.textContent = 'Go';
+	        right.appendChild(go);
+	    }
+	    anchor.appendChild(right);
+	}
+
+	function createMenuLink(label, href, extraClass, active) {
+	    var anchor = document.createElement('a');
+	    anchor.href = href;
+	    anchor.target = '_blank';
+	    anchor.rel = 'noopener noreferrer';
+	    anchor.className = 'menu-item nav-link ' + extraClass + (active ? ' active' : '');
+
+	    var text = document.createElement('span');
+	    text.className = 'menu-item-path';
+	    text.textContent = label;
+	    anchor.appendChild(text);
+	    appendRightContent(anchor, active);
+	    return anchor;
+	}
+
+	function appendEmptyMenu() {
+	    var empty = document.createElement('div');
+	    empty.className = 'menu-empty';
+	    empty.textContent = 'No routes configured';
+	    menuScroll.appendChild(empty);
+	}
+
+	function populateMenu() {
+	    if (!menuScroll) return;
+	    var hostRules = Array.isArray(toolbarData.host_rules) ? toolbarData.host_rules : [];
+	    var rules = Array.isArray(toolbarData.rules) ? toolbarData.rules : [];
+
+	    if (hostRules.length > 0) {
+	        for (var i = 0; i < hostRules.length; i++) {
+	            var host = asString(hostRules[i].host);
+	            var hostLink = createMenuLink(host, '/', 'host-link', isActiveHost(host, toolbarData.current_host));
+	            hostLink.setAttribute('data-host', host);
+	            menuScroll.appendChild(hostLink);
+	        }
+	        return;
+	    }
+
+	    if (rules.length > 0) {
+	        for (var j = 0; j < rules.length; j++) {
+	            var path = asString(rules[j].path);
+	            menuScroll.appendChild(createMenuLink(path, ensureSlash(path), 'rule-link', isActivePath(path, toolbarData.current_path)));
+	        }
+	        return;
+	    }
+
+	    appendEmptyMenu();
+	}
+
+	populateMenu();
+
+	function buildHostHref(host) {
+	    host = asString(host).trim();
+	    if (!host) return '/';
+	    var port = window.location.port ? ':' + window.location.port : '';
+	    var candidate = window.location.protocol + '//' + host + port + '/';
+	    try {
+	        return new URL(candidate).href;
+	    } catch (err) {
+	        return '/';
+	    }
+	}
 
     var navLinks = shadow.querySelectorAll('.nav-link');
     for (var i = 0; i < navLinks.length; i++) {
@@ -664,33 +734,25 @@ const toolbarTemplate = `
 
     document.body.appendChild(container);
 })(window, document);
-</script>
-`
+	</script>
+	`
 
-var toolbarFuncMap = template.FuncMap{
-	"ensureSlash": func(path string) string {
-		if !strings.HasSuffix(path, "/") {
-			return path + "/"
-		}
-		return path
-	},
-	"isActive": func(rulePath, currentPath string) bool {
-		if currentPath == "" {
-			return false
-		}
-		// Normalize paths for comparison
-		rp := strings.TrimSuffix(rulePath, "/")
-		cp := strings.TrimSuffix(currentPath, "/")
-		return rp == cp || strings.HasPrefix(cp, rp+"/") || strings.HasPrefix(cp, rp)
-	},
-	"isActiveHost": func(ruleHost, currentHost string) bool {
-		rh := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(ruleHost)), ".")
-		ch := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(currentHost)), ".")
-		return rh != "" && rh == ch
-	},
+const toolbarDataMarker = "__REAUTH_TOOLBAR_DATA__"
+
+type toolbarRuleData struct {
+	Path string `json:"path"`
 }
 
-var toolbarTmpl = template.Must(template.New("toolbar").Funcs(toolbarFuncMap).Parse(toolbarTemplate))
+type toolbarHostRuleData struct {
+	Host string `json:"host"`
+}
+
+type toolbarData struct {
+	Rules       []toolbarRuleData     `json:"rules"`
+	HostRules   []toolbarHostRuleData `json:"host_rules"`
+	CurrentPath string                `json:"current_path"`
+	CurrentHost string                `json:"current_host"`
+}
 
 func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(userAgent))
@@ -730,22 +792,22 @@ func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []
 func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string) string {
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
 
-	var buf bytes.Buffer
-	data := struct {
-		Rules        []models.Rule
-		HostRules    []models.HostRule
-		CurrentPath  string
-		CurrentHost  string
-		HasPathRules bool
-		HasHostRules bool
-	}{
-		Rules:        rules,
-		HostRules:    filteredHostRules,
-		CurrentPath:  currentPath,
-		CurrentHost:  currentHost,
-		HasPathRules: len(rules) > 0,
-		HasHostRules: len(filteredHostRules) > 0,
+	data := toolbarData{
+		Rules:       make([]toolbarRuleData, 0, len(rules)),
+		HostRules:   make([]toolbarHostRuleData, 0, len(filteredHostRules)),
+		CurrentPath: currentPath,
+		CurrentHost: currentHost,
 	}
-	_ = toolbarTmpl.Execute(&buf, data)
-	return buf.String()
+	for _, rule := range rules {
+		data.Rules = append(data.Rules, toolbarRuleData{Path: rule.Path})
+	}
+	for _, rule := range filteredHostRules {
+		data.HostRules = append(data.HostRules, toolbarHostRuleData{Host: rule.Host})
+	}
+
+	payload, err := json.Marshal(data)
+	if err != nil {
+		payload = []byte(`{"rules":[],"host_rules":[],"current_path":"","current_host":""}`)
+	}
+	return strings.Replace(toolbarTemplate, toolbarDataMarker, string(payload), 1)
 }

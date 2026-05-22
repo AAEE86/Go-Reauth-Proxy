@@ -2516,6 +2516,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
+		} else if !matchedHostRule.SuppressToolbar && shouldProbeAuthForToolbar(r, snapshot.authConfig) {
+			authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP)
+			accessEntry.AuthDecision = authResult.decision
 		} else {
 			accessEntry.AuthDecision = authResult.decision
 		}
@@ -2555,6 +2558,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+	} else if shouldProbeAuthForToolbar(r, snapshot.authConfig) {
+		authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP)
+		accessEntry.AuthDecision = authResult.decision
 	} else {
 		accessEntry.AuthDecision = authResult.decision
 	}
@@ -2863,7 +2869,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
+			if authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 		},
@@ -2884,7 +2890,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			return err
 		}
 
-		needsToolbar := matchedRule.UseAuth && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsToolbar := authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 		if !needsToolbar {
 			return nil
 		}
@@ -2994,7 +3000,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.RewriteHTML || (matchedRule.UseAuth && !authResult.suppressToolbar && !suppressToolbarForUA) {
+			if matchedRule.RewriteHTML || (authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA) {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
@@ -3012,7 +3018,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 
 		needsRewrite := matchedRule.RewriteHTML && !matchedRule.UseRootMode
-		needsToolbar := matchedRule.UseAuth && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsToolbar := authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA
 		if !needsRewrite && !needsToolbar {
 			return nil
 		}
@@ -3371,7 +3377,30 @@ func (h *Handler) applyAuthCheckPlan(w http.ResponseWriter, r *http.Request, pla
 	return plan.result
 }
 
-func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string) authCheckResult {
+func requestHasExplicitAuthIdentity(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, cookie := range r.Cookies() {
+		if cookie == nil || cookie.Value == "" {
+			continue
+		}
+		switch cookie.Name {
+		case authSessionCookieName, authShareSessionCookieName:
+			return true
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("Authorization")) != ""
+}
+
+func shouldProbeAuthForToolbar(r *http.Request, authConfig models.AuthConfig) bool {
+	return authConfig.AuthPort > 0 &&
+		authConfig.AuthURL != "" &&
+		requestHasExplicitAuthIdentity(r) &&
+		!response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+}
+
+func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string) authCheckExecution {
 	now := time.Now()
 	useCache := authCacheEnabled(authConfig)
 	lookup, canLookup := buildAuthCacheLookup(r, clientIP, accessMode)
@@ -3383,7 +3412,7 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 				h.authCache.deleteEntryLocked(lookup.cacheKey)
 				h.authCache.mu.Unlock()
 			} else {
-				return h.applyAuthCacheEntry(w, r, entry, clientIP, upstreamTarget)
+				return authCheckExecution{entry: &entry}
 			}
 		}
 
@@ -3420,14 +3449,52 @@ func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig m
 		})
 
 		execution, _ := executionAny.(authCheckExecution)
-		if execution.entry != nil {
-			return h.applyAuthCacheEntry(w, r, *execution.entry, clientIP, upstreamTarget)
-		}
-		return h.applyAuthCheckPlan(w, r, execution.plan, clientIP, upstreamTarget)
+		return execution
 	}
 
 	plan := h.performAuthCheck(r, authConfig, clientIP, accessMode)
-	return h.applyAuthCheckPlan(w, r, plan, clientIP, upstreamTarget)
+	return authCheckExecution{plan: plan}
+}
+
+func (h *Handler) applyToolbarAuthCacheEntry(w http.ResponseWriter, r *http.Request, entry authCacheEntry, clientIP string) authCheckResult {
+	for _, setCookie := range entry.setCookies {
+		w.Header().Add("Set-Cookie", setCookie)
+	}
+	if entry.result.allowed && entry.result.authenticated {
+		h.markLoggedInActive(r, clientIP, time.Now())
+		return entry.result
+	}
+	return authCheckResult{allowed: true, decision: "not_required"}
+}
+
+func (h *Handler) applyToolbarAuthCheckPlan(w http.ResponseWriter, r *http.Request, plan authCheckPlan, clientIP string) authCheckResult {
+	for _, setCookie := range plan.setCookies {
+		w.Header().Add("Set-Cookie", setCookie)
+	}
+	if len(plan.setCookies) > 0 {
+		h.authCacheInvalidateForSetCookieMutation(r, clientIP, plan.setCookies)
+	}
+	if plan.result.allowed && plan.result.authenticated {
+		h.markLoggedInActive(r, clientIP, time.Now())
+		return plan.result
+	}
+	return authCheckResult{allowed: true, decision: "not_required"}
+}
+
+func (h *Handler) checkAuthForToolbar(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string) authCheckResult {
+	execution := h.executeAuthCheck(r, authConfig, clientIP, "")
+	if execution.entry != nil {
+		return h.applyToolbarAuthCacheEntry(w, r, *execution.entry, clientIP)
+	}
+	return h.applyToolbarAuthCheckPlan(w, r, execution.plan, clientIP)
+}
+
+func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string) authCheckResult {
+	execution := h.executeAuthCheck(r, authConfig, clientIP, accessMode)
+	if execution.entry != nil {
+		return h.applyAuthCacheEntry(w, r, *execution.entry, clientIP, upstreamTarget)
+	}
+	return h.applyAuthCheckPlan(w, r, execution.plan, clientIP, upstreamTarget)
 }
 
 func singleJoiningSlash(a, b string) string {
