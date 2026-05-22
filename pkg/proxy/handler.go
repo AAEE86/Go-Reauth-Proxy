@@ -74,6 +74,7 @@ type Handler struct {
 	preflightCache             preflightStateCache
 	reverseProxyThrottle       *reverseProxyThrottle
 	reverseProxyThrottleExempt *reverseProxyThrottleExemptIPsRuntime
+	commonLocationExemptions   *commonLocationExemptionsRuntime
 	gatewayVisibility          *gatewayVisibility
 	forwardedHeaders           *forwardedHeadersConfig
 	preserveHost               *preserveHostConfig
@@ -620,6 +621,14 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 			IPs:       []string{},
 			CIDRs:     []string{},
 			UpdatedAt: "",
+		},
+	)
+	h.commonLocationExemptions = newCommonLocationExemptionsRuntime(
+		models.CommonLocationExemptionsRuntime{
+			Enabled:    false,
+			WAFEnabled: false,
+			CIDRs:      []string{},
+			UpdatedAt:  "",
 		},
 	)
 	visibility, err := newGatewayVisibility(initialCfg.Visibility)
@@ -1670,6 +1679,37 @@ func (h *Handler) SetReverseProxyThrottleExemptIPs(cfg models.ReverseProxyThrott
 	runtime.updateConfig(cfg)
 }
 
+func (h *Handler) GetCommonLocationExemptions() models.CommonLocationExemptionsRuntime {
+	h.mu.RLock()
+	runtime := h.commonLocationExemptions
+	h.mu.RUnlock()
+
+	if runtime == nil {
+		return models.CommonLocationExemptionsRuntime{
+			Enabled:    false,
+			WAFEnabled: false,
+			CIDRs:      []string{},
+			UpdatedAt:  "",
+		}
+	}
+
+	return runtime.getConfig()
+}
+
+func (h *Handler) SetCommonLocationExemptions(cfg models.CommonLocationExemptionsRuntime) {
+	h.mu.Lock()
+	runtime := h.commonLocationExemptions
+	if runtime == nil {
+		runtime = newCommonLocationExemptionsRuntime(
+			models.CommonLocationExemptionsRuntime{},
+		)
+		h.commonLocationExemptions = runtime
+	}
+	h.mu.Unlock()
+
+	runtime.updateConfig(cfg)
+}
+
 type TrafficStats struct {
 	TotalIn     uint64             `json:"total_in"`
 	TotalOut    uint64             `json:"total_out"`
@@ -2377,7 +2417,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wafRouteType, wafRouteKey, wafUpstream := wafRouteContext(r, snapshot, isAuthRoute, matchedHostRule, matchedRule)
-	if h.wafRuntime != nil {
+	h.mu.RLock()
+	commonLocationExemptions := h.commonLocationExemptions
+	h.mu.RUnlock()
+	wafBypassedByCommonLocation := commonLocationExemptions != nil && commonLocationExemptions.shouldBypassWAF(clientIP)
+	if h.wafRuntime != nil && !wafBypassedByCommonLocation {
 		decision := h.wafRuntime.Evaluate(r, proxywaf.EvaluateContext{
 			ClientIP:   clientIP,
 			RouteType:  wafRouteType,

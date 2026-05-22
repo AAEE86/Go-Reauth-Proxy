@@ -55,6 +55,7 @@ type authConfigPatch struct {
 }
 
 type reverseProxyThrottleExemptIPsRuntimeResponse = models.ReverseProxyThrottleExemptIPsRuntime
+type commonLocationExemptionsRuntimeResponse = models.CommonLocationExemptionsRuntime
 
 func NewServer(handler *proxy.Handler, port int, cfgManager *config.Manager, initialCfg *config.AppConfig, streamManager *stream.Manager) *Server {
 	iptablesChainName := "REAUTH_FW"
@@ -108,6 +109,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/fnos-port-icon-hijack", s.handleSetFnosPortIconHijackConfig).Methods("POST")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleGetReverseProxyThrottleExemptIPs).Methods("GET")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleSetReverseProxyThrottleExemptIPs).Methods("POST")
+	r.HandleFunc("/api/runtime/common-location-exemptions", s.handleGetCommonLocationExemptions).Methods("GET")
+	r.HandleFunc("/api/runtime/common-location-exemptions", s.handleSetCommonLocationExemptions).Methods("POST")
 	r.HandleFunc("/api/auth", s.handleGetAuth).Methods("GET")
 	r.HandleFunc("/api/auth", s.handleSetAuth).Methods("POST")
 	r.HandleFunc("/api/logging", s.handleGetLoggingConfig).Methods("GET")
@@ -678,6 +681,21 @@ func (s *Server) handleSetReverseProxyThrottleExemptIPs(w http.ResponseWriter, r
 
 	s.ProxyHandler.SetReverseProxyThrottleExemptIPs(req)
 	response.Success(w, s.ProxyHandler.GetReverseProxyThrottleExemptIPs())
+}
+
+func (s *Server) handleGetCommonLocationExemptions(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetCommonLocationExemptions())
+}
+
+func (s *Server) handleSetCommonLocationExemptions(w http.ResponseWriter, r *http.Request) {
+	var req commonLocationExemptionsRuntimeResponse
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	s.ProxyHandler.SetCommonLocationExemptions(req)
+	response.Success(w, s.ProxyHandler.GetCommonLocationExemptions())
 }
 
 // handleGetAuth gets the global auth configuration (port and relative urls)

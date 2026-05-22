@@ -146,6 +146,13 @@ type ReverseProxyThrottleExemptIPsRuntime struct {
 	UpdatedAt string   `json:"updated_at,omitempty"`
 }
 
+type CommonLocationExemptionsRuntime struct {
+	Enabled    bool     `json:"enabled,omitempty"`
+	WAFEnabled bool     `json:"waf_enabled,omitempty"`
+	CIDRs      []string `json:"cidrs,omitempty"`
+	UpdatedAt  string   `json:"updated_at,omitempty"`
+}
+
 type PortConfig struct {
 	Port  int    `json:"port"`
 	Rules []Rule `json:"rules"`
