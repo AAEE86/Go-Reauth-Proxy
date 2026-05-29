@@ -58,10 +58,10 @@ type Handler struct {
 	sslConfig         models.SSLConfig
 	gatewayLogManager *gatewaylog.Manager
 
-	trafficTotalIn  uint64
-	trafficTotalOut uint64
-	trafficActive   int64
-	trafficError5xx uint64
+	trafficTotalIn  atomic.Uint64
+	trafficTotalOut atomic.Uint64
+	trafficActive   atomic.Int64
+	trafficError5xx atomic.Uint64
 	trafficByHost   sync.Map
 
 	fnAppMockService           *fnAppMockService
@@ -69,7 +69,7 @@ type Handler struct {
 	preflightClient            *http.Client
 	authClient                 *http.Client
 	proxyTransport             *http.Transport
-	preflightSkipUntilUnixNano int64
+	preflightSkipUntilUnixNano atomic.Int64
 	authCache                  authStateCache
 	preflightCache             preflightStateCache
 	reverseProxyThrottle       *reverseProxyThrottle
@@ -443,7 +443,7 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 			}
 		}
 	}
-	if skipUntil := atomic.LoadInt64(&h.preflightSkipUntilUnixNano); skipUntil > now.UnixNano() {
+	if skipUntil := h.preflightSkipUntilUnixNano.Load(); skipUntil > now.UnixNano() {
 		return preflightDecision{}
 	}
 
@@ -462,11 +462,11 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 			decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
 			if err != nil {
 				cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
-				atomic.StoreInt64(&h.preflightSkipUntilUnixNano, cooldownUntil)
+				h.preflightSkipUntilUnixNano.Store(cooldownUntil)
 				log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
 				return preflightCacheExecution{}, nil
 			}
-			atomic.StoreInt64(&h.preflightSkipUntilUnixNano, 0)
+			h.preflightSkipUntilUnixNano.Store(0)
 
 			entry := preflightCacheEntry{
 				decision:    decision,
@@ -489,11 +489,11 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
 	if err != nil {
 		cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
-		atomic.StoreInt64(&h.preflightSkipUntilUnixNano, cooldownUntil)
+		h.preflightSkipUntilUnixNano.Store(cooldownUntil)
 		log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
 		return preflightDecision{}
 	}
-	atomic.StoreInt64(&h.preflightSkipUntilUnixNano, 0)
+	h.preflightSkipUntilUnixNano.Store(0)
 	return decision
 }
 
@@ -1739,17 +1739,17 @@ type HostActiveIPsStats struct {
 }
 
 type hostTrafficCounters struct {
-	totalIn                     uint64
-	totalOut                    uint64
-	error5xx                    uint64
+	totalIn                     atomic.Uint64
+	totalOut                    atomic.Uint64
+	error5xx                    atomic.Uint64
 	activeIPs                   sync.Map
-	activeIPLastCleanupUnixNano int64
+	activeIPLastCleanupUnixNano atomic.Int64
 }
 
 type hostActiveIPRecord struct {
 	ip               string
-	lastSeenUnixNano int64
-	activeConns      int64
+	lastSeenUnixNano atomic.Int64
+	activeConns      atomic.Int64
 }
 
 func normalizeTrafficHost(host string) string {
@@ -1773,8 +1773,8 @@ func (c *hostTrafficCounters) cleanupActiveIPs(now time.Time) {
 			c.activeIPs.Delete(key)
 			return true
 		}
-		lastSeen := atomic.LoadInt64(&record.lastSeenUnixNano)
-		activeConns := atomic.LoadInt64(&record.activeConns)
+		lastSeen := record.lastSeenUnixNano.Load()
+		activeConns := record.activeConns.Load()
 		if activeConns <= 0 && lastSeen < cutoff {
 			c.activeIPs.Delete(key)
 		}
@@ -1787,11 +1787,11 @@ func (c *hostTrafficCounters) cleanupActiveIPsIfNeeded(now time.Time) {
 		return
 	}
 	nowUnixNano := now.UnixNano()
-	lastCleanup := atomic.LoadInt64(&c.activeIPLastCleanupUnixNano)
+	lastCleanup := c.activeIPLastCleanupUnixNano.Load()
 	if lastCleanup > 0 && nowUnixNano-lastCleanup < int64(hostActiveIPCleanupInterval) {
 		return
 	}
-	if !atomic.CompareAndSwapInt64(&c.activeIPLastCleanupUnixNano, lastCleanup, nowUnixNano) {
+	if !c.activeIPLastCleanupUnixNano.CompareAndSwap(lastCleanup, nowUnixNano) {
 		return
 	}
 	c.cleanupActiveIPs(now)
@@ -1813,13 +1813,13 @@ func (c *hostTrafficCounters) markActiveIP(clientIP string, now time.Time) func(
 		record = existing
 	}
 
-	atomic.StoreInt64(&record.lastSeenUnixNano, now.UnixNano())
-	atomic.AddInt64(&record.activeConns, 1)
+	record.lastSeenUnixNano.Store(now.UnixNano())
+	record.activeConns.Add(1)
 
 	return func() {
-		atomic.StoreInt64(&record.lastSeenUnixNano, time.Now().UnixNano())
-		if atomic.AddInt64(&record.activeConns, -1) < 0 {
-			atomic.StoreInt64(&record.activeConns, 0)
+		record.lastSeenUnixNano.Store(time.Now().UnixNano())
+		if record.activeConns.Add(-1) < 0 {
+			record.activeConns.Store(0)
 		}
 	}
 }
@@ -1838,8 +1838,8 @@ func (c *hostTrafficCounters) activeIPCount(now time.Time) int {
 			c.activeIPs.Delete(key)
 			return true
 		}
-		lastSeen := atomic.LoadInt64(&record.lastSeenUnixNano)
-		activeConns := atomic.LoadInt64(&record.activeConns)
+		lastSeen := record.lastSeenUnixNano.Load()
+		activeConns := record.activeConns.Load()
 		if activeConns <= 0 && lastSeen < cutoff {
 			c.activeIPs.Delete(key)
 			return true
@@ -1867,8 +1867,8 @@ func (c *hostTrafficCounters) activeIPStats(now time.Time) []HostActiveIPStats {
 			return true
 		}
 
-		lastSeen := atomic.LoadInt64(&record.lastSeenUnixNano)
-		activeConns := atomic.LoadInt64(&record.activeConns)
+		lastSeen := record.lastSeenUnixNano.Load()
+		activeConns := record.activeConns.Load()
 		if activeConns <= 0 && lastSeen < cutoff {
 			c.activeIPs.Delete(key)
 			return true
@@ -1964,9 +1964,9 @@ func (h *Handler) GetTrafficStats(timestamp time.Time) TrafficStats {
 		}
 		byHost = append(byHost, HostTrafficStats{
 			Host:          host,
-			TotalIn:       atomic.LoadUint64(&counters.totalIn),
-			TotalOut:      atomic.LoadUint64(&counters.totalOut),
-			Error5xx:      atomic.LoadUint64(&counters.error5xx),
+			TotalIn:       counters.totalIn.Load(),
+			TotalOut:      counters.totalOut.Load(),
+			Error5xx:      counters.error5xx.Load(),
 			ActiveIPCount: counters.activeIPCount(timestamp),
 		})
 		return true
@@ -1976,10 +1976,10 @@ func (h *Handler) GetTrafficStats(timestamp time.Time) TrafficStats {
 	})
 
 	return TrafficStats{
-		TotalIn:     atomic.LoadUint64(&h.trafficTotalIn),
-		TotalOut:    atomic.LoadUint64(&h.trafficTotalOut),
+		TotalIn:     h.trafficTotalIn.Load(),
+		TotalOut:    h.trafficTotalOut.Load(),
 		ActiveConns: h.activeLoggedInCount(timestamp),
-		Error5xx:    atomic.LoadUint64(&h.trafficError5xx),
+		Error5xx:    h.trafficError5xx.Load(),
 		ByHost:      byHost,
 	}
 }
@@ -2012,13 +2012,13 @@ func (h *Handler) GetHostActiveIPs(host string, timestamp time.Time) HostActiveI
 
 func (h *Handler) AddStreamTraffic(bytesIn, bytesOut uint64, status int) {
 	if bytesIn > 0 {
-		atomic.AddUint64(&h.trafficTotalIn, bytesIn)
+		h.trafficTotalIn.Add(bytesIn)
 	}
 	if bytesOut > 0 {
-		atomic.AddUint64(&h.trafficTotalOut, bytesOut)
+		h.trafficTotalOut.Add(bytesOut)
 	}
 	if status >= 500 {
-		atomic.AddUint64(&h.trafficError5xx, 1)
+		h.trafficError5xx.Add(1)
 	}
 }
 
@@ -2168,21 +2168,21 @@ func (m *requestTrafficMetrics) addIn(bytes uint64) {
 	if m == nil || bytes == 0 || m.hostTraffic == nil {
 		return
 	}
-	atomic.AddUint64(&m.hostTraffic.totalIn, bytes)
+	m.hostTraffic.totalIn.Add(bytes)
 }
 
 func (m *requestTrafficMetrics) addOut(bytes uint64) {
 	if m == nil || bytes == 0 || m.hostTraffic == nil {
 		return
 	}
-	atomic.AddUint64(&m.hostTraffic.totalOut, bytes)
+	m.hostTraffic.totalOut.Add(bytes)
 }
 
 func (m *requestTrafficMetrics) add5xx() {
 	if m == nil || m.hostTraffic == nil {
 		return
 	}
-	atomic.AddUint64(&m.hostTraffic.error5xx, 1)
+	m.hostTraffic.error5xx.Add(1)
 }
 
 type trafficReadCloser struct {
@@ -2195,7 +2195,7 @@ func (trc *trafficReadCloser) Read(p []byte) (int, error) {
 	n, err := trc.ReadCloser.Read(p)
 	if n > 0 {
 		trc.metrics.inBytes += uint64(n)
-		atomic.AddUint64(&trc.handler.trafficTotalIn, uint64(n))
+		trc.handler.trafficTotalIn.Add(uint64(n))
 		trc.metrics.addIn(uint64(n))
 	}
 	return n, err
@@ -2223,7 +2223,7 @@ func (tw *trafficResponseWriter) Write(p []byte) (int, error) {
 	n, err := tw.ResponseWriter.Write(p)
 	if n > 0 {
 		tw.metrics.outBytes += uint64(n)
-		atomic.AddUint64(&tw.handler.trafficTotalOut, uint64(n))
+		tw.handler.trafficTotalOut.Add(uint64(n))
 		tw.metrics.addOut(uint64(n))
 	}
 	return n, err
@@ -2277,7 +2277,7 @@ func wrapRequestBodyForTraffic(r *http.Request, h *Handler, metrics *requestTraf
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	atomic.AddInt64(&h.trafficActive, 1)
+	h.trafficActive.Add(1)
 	metrics := &requestTrafficMetrics{statusCode: http.StatusOK}
 	accessEntry := gatewaylog.Entry{
 		Method:          r.Method,
@@ -2305,9 +2305,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w = tw
 
 	defer func() {
-		atomic.AddInt64(&h.trafficActive, -1)
+		h.trafficActive.Add(-1)
 		if metrics.statusCode >= 500 {
-			atomic.AddUint64(&h.trafficError5xx, 1)
+			h.trafficError5xx.Add(1)
 			metrics.add5xx()
 		}
 		accessEntry.Path = r.URL.Path

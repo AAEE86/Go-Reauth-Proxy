@@ -19,7 +19,7 @@ import (
 	"go-reauth-proxy/pkg/models"
 )
 
-var traceFallbackCounter uint64
+var traceFallbackCounter atomic.Uint64
 
 type Runtime struct {
 	current         atomic.Value
@@ -517,7 +517,7 @@ func newTraceID() string {
 	var uuid [16]byte
 	if _, err := rand.Read(uuid[:]); err != nil {
 		binary.BigEndian.PutUint64(uuid[0:8], uint64(time.Now().UnixNano()))
-		binary.BigEndian.PutUint64(uuid[8:16], atomic.AddUint64(&traceFallbackCounter, 1))
+		binary.BigEndian.PutUint64(uuid[8:16], traceFallbackCounter.Add(1))
 	}
 	uuid[6] = (uuid[6] & 0x0f) | 0x40
 	uuid[8] = (uuid[8] & 0x3f) | 0x80
