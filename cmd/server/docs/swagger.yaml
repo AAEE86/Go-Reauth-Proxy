@@ -45,6 +45,15 @@ definitions:
         example: 192.168.1.100
         type: string
     type: object
+  iptables.tcpPortRuleRequest:
+    properties:
+      ip:
+        example: 192.168.1.100
+        type: string
+      port:
+        example: 22
+        type: integer
+    type: object
   iptables.tcpRedirectRequest:
     properties:
       listen_port:
@@ -58,10 +67,6 @@ definitions:
     properties:
       aliyun_esa_enabled:
         description: Enables Alibaba Cloud ESA client IP/header handling.
-        example: false
-        type: boolean
-      edge_client_ip_enabled:
-        description: Master switch for edge vendor client IP/header handling.
         example: false
         type: boolean
       auth_cache_ttl_seconds:
@@ -84,6 +89,10 @@ definitions:
         description: Relative Verify URL (default /api/auth/verify)
         example: /api/auth/verify
         type: string
+      edge_client_ip_enabled:
+        description: Master switch for edge vendor client IP/header handling.
+        example: false
+        type: boolean
       login_url:
         description: Relative Login URL (default /login)
         example: /login
@@ -110,7 +119,53 @@ definitions:
         example: false
         type: boolean
     type: object
+  models.BasicAuthConfig:
+    properties:
+      enabled:
+        example: true
+        type: boolean
+      password:
+        example: password
+        type: string
+      username:
+        example: admin
+        type: string
+    type: object
   models.ForwardedHeadersConfig:
+    properties:
+      enabled:
+        type: boolean
+      omit_targets:
+        items:
+          type: string
+        type: array
+      updated_at:
+        type: string
+    type: object
+  models.HostRule:
+    properties:
+      access_mode:
+        example: login_first
+        type: string
+      basic_auth:
+        $ref: '#/definitions/models.BasicAuthConfig'
+      host:
+        example: redis.example.com
+        type: string
+      preserve_host:
+        example: true
+        type: boolean
+      suppress_toolbar:
+        example: false
+        type: boolean
+      target:
+        example: http://127.0.0.1:5173
+        type: string
+      use_auth:
+        example: true
+        type: boolean
+    type: object
+  models.PreserveHostConfig:
     properties:
       enabled:
         type: boolean
@@ -221,8 +276,30 @@ definitions:
       enabled:
         type: boolean
     type: object
+  proxy.HostActiveIPStats:
+    properties:
+      active_conns:
+        type: integer
+      ip:
+        type: string
+      last_seen_at:
+        type: string
+    type: object
+  proxy.HostActiveIPsStats:
+    properties:
+      host:
+        type: string
+      items:
+        items:
+          $ref: '#/definitions/proxy.HostActiveIPStats'
+        type: array
+      window_seconds:
+        type: integer
+    type: object
   proxy.HostTrafficStats:
     properties:
+      active_ip_count:
+        type: integer
       error_5xx:
         type: integer
       host:
@@ -403,6 +480,54 @@ paths:
       summary: Set forwarded headers config
       tags:
       - config
+  /api/config/preserve-host:
+    get:
+      description: Get the current explicit preserve-host runtime configuration
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/models.PreserveHostConfig'
+              type: object
+      summary: Get preserve host config
+      tags:
+      - config
+    post:
+      consumes:
+      - application/json
+      description: Replace the explicit preserve-host runtime configuration
+      parameters:
+      - description: Preserve host config
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/models.PreserveHostConfig'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/models.PreserveHostConfig'
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Set preserve host config
+      tags:
+      - config
   /api/config/proxy-protocol:
     get:
       description: Get whether the proxy port requires Proxy Protocol header
@@ -451,6 +576,72 @@ paths:
       summary: Set proxy protocol force
       tags:
       - config
+  /api/host-rules:
+    delete:
+      description: Remove all exact-host reverse proxy rules
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Flush host rules
+      tags:
+      - host-rules
+    get:
+      description: Get all exact-host reverse proxy rules
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/models.HostRule'
+                  type: array
+              type: object
+      summary: Get host rules
+      tags:
+      - host-rules
+    post:
+      consumes:
+      - application/json
+      description: Replace all exact-host reverse proxy rules
+      parameters:
+      - description: List of host rules to set
+        in: body
+        name: rules
+        required: true
+        schema:
+          items:
+            $ref: '#/definitions/models.HostRule'
+          type: array
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/models.HostRule'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Set host rules
+      tags:
+      - host-rules
   /api/info:
     get:
       description: Get version and other server info
@@ -676,6 +867,67 @@ paths:
       summary: Remove IP rule
       tags:
       - iptables
+  /api/iptables/tcp-port/block:
+    post:
+      consumes:
+      - application/json
+      description: Add a DROP rule for a specific source IP and TCP destination port
+      parameters:
+      - description: IP and TCP destination port to block
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/iptables.tcpPortRuleRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Response'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Block TCP port for IP
+      tags:
+      - iptables
+  /api/iptables/tcp-port/remove:
+    post:
+      consumes:
+      - application/json
+      description: Remove an ACCEPT/DROP rule for a specific source IP and TCP destination
+        port
+      parameters:
+      - description: IP and TCP destination port rule to remove
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/iptables.tcpPortRuleRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/response.Response'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Remove TCP port rule for IP
+      tags:
+      - iptables
   /api/iptables/tcp-redirect:
     delete:
       consumes:
@@ -878,6 +1130,34 @@ paths:
                   $ref: '#/definitions/proxy.TrafficStats'
               type: object
       summary: Get traffic stats
+      tags:
+      - traffic
+  /api/traffic/active-ips:
+    get:
+      description: Get recently active client IPs for one proxy host mapping
+      parameters:
+      - description: Host mapping
+        in: query
+        name: host
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/proxy.HostActiveIPsStats'
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/response.Response'
+      summary: Get active IPs for host traffic
       tags:
       - traffic
 swagger: "2.0"

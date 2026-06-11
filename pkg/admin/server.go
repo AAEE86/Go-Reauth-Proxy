@@ -297,11 +297,28 @@ func (s *Server) handleFlushRules(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, nil)
 }
 
+// handleGetHostRules returns all exact-host proxy rules
+// @Summary Get host rules
+// @Description Get all exact-host reverse proxy rules
+// @Tags host-rules
+// @Produce  json
+// @Success 200 {object} response.Response{data=[]models.HostRule}
+// @Router /api/host-rules [get]
 func (s *Server) handleGetHostRules(w http.ResponseWriter, r *http.Request) {
 	rules := s.ProxyHandler.GetHostRules()
 	response.Success(w, rules)
 }
 
+// handleAddHostRule replaces all exact-host proxy rules
+// @Summary Set host rules
+// @Description Replace all exact-host reverse proxy rules
+// @Tags host-rules
+// @Accept  json
+// @Produce  json
+// @Param rules body []models.HostRule true "List of host rules to set"
+// @Success 200 {object} response.Response{data=[]models.HostRule}
+// @Failure 400 {object} response.Response
+// @Router /api/host-rules [post]
 func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -311,12 +328,13 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	type hostRuleRequest struct {
-		Host            string `json:"host"`
-		Target          string `json:"target"`
-		UseAuth         *bool  `json:"use_auth"`
-		AccessMode      string `json:"access_mode"`
-		SuppressToolbar *bool  `json:"suppress_toolbar"`
-		PreserveHost    *bool  `json:"preserve_host"`
+		Host            string                 `json:"host"`
+		Target          string                 `json:"target"`
+		UseAuth         *bool                  `json:"use_auth"`
+		AccessMode      string                 `json:"access_mode"`
+		SuppressToolbar *bool                  `json:"suppress_toolbar"`
+		PreserveHost    *bool                  `json:"preserve_host"`
+		BasicAuth       models.BasicAuthConfig `json:"basic_auth"`
 	}
 
 	var reqs []hostRuleRequest
@@ -334,6 +352,7 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 			AccessMode:      req.AccessMode,
 			SuppressToolbar: req.SuppressToolbar != nil && *req.SuppressToolbar,
 			PreserveHost:    req.PreserveHost == nil || *req.PreserveHost,
+			BasicAuth:       req.BasicAuth,
 		})
 	}
 
@@ -345,6 +364,13 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, s.ProxyHandler.GetHostRules())
 }
 
+// handleFlushHostRules clears all exact-host proxy rules
+// @Summary Flush host rules
+// @Description Remove all exact-host reverse proxy rules
+// @Tags host-rules
+// @Produce  json
+// @Success 200 {object} response.Response
+// @Router /api/host-rules [delete]
 func (s *Server) handleFlushHostRules(w http.ResponseWriter, r *http.Request) {
 	s.ProxyHandler.FlushHostRules()
 	response.Success(w, nil)

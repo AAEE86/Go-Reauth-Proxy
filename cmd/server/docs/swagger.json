@@ -235,6 +235,88 @@
                 }
             }
         },
+        "/api/config/preserve-host": {
+            "get": {
+                "description": "Get the current explicit preserve-host runtime configuration",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "config"
+                ],
+                "summary": "Get preserve host config",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/models.PreserveHostConfig"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Replace the explicit preserve-host runtime configuration",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "config"
+                ],
+                "summary": "Set preserve host config",
+                "parameters": [
+                    {
+                        "description": "Preserve host config",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/models.PreserveHostConfig"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/models.PreserveHostConfig"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
         "/api/config/proxy-protocol": {
             "get": {
                 "description": "Get whether the proxy port requires Proxy Protocol header",
@@ -310,6 +392,115 @@
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/host-rules": {
+            "get": {
+                "description": "Get all exact-host reverse proxy rules",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "host-rules"
+                ],
+                "summary": "Get host rules",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/definitions/models.HostRule"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Replace all exact-host reverse proxy rules",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "host-rules"
+                ],
+                "summary": "Set host rules",
+                "parameters": [
+                    {
+                        "description": "List of host rules to set",
+                        "name": "rules",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/models.HostRule"
+                            }
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/definitions/models.HostRule"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Remove all exact-host reverse proxy rules",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "host-rules"
+                ],
+                "summary": "Flush host rules",
+                "responses": {
+                    "200": {
+                        "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/response.Response"
                         }
@@ -671,6 +862,98 @@
                 }
             }
         },
+        "/api/iptables/tcp-port/block": {
+            "post": {
+                "description": "Add a DROP rule for a specific source IP and TCP destination port",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "iptables"
+                ],
+                "summary": "Block TCP port for IP",
+                "parameters": [
+                    {
+                        "description": "IP and TCP destination port to block",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/iptables.tcpPortRuleRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/iptables/tcp-port/remove": {
+            "post": {
+                "description": "Remove an ACCEPT/DROP rule for a specific source IP and TCP destination port",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "iptables"
+                ],
+                "summary": "Remove TCP port rule for IP",
+                "parameters": [
+                    {
+                        "description": "IP and TCP destination port rule to remove",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/iptables.tcpPortRuleRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
+        },
         "/api/iptables/tcp-redirect": {
             "post": {
                 "description": "Ensure a tcp REDIRECT rule exists in nat PREROUTING for both iptables and ip6tables",
@@ -989,6 +1272,53 @@
                     }
                 }
             }
+        },
+        "/api/traffic/active-ips": {
+            "get": {
+                "description": "Get recently active client IPs for one proxy host mapping",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "traffic"
+                ],
+                "summary": "Get active IPs for host traffic",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Host mapping",
+                        "name": "host",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/proxy.HostActiveIPsStats"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/response.Response"
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -1058,6 +1388,19 @@
                 }
             }
         },
+        "iptables.tcpPortRuleRequest": {
+            "type": "object",
+            "properties": {
+                "ip": {
+                    "type": "string",
+                    "example": "192.168.1.100"
+                },
+                "port": {
+                    "type": "integer",
+                    "example": 22
+                }
+            }
+        },
         "iptables.tcpRedirectRequest": {
             "type": "object",
             "properties": {
@@ -1076,11 +1419,6 @@
             "properties": {
                 "aliyun_esa_enabled": {
                     "description": "Enables Alibaba Cloud ESA client IP/header handling.",
-                    "type": "boolean",
-                    "example": false
-                },
-                "edge_client_ip_enabled": {
-                    "description": "Master switch for edge vendor client IP/header handling.",
                     "type": "boolean",
                     "example": false
                 },
@@ -1107,6 +1445,11 @@
                     "description": "Relative Verify URL (default /api/auth/verify)",
                     "type": "string",
                     "example": "/api/auth/verify"
+                },
+                "edge_client_ip_enabled": {
+                    "description": "Master switch for edge vendor client IP/header handling.",
+                    "type": "boolean",
+                    "example": false
                 },
                 "login_url": {
                     "description": "Relative Login URL (default /login)",
@@ -1142,7 +1485,73 @@
                 }
             }
         },
+        "models.BasicAuthConfig": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "password": {
+                    "type": "string",
+                    "example": "password"
+                },
+                "username": {
+                    "type": "string",
+                    "example": "admin"
+                }
+            }
+        },
         "models.ForwardedHeadersConfig": {
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean"
+                },
+                "omit_targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "models.HostRule": {
+            "type": "object",
+            "properties": {
+                "access_mode": {
+                    "type": "string",
+                    "example": "login_first"
+                },
+                "basic_auth": {
+                    "$ref": "#/definitions/models.BasicAuthConfig"
+                },
+                "host": {
+                    "type": "string",
+                    "example": "redis.example.com"
+                },
+                "preserve_host": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "suppress_toolbar": {
+                    "type": "boolean",
+                    "example": false
+                },
+                "target": {
+                    "type": "string",
+                    "example": "http://127.0.0.1:5173"
+                },
+                "use_auth": {
+                    "type": "boolean",
+                    "example": true
+                }
+            }
+        },
+        "models.PreserveHostConfig": {
             "type": "object",
             "properties": {
                 "enabled": {
@@ -1291,9 +1700,43 @@
                 }
             }
         },
+        "proxy.HostActiveIPStats": {
+            "type": "object",
+            "properties": {
+                "active_conns": {
+                    "type": "integer"
+                },
+                "ip": {
+                    "type": "string"
+                },
+                "last_seen_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "proxy.HostActiveIPsStats": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string"
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/proxy.HostActiveIPStats"
+                    }
+                },
+                "window_seconds": {
+                    "type": "integer"
+                }
+            }
+        },
         "proxy.HostTrafficStats": {
             "type": "object",
             "properties": {
+                "active_ip_count": {
+                    "type": "integer"
+                },
                 "error_5xx": {
                     "type": "integer"
                 },

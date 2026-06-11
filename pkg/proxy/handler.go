@@ -1181,8 +1181,46 @@ func (h *Handler) normalizeHostRule(newRule models.HostRule) (models.HostRule, e
 	if newRule.AccessMode == "" {
 		newRule.AccessMode = "login_first"
 	}
+	basicAuth, err := normalizeBasicAuthConfig(newRule.BasicAuth)
+	if err != nil {
+		return models.HostRule{}, err
+	}
+	newRule.BasicAuth = basicAuth
 
 	return newRule, nil
+}
+
+func normalizeBasicAuthConfig(cfg models.BasicAuthConfig) (models.BasicAuthConfig, error) {
+	if !cfg.Enabled {
+		return models.BasicAuthConfig{}, nil
+	}
+
+	username := strings.TrimSpace(cfg.Username)
+	if username == "" || cfg.Password == "" {
+		return models.BasicAuthConfig{}, fmt.Errorf("basic auth injection requires username and password")
+	}
+	if strings.Contains(username, ":") {
+		return models.BasicAuthConfig{}, fmt.Errorf("basic auth username cannot contain ':'")
+	}
+
+	return models.BasicAuthConfig{
+		Enabled:  true,
+		Username: username,
+		Password: cfg.Password,
+	}, nil
+}
+
+func applyBasicAuthInjection(out *http.Request, cfg models.BasicAuthConfig) {
+	if out == nil || !cfg.Enabled {
+		return
+	}
+
+	username := strings.TrimSpace(cfg.Username)
+	if username == "" || cfg.Password == "" || strings.Contains(username, ":") {
+		return
+	}
+
+	out.SetBasicAuth(username, cfg.Password)
 }
 
 func (h *Handler) AddHostRule(newRule models.HostRule) error {
@@ -2851,6 +2889,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, omitForwardedHeaders)
 			copyUserAgentHeader(pr.Out, pr.In)
 			pr.SetURL(targetURL)
+			applyBasicAuthInjection(pr.Out, matchedRule.BasicAuth)
 			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
 			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
@@ -2929,6 +2968,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		clientIP:             clientIP,
 		omitForwardedHeaders: omitForwardedHeaders,
 		preserveHost:         preserveHost,
+		basicAuth:            matchedRule.BasicAuth,
 		rewriteOriginReferer: !preserveHost,
 		stripPath:            false,
 		pathPrefix:           "",

@@ -33,6 +33,7 @@ type fnosPortIconHijackWebSocketOptions struct {
 	clientIP             string
 	omitForwardedHeaders bool
 	preserveHost         bool
+	basicAuth            models.BasicAuthConfig
 	rewriteOriginReferer bool
 	stripPath            bool
 	pathPrefix           string
@@ -227,6 +228,7 @@ func buildFnosPortIconHijackWebSocketHeader(r *http.Request, options fnosPortIco
 	copyUserAgentHeader(out, r)
 	applyUpstreamPrivateIPv4HintHeader(out, options.targetURL)
 	applyPreserveHostPolicy(out, r, options.targetURL, options.preserveHost)
+	applyBasicAuthInjection(out, options.basicAuth)
 
 	if options.rewriteOriginReferer {
 		if origin := r.Header.Get("Origin"); origin != "" {
