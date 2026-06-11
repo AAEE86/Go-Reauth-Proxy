@@ -17,6 +17,32 @@ type HostRule struct {
 	SuppressToolbar bool            `json:"suppress_toolbar,omitempty" example:"false"`
 	PreserveHost    bool            `json:"preserve_host,omitempty" example:"true"`
 	BasicAuth       BasicAuthConfig `json:"basic_auth,omitempty"`
+	Locations       []HostLocation  `json:"locations,omitempty"`
+}
+
+const (
+	HostLocationMatchExact  = "exact"
+	HostLocationMatchPrefix = "prefix"
+
+	HostLocationActionProxy    = "proxy"
+	HostLocationActionResponse = "response"
+)
+
+type HostLocation struct {
+	Path        string               `json:"path" example:"/api"`
+	Match       string               `json:"match,omitempty" example:"prefix"`
+	Action      string               `json:"action,omitempty" example:"proxy"`
+	Target      string               `json:"target,omitempty" example:"http://127.0.0.1:8080"`
+	StripPath   bool                 `json:"strip_path" example:"true"`
+	RewriteHTML bool                 `json:"rewrite_html" example:"true"`
+	Response    HostLocationResponse `json:"response,omitempty"`
+}
+
+type HostLocationResponse struct {
+	Status      int               `json:"status,omitempty" example:"200"`
+	ContentType string            `json:"content_type,omitempty" example:"text/plain; charset=utf-8"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Body        string            `json:"body,omitempty" example:"ok"`
 }
 
 type BasicAuthConfig struct {

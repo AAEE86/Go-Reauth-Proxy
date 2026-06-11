@@ -327,6 +327,15 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body.Close()
 
+	type hostLocationRequest struct {
+		Path        string                      `json:"path"`
+		Match       string                      `json:"match"`
+		Action      string                      `json:"action"`
+		Target      string                      `json:"target"`
+		StripPath   *bool                       `json:"strip_path"`
+		RewriteHTML *bool                       `json:"rewrite_html"`
+		Response    models.HostLocationResponse `json:"response"`
+	}
 	type hostRuleRequest struct {
 		Host            string                 `json:"host"`
 		Target          string                 `json:"target"`
@@ -335,6 +344,7 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 		SuppressToolbar *bool                  `json:"suppress_toolbar"`
 		PreserveHost    *bool                  `json:"preserve_host"`
 		BasicAuth       models.BasicAuthConfig `json:"basic_auth"`
+		Locations       []hostLocationRequest  `json:"locations"`
 	}
 
 	var reqs []hostRuleRequest
@@ -345,6 +355,27 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 
 	rules := make([]models.HostRule, 0, len(reqs))
 	for _, req := range reqs {
+		locations := make([]models.HostLocation, 0, len(req.Locations))
+		for _, locationReq := range req.Locations {
+			stripPath := true
+			if locationReq.StripPath != nil {
+				stripPath = *locationReq.StripPath
+			}
+			rewriteHTML := true
+			if locationReq.RewriteHTML != nil {
+				rewriteHTML = *locationReq.RewriteHTML
+			}
+			locations = append(locations, models.HostLocation{
+				Path:        locationReq.Path,
+				Match:       locationReq.Match,
+				Action:      locationReq.Action,
+				Target:      locationReq.Target,
+				StripPath:   stripPath,
+				RewriteHTML: rewriteHTML,
+				Response:    locationReq.Response,
+			})
+		}
+
 		rules = append(rules, models.HostRule{
 			Host:            req.Host,
 			Target:          req.Target,
@@ -353,6 +384,7 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 			SuppressToolbar: req.SuppressToolbar != nil && *req.SuppressToolbar,
 			PreserveHost:    req.PreserveHost == nil || *req.PreserveHost,
 			BasicAuth:       req.BasicAuth,
+			Locations:       locations,
 		})
 	}
 

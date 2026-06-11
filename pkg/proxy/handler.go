@@ -30,6 +30,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 type Handler struct {
@@ -139,7 +141,7 @@ func (h *Handler) buildRequestSnapshotLocked() *requestSnapshot {
 		rulesByPath[rule.Path] = rule
 	}
 
-	hostRules := append([]models.HostRule(nil), h.HostRules...)
+	hostRules := copyHostRules(h.HostRules)
 	hostRulesByHost := make(map[string]models.HostRule, len(hostRules))
 	for _, rule := range hostRules {
 		host := normalizeRequestHost(rule.Host)
@@ -215,7 +217,49 @@ func copyRule(rule models.Rule) *models.Rule {
 
 func copyHostRule(rule models.HostRule) *models.HostRule {
 	r := rule
+	r.Locations = copyHostLocations(rule.Locations)
 	return &r
+}
+
+func copyHostLocation(location models.HostLocation) *models.HostLocation {
+	loc := location
+	loc.Response.Headers = copyStringMap(location.Response.Headers)
+	return &loc
+}
+
+func copyHostLocations(locations []models.HostLocation) []models.HostLocation {
+	if locations == nil {
+		return nil
+	}
+	copied := make([]models.HostLocation, len(locations))
+	for i, location := range locations {
+		copied[i] = location
+		copied[i].Response.Headers = copyStringMap(location.Response.Headers)
+	}
+	return copied
+}
+
+func copyHostRules(rules []models.HostRule) []models.HostRule {
+	if rules == nil {
+		return nil
+	}
+	copied := make([]models.HostRule, len(rules))
+	for i, rule := range rules {
+		copied[i] = rule
+		copied[i].Locations = copyHostLocations(rule.Locations)
+	}
+	return copied
+}
+
+func copyStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	copied := make(map[string]string, len(values))
+	for key, value := range values {
+		copied[key] = value
+	}
+	return copied
 }
 
 func copyStreamRule(rule models.StreamRule) *models.StreamRule {
@@ -580,7 +624,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 
 	h := &Handler{
 		Rules:                initialCfg.Rules,
-		HostRules:            initialCfg.HostRules,
+		HostRules:            copyHostRules(initialCfg.HostRules),
 		StreamRules:          initialCfg.StreamRules,
 		DefaultRoute:         initialCfg.DefaultRoute,
 		AuthConfig:           initialCfg.AuthConfig,
@@ -706,8 +750,7 @@ func (h *Handler) saveConfigLocked() {
 
 	rulesCopy := make([]models.Rule, len(h.Rules))
 	copy(rulesCopy, h.Rules)
-	hostRulesCopy := make([]models.HostRule, len(h.HostRules))
-	copy(hostRulesCopy, h.HostRules)
+	hostRulesCopy := copyHostRules(h.HostRules)
 	streamRulesCopy := make([]models.StreamRule, len(h.StreamRules))
 	copy(streamRulesCopy, h.StreamRules)
 
@@ -752,7 +795,7 @@ func (h *Handler) SetProxyProtocolForce(force bool) {
 	}
 }
 
-func (h *Handler) evaluateReverseProxyThrottleRequest(isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule, clientIP string, now time.Time) reverseProxyThrottleDecision {
+func (h *Handler) evaluateReverseProxyThrottleRequest(isAuthRoute bool, matchedHostRule *models.HostRule, matchedHostLocation *models.HostLocation, matchedRule *models.Rule, clientIP string, now time.Time) reverseProxyThrottleDecision {
 	if !isAuthRoute && matchedHostRule == nil && matchedRule == nil {
 		return reverseProxyThrottleDecision{Allowed: true}
 	}
@@ -768,12 +811,14 @@ func (h *Handler) evaluateReverseProxyThrottleRequest(isAuthRoute bool, matchedH
 	return h.reverseProxyThrottle.evaluate(clientIP, now)
 }
 
-func classifyReverseProxyRouteType(requestPath string, isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule) string {
+func classifyReverseProxyRouteType(requestPath string, isAuthRoute bool, matchedHostRule *models.HostRule, matchedHostLocation *models.HostLocation, matchedRule *models.Rule) string {
 	switch {
 	case isAuthRoute:
 		return "auth_proxy"
 	case requestPath == "/__select__":
 		return "select"
+	case matchedHostRule != nil && matchedHostLocation != nil:
+		return "host_location"
 	case matchedHostRule != nil:
 		return "host_rule"
 	case matchedRule != nil:
@@ -783,12 +828,12 @@ func classifyReverseProxyRouteType(requestPath string, isAuthRoute bool, matched
 	}
 }
 
-func wafRouteContext(r *http.Request, snapshot requestSnapshot, isAuthRoute bool, matchedHostRule *models.HostRule, matchedRule *models.Rule) (string, string, string) {
+func wafRouteContext(r *http.Request, snapshot requestSnapshot, isAuthRoute bool, matchedHostRule *models.HostRule, matchedHostLocation *models.HostLocation, matchedRule *models.Rule) (string, string, string) {
 	requestPath := ""
 	if r != nil && r.URL != nil {
 		requestPath = r.URL.Path
 	}
-	routeType := classifyReverseProxyRouteType(requestPath, isAuthRoute, matchedHostRule, matchedRule)
+	routeType := classifyReverseProxyRouteType(requestPath, isAuthRoute, matchedHostRule, matchedHostLocation, matchedRule)
 	switch {
 	case isAuthRoute:
 		upstream := ""
@@ -798,6 +843,12 @@ func wafRouteContext(r *http.Request, snapshot requestSnapshot, isAuthRoute bool
 		return routeType, requestPath, upstream
 	case requestPath == "/__select__":
 		return routeType, requestPath, ""
+	case matchedHostRule != nil && matchedHostLocation != nil:
+		upstream := ""
+		if matchedHostLocation.Action == models.HostLocationActionProxy {
+			upstream = matchedHostLocation.Target
+		}
+		return routeType, hostLocationRouteKey(matchedHostRule, matchedHostLocation), upstream
 	case matchedHostRule != nil:
 		return routeType, matchedHostRule.Host, matchedHostRule.Target
 	case matchedRule != nil:
@@ -1164,6 +1215,148 @@ func (h *Handler) GetRules() []models.Rule {
 	return rules
 }
 
+func hostLocationMapKey(location models.HostLocation) string {
+	return location.Match + "\x00" + location.Path
+}
+
+func hostLocationRouteKey(hostRule *models.HostRule, location *models.HostLocation) string {
+	host := ""
+	locationPath := ""
+	if hostRule != nil {
+		host = hostRule.Host
+	}
+	if location != nil {
+		locationPath = location.Path
+	}
+	if host == "" {
+		return locationPath
+	}
+	if locationPath == "" {
+		return host
+	}
+	return host + " " + locationPath
+}
+
+func normalizeHostLocationResponseHeaders(headers map[string]string) (map[string]string, error) {
+	if len(headers) == 0 {
+		return map[string]string{}, nil
+	}
+
+	normalized := make(map[string]string, len(headers))
+	for rawName, value := range headers {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			return nil, fmt.Errorf("response header name cannot be empty")
+		}
+		if !httpguts.ValidHeaderFieldName(name) {
+			return nil, fmt.Errorf("invalid response header name %q", rawName)
+		}
+		switch strings.ToLower(name) {
+		case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+			"proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+			"content-type":
+			return nil, fmt.Errorf("response header %q is not configurable", name)
+		}
+		normalized[http.CanonicalHeaderKey(name)] = value
+	}
+
+	return normalized, nil
+}
+
+func (h *Handler) normalizeHostLocation(location models.HostLocation) (models.HostLocation, error) {
+	rawPath := strings.TrimSpace(location.Path)
+	if rawPath == "" {
+		return models.HostLocation{}, fmt.Errorf("host location path is required")
+	}
+	if !strings.HasPrefix(rawPath, "/") {
+		return models.HostLocation{}, fmt.Errorf("host location path must start with '/'")
+	}
+	location.Path = path.Clean(rawPath)
+	if location.Path == "/" {
+		return models.HostLocation{}, fmt.Errorf("host location path '/' is not allowed")
+	}
+	if location.Path == "/s" || location.Path == "/s/" {
+		return models.HostLocation{}, fmt.Errorf("host location path cannot use reserved share path %q", location.Path)
+	}
+	if strings.HasPrefix(location.Path, "/__") {
+		return models.HostLocation{}, fmt.Errorf("host location path cannot start with reserved prefix '/__'")
+	}
+
+	switch strings.TrimSpace(strings.ToLower(location.Match)) {
+	case "", models.HostLocationMatchPrefix:
+		location.Match = models.HostLocationMatchPrefix
+	case models.HostLocationMatchExact:
+		location.Match = models.HostLocationMatchExact
+	default:
+		return models.HostLocation{}, fmt.Errorf("host location match must be exact or prefix")
+	}
+
+	switch strings.TrimSpace(strings.ToLower(location.Action)) {
+	case "", models.HostLocationActionProxy:
+		location.Action = models.HostLocationActionProxy
+	case models.HostLocationActionResponse:
+		location.Action = models.HostLocationActionResponse
+	default:
+		return models.HostLocation{}, fmt.Errorf("host location action must be proxy or response")
+	}
+
+	switch location.Action {
+	case models.HostLocationActionProxy:
+		location.Target = strings.TrimSpace(location.Target)
+		if location.Target == "" {
+			return models.HostLocation{}, fmt.Errorf("host location %s requires target", location.Path)
+		}
+		if err := h.checkSafeTarget(location.Target); err != nil {
+			return models.HostLocation{}, fmt.Errorf("invalid location target for %s: %v", location.Path, err)
+		}
+		location.Response = models.HostLocationResponse{}
+	case models.HostLocationActionResponse:
+		location.Target = ""
+		if location.Response.Status == 0 {
+			location.Response.Status = http.StatusOK
+		}
+		if location.Response.Status < 100 || location.Response.Status > 599 {
+			return models.HostLocation{}, fmt.Errorf("host location response status for %s must be between 100 and 599", location.Path)
+		}
+		location.Response.ContentType = strings.TrimSpace(location.Response.ContentType)
+		if location.Response.ContentType == "" {
+			location.Response.ContentType = "text/plain; charset=utf-8"
+		}
+		headers, err := normalizeHostLocationResponseHeaders(location.Response.Headers)
+		if err != nil {
+			return models.HostLocation{}, fmt.Errorf("invalid response headers for %s: %v", location.Path, err)
+		}
+		location.Response.Headers = headers
+		location.StripPath = false
+		location.RewriteHTML = false
+	}
+
+	return location, nil
+}
+
+func (h *Handler) normalizeHostLocations(locations []models.HostLocation) ([]models.HostLocation, error) {
+	if len(locations) == 0 {
+		return nil, nil
+	}
+
+	normalized := make([]models.HostLocation, 0, len(locations))
+	seen := make(map[string]struct{}, len(locations))
+	for _, location := range locations {
+		nextLocation, err := h.normalizeHostLocation(location)
+		if err != nil {
+			return nil, err
+		}
+		key := hostLocationMapKey(nextLocation)
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("duplicate host location %s %s", nextLocation.Match, nextLocation.Path)
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, nextLocation)
+	}
+
+	return normalized, nil
+}
+
 func (h *Handler) normalizeHostRule(newRule models.HostRule) (models.HostRule, error) {
 	newRule.Host = normalizeRequestHost(newRule.Host)
 	if newRule.Host == "" {
@@ -1186,6 +1379,11 @@ func (h *Handler) normalizeHostRule(newRule models.HostRule) (models.HostRule, e
 		return models.HostRule{}, err
 	}
 	newRule.BasicAuth = basicAuth
+	locations, err := h.normalizeHostLocations(newRule.Locations)
+	if err != nil {
+		return models.HostRule{}, err
+	}
+	newRule.Locations = locations
 
 	return newRule, nil
 }
@@ -1292,9 +1490,7 @@ func (h *Handler) GetHostRules() []models.HostRule {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	rules := make([]models.HostRule, len(h.HostRules))
-	copy(rules, h.HostRules)
-	return rules
+	return copyHostRules(h.HostRules)
 }
 
 func (h *Handler) ValidateStreamRules(rules []models.StreamRule) ([]models.StreamRule, error) {
@@ -2400,6 +2596,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isSelectRoute := r.URL.Path == "/__select__"
 	isAuthRoute := strings.HasPrefix(r.URL.Path, "/__auth__/")
 	matchedHostRule := matchHostRule(r, snapshot)
+	matchedHostLocation := matchHostLocation(r, matchedHostRule)
 	if matchedHostRule != nil {
 		metrics.bindHost(h, matchedHostRule.Host)
 		if releaseHostActiveIP := metrics.markActiveIP(clientIP, time.Now()); releaseHostActiveIP != nil {
@@ -2424,6 +2621,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	throttleDecision := h.evaluateReverseProxyThrottleRequest(
 		isAuthRoute,
 		matchedHostRule,
+		matchedHostLocation,
 		matchedRule,
 		clientIP,
 		throttleCheckedAt,
@@ -2443,7 +2641,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ClientIP:     clientIP,
 				BlockedUntil: throttleDecision.BlockedUntil,
 				Config:       throttleDecision.Config,
-				RouteType:    classifyReverseProxyRouteType(r.URL.Path, isAuthRoute, matchedHostRule, matchedRule),
+				RouteType:    classifyReverseProxyRouteType(r.URL.Path, isAuthRoute, matchedHostRule, matchedHostLocation, matchedRule),
 				Host:         r.Host,
 				RequestPath:  r.URL.Path,
 				IsAuthRoute:  isAuthRoute,
@@ -2454,7 +2652,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.abortConnection(w)
 		return
 	}
-	wafRouteType, wafRouteKey, wafUpstream := wafRouteContext(r, snapshot, isAuthRoute, matchedHostRule, matchedRule)
+	wafRouteType, wafRouteKey, wafUpstream := wafRouteContext(r, snapshot, isAuthRoute, matchedHostRule, matchedHostLocation, matchedRule)
 	h.mu.RLock()
 	commonLocationExemptions := h.commonLocationExemptions
 	h.mu.RUnlock()
@@ -2542,10 +2740,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.RouteType = "host_rule"
 		accessEntry.RouteKey = matchedHostRule.Host
 		accessEntry.Upstream = matchedHostRule.Target
+		authUpstreamTarget := matchedHostRule.Target
+		if matchedHostLocation != nil {
+			accessEntry.RouteType = "host_location"
+			accessEntry.RouteKey = hostLocationRouteKey(matchedHostRule, matchedHostLocation)
+			if matchedHostLocation.Action == models.HostLocationActionProxy {
+				accessEntry.Upstream = matchedHostLocation.Target
+				authUpstreamTarget = matchedHostLocation.Target
+			} else {
+				accessEntry.Upstream = ""
+			}
+		}
 		accessEntry.AuthRequired = matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != ""
 		authResult := authCheckResult{allowed: true, decision: "not_required"}
 		if accessEntry.AuthRequired {
-			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode, matchedHostRule.Target)
+			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode, authUpstreamTarget)
 			accessEntry.LoggedIn = authResult.authenticated
 			accessEntry.AuthDecision = authResult.decision
 			if !authResult.allowed {
@@ -2561,6 +2770,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			accessEntry.AuthDecision = authResult.decision
 		}
 		accessEntry.LoggedIn = authResult.authenticated
+		if matchedHostLocation != nil {
+			switch matchedHostLocation.Action {
+			case models.HostLocationActionResponse:
+				serveHostLocationResponse(w, *matchedHostLocation)
+			case models.HostLocationActionProxy:
+				h.proxyToHostLocationTarget(w, r, snapshot, *matchedHostRule, *matchedHostLocation, clientIP, authResult)
+			default:
+				response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid host location configuration", snapshot.rules)
+			}
+			return
+		}
 		h.proxyToHostTarget(w, r, snapshot, *matchedHostRule, clientIP, authResult)
 		return
 	}
@@ -2771,6 +2991,34 @@ func matchHostRule(r *http.Request, snapshot requestSnapshot) *models.HostRule {
 	return nil
 }
 
+func matchHostLocation(r *http.Request, hostRule *models.HostRule) *models.HostLocation {
+	if r == nil || r.URL == nil || hostRule == nil || len(hostRule.Locations) == 0 {
+		return nil
+	}
+
+	requestPath := r.URL.Path
+	var matchedPrefix *models.HostLocation
+	longestPrefix := -1
+	for _, location := range hostRule.Locations {
+		if location.Path == "" {
+			continue
+		}
+		switch location.Match {
+		case models.HostLocationMatchExact:
+			if requestPath == location.Path {
+				return copyHostLocation(location)
+			}
+		case models.HostLocationMatchPrefix:
+			if strings.HasPrefix(requestPath, location.Path) && len(location.Path) > longestPrefix {
+				matchedPrefix = copyHostLocation(location)
+				longestPrefix = len(location.Path)
+			}
+		}
+	}
+
+	return matchedPrefix
+}
+
 func matchRule(r *http.Request, snapshot requestSnapshot) (*models.Rule, string) {
 	var matchedRule *models.Rule
 	var longestMatch int
@@ -2858,6 +3106,174 @@ func (h *Handler) handleNoMatchRoute(w http.ResponseWriter, r *http.Request, sna
 		}
 	}
 	response.RouteNotFound(w, r, snapshot.rules)
+}
+
+func serveHostLocationResponse(w http.ResponseWriter, location models.HostLocation) {
+	for name, value := range location.Response.Headers {
+		w.Header().Set(name, value)
+	}
+	contentType := strings.TrimSpace(location.Response.ContentType)
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
+	}
+	status := location.Response.Status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, location.Response.Body)
+}
+
+func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, location models.HostLocation, clientIP string, authResult authCheckResult) {
+	targetURL, err := url.Parse(location.Target)
+	if err != nil {
+		response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
+		return
+	}
+
+	switch targetURL.Scheme {
+	case "ws":
+		targetURL.Scheme = "http"
+	case "wss":
+		targetURL.Scheme = "https"
+	}
+
+	transport := h.proxyTransport
+	if transport == nil {
+		transport = newProxyTransport()
+	}
+	omitForwardedHeaders := h.shouldOmitForwardedHeaders(targetURL)
+	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
+	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
+
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, omitForwardedHeaders)
+			copyUserAgentHeader(pr.Out, pr.In)
+			pr.SetURL(targetURL)
+			applyBasicAuthInjection(pr.Out, matchedRule.BasicAuth)
+			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
+			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
+			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
+
+			if location.StripPath {
+				pr.Out.URL.Path = strings.TrimPrefix(pr.Out.URL.Path, location.Path)
+				if !strings.HasPrefix(pr.Out.URL.Path, "/") {
+					pr.Out.URL.Path = "/" + pr.Out.URL.Path
+				}
+				pr.Out.URL.RawPath = ""
+			}
+
+			if !preserveHost {
+				if origin := pr.In.Header.Get("Origin"); origin != "" {
+					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+				}
+				if referer := pr.In.Header.Get("Referer"); referer != "" {
+					ref, err := url.Parse(referer)
+					if err == nil {
+						ref.Scheme = targetURL.Scheme
+						ref.Host = targetURL.Host
+						ref.Path = path.Clean(ref.Path)
+						if location.StripPath {
+							ref.Path = strings.TrimPrefix(ref.Path, location.Path)
+							if !strings.HasPrefix(ref.Path, "/") {
+								ref.Path = "/" + ref.Path
+							}
+						}
+						ref.RawPath = ""
+						pr.Out.Header.Set("Referer", ref.String())
+					}
+				}
+			}
+
+			if location.RewriteHTML || (authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA) {
+				pr.Out.Header.Del("Accept-Encoding")
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("Host location proxy error: %v", err)
+			response.HTML(w, r, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
+		},
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if isAuthHostProxy && shouldDisableAuthResponseCaching(r.URL.Path) {
+			applyNoStoreCacheHeaders(resp.Header)
+		}
+		if isAuthHostProxy {
+			h.authCacheInvalidateForSetCookieMutation(r, clientIP, resp.Header.Values("Set-Cookie"))
+		}
+		if err := h.maybeRewriteFnosPortIconHijackHTTPResponse(resp, snapshot.hostRules); err != nil {
+			return err
+		}
+
+		needsRewrite := location.RewriteHTML
+		needsToolbar := authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		if !needsRewrite && !needsToolbar {
+			return nil
+		}
+
+		if needsRewrite {
+			if locationHeader := resp.Header.Get("Location"); locationHeader != "" {
+				if strings.HasPrefix(locationHeader, "/") {
+					resp.Header.Set("Location", location.Path+locationHeader)
+				}
+			}
+		}
+
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(contentType, "text/html") {
+			return nil
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+
+		if needsRewrite {
+			prefix := strings.TrimSuffix(location.Path, "/")
+			bodyBytes = rewriteHTMLAbsolutePaths(bodyBytes, prefix)
+		}
+
+		if needsToolbar {
+			bodyBytes = injectToolbarIntoHTMLBytes(
+				bodyBytes,
+				response.GenerateToolbarWithHosts(
+					snapshot.rules,
+					snapshot.hostRules,
+					r.URL.Path,
+					matchedRule.Host,
+					snapshot.authConfig.AuthHost,
+				),
+			)
+		}
+
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(bodyBytes)))
+		return nil
+	}
+
+	if h.maybeProxyFnosPortIconHijackWebSocket(w, r, fnosPortIconHijackWebSocketOptions{
+		targetURL:            targetURL,
+		hostRules:            snapshot.hostRules,
+		clientIP:             clientIP,
+		omitForwardedHeaders: omitForwardedHeaders,
+		preserveHost:         preserveHost,
+		basicAuth:            matchedRule.BasicAuth,
+		rewriteOriginReferer: !preserveHost,
+		stripPath:            location.StripPath,
+		pathPrefix:           location.Path,
+	}) {
+		return
+	}
+
+	proxy.ServeHTTP(w, r)
 }
 
 func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult) {
