@@ -142,11 +142,21 @@ func requestIdentityKey(r *http.Request, clientIP string) string {
 	return activeIdentityKeyFromSource(requestIdentitySource(r, clientIP))
 }
 
+func authCacheClientIPDimension(identitySource string, clientIP string) string {
+	identitySource = strings.TrimSpace(identitySource)
+	if !(strings.HasPrefix(identitySource, "cookie:") || strings.HasPrefix(identitySource, "auth:")) {
+		return ""
+	}
+	return strings.TrimSpace(clientIP)
+}
+
 func buildAuthCacheLookup(r *http.Request, clientIP string, accessMode string) (authCacheLookup, bool) {
-	identityKey := requestIdentityKey(r, clientIP)
+	identitySource := requestIdentitySource(r, clientIP)
+	identityKey := activeIdentityKeyFromSource(identitySource)
 	if identityKey == "" {
 		return authCacheLookup{}, false
 	}
+	clientIPDimension := authCacheClientIPDimension(identitySource, clientIP)
 
 	host := normalizeRequestHost(r.Host)
 	if host == "" {
@@ -155,6 +165,7 @@ func buildAuthCacheLookup(r *http.Request, clientIP string, accessMode string) (
 
 	raw := strings.Join([]string{
 		identityKey,
+		clientIPDimension,
 		strings.TrimSpace(strings.ToLower(accessMode)),
 		strings.TrimSpace(strings.ToLower(requestScheme(r))),
 		strings.TrimSpace(strings.ToUpper(r.Method)),
@@ -170,10 +181,12 @@ func buildAuthCacheLookup(r *http.Request, clientIP string, accessMode string) (
 }
 
 func buildPreflightCacheLookup(r *http.Request, clientIP string, accessMode string, isMatch bool) (preflightCacheLookup, bool) {
-	identityKey := requestIdentityKey(r, clientIP)
+	identitySource := requestIdentitySource(r, clientIP)
+	identityKey := activeIdentityKeyFromSource(identitySource)
 	if identityKey == "" {
 		return preflightCacheLookup{}, false
 	}
+	clientIPDimension := authCacheClientIPDimension(identitySource, clientIP)
 
 	host := normalizeRequestHost(r.Host)
 	if host == "" {
@@ -182,6 +195,7 @@ func buildPreflightCacheLookup(r *http.Request, clientIP string, accessMode stri
 
 	raw := strings.Join([]string{
 		identityKey,
+		clientIPDimension,
 		strings.TrimSpace(strings.ToLower(accessMode)),
 		strings.TrimSpace(strings.ToLower(requestScheme(r))),
 		host,
