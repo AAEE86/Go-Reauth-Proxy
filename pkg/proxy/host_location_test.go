@@ -111,6 +111,35 @@ func TestMatchHostLocationUsesLongestPrefix(t *testing.T) {
 	}
 }
 
+func TestMatchHostLocationPrefixRequiresPathBoundary(t *testing.T) {
+	hostRule := &models.HostRule{
+		Host: "app.example.com",
+		Locations: []models.HostLocation{
+			{Path: "/api", Match: models.HostLocationMatchPrefix, Action: models.HostLocationActionResponse, Response: models.HostLocationResponse{Body: "api"}},
+		},
+	}
+
+	tests := []struct {
+		path      string
+		wantMatch bool
+	}{
+		{path: "/api", wantMatch: true},
+		{path: "/api/users", wantMatch: true},
+		{path: "/apiary", wantMatch: false},
+		{path: "/api-v2", wantMatch: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://app.example.com"+tt.path, nil)
+			location := matchHostLocation(req, hostRule)
+			if gotMatch := location != nil; gotMatch != tt.wantMatch {
+				t.Fatalf("match = %v, want %v", gotMatch, tt.wantMatch)
+			}
+		})
+	}
+}
+
 func TestHostLocationFixedResponseWritesCustomHeaders(t *testing.T) {
 	handler := newHostLocationTestHandler(models.HostRule{
 		Host:   "app.example.com",

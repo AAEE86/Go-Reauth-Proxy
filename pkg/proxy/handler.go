@@ -3009,7 +3009,7 @@ func matchHostLocation(r *http.Request, hostRule *models.HostRule) *models.HostL
 				return copyHostLocation(location)
 			}
 		case models.HostLocationMatchPrefix:
-			if strings.HasPrefix(requestPath, location.Path) && len(location.Path) > longestPrefix {
+			if hostLocationPrefixMatches(requestPath, location.Path) && len(location.Path) > longestPrefix {
 				matchedPrefix = copyHostLocation(location)
 				longestPrefix = len(location.Path)
 			}
@@ -3017,6 +3017,19 @@ func matchHostLocation(r *http.Request, hostRule *models.HostRule) *models.HostL
 	}
 
 	return matchedPrefix
+}
+
+func hostLocationPrefixMatches(requestPath string, locationPath string) bool {
+	if locationPath == "" {
+		return false
+	}
+	if requestPath == locationPath {
+		return true
+	}
+	if strings.HasSuffix(locationPath, "/") {
+		return strings.HasPrefix(requestPath, locationPath)
+	}
+	return strings.HasPrefix(requestPath, locationPath+"/")
 }
 
 func matchRule(r *http.Request, snapshot requestSnapshot) (*models.Rule, string) {
