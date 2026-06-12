@@ -16,6 +16,7 @@ import (
 
 	"github.com/corazawaf/coraza/v3/types"
 
+	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/models"
 )
 
@@ -76,10 +77,21 @@ func (rt *Runtime) SetConfig(cfg models.WAFConfig) (models.WAFConfig, error) {
 		return cfg, nil
 	}
 	cfg = NormalizeConfig(cfg, rt.defaultRulesDir)
+	if event := logger.DebugEvent("waf", "config_set_start"); event != nil {
+		event.Bool("enabled", cfg.Enabled).
+			Str("mode", logger.SanitizeLogString(cfg.Mode)).
+			Str("rules_dir", logger.SanitizeLogString(cfg.RulesDir)).
+			Int("disabled_host_count", len(cfg.DisabledHosts)).
+			Int("disabled_path_prefix_count", len(cfg.DisabledPathPrefixes)).
+			Send()
+	}
 	if !IsActive(cfg) {
 		rt.current.Store((*CompiledRuntime)(nil))
 		rt.config.Store(cfg)
 		rt.lastError.Store("")
+		if event := logger.DebugEvent("waf", "config_set_end"); event != nil {
+			event.Bool("active", false).Send()
+		}
 		return cfg, nil
 	}
 	current := rt.compiled()
@@ -87,18 +99,35 @@ func (rt *Runtime) SetConfig(cfg models.WAFConfig) (models.WAFConfig, error) {
 		compiled, err := buildCompiledRuntime(cfg, rt.defaultRulesDir, "", "")
 		if err != nil {
 			rt.lastError.Store(err.Error())
+			if event := logger.DebugEvent("waf", "config_set_failed"); event != nil {
+				event.Str("error", logger.SanitizeLogString(err.Error())).
+					Str("rules_dir", logger.SanitizeLogString(cfg.RulesDir)).
+					Send()
+			}
 			return cfg, err
 		}
 		rt.current.Store(compiled)
 	}
 	rt.config.Store(cfg)
 	rt.lastError.Store("")
+	if event := logger.DebugEvent("waf", "config_set_end"); event != nil {
+		event.Bool("active", IsActive(cfg)).
+			Send()
+	}
 	return cfg, nil
 }
 
 func (rt *Runtime) Validate(cfg models.WAFConfig, bundleID string, bundlePath string) (ValidationResult, error) {
 	if rt == nil {
 		return ValidationResult{OK: false, Error: "WAF runtime is not initialized"}, fmt.Errorf("WAF runtime is not initialized")
+	}
+	start := time.Now()
+	if event := logger.DebugEvent("waf", "validate_start"); event != nil {
+		event.Bool("enabled", cfg.Enabled).
+			Str("mode", logger.SanitizeLogString(cfg.Mode)).
+			Str("bundle_id", logger.SanitizeLogString(bundleID)).
+			Str("bundle_path", logger.SanitizeLogString(bundlePath)).
+			Send()
 	}
 	compiled, err := buildCompiledRuntime(cfg, rt.defaultRulesDir, bundleID, bundlePath)
 	if err != nil {
@@ -108,14 +137,31 @@ func (rt *Runtime) Validate(cfg models.WAFConfig, bundleID string, bundlePath st
 			BundlePath: strings.TrimSpace(bundlePath),
 			Error:      err.Error(),
 		}
+		if event := logger.DebugEvent("waf", "validate_end"); event != nil {
+			event.Bool("ok", false).
+				Str("bundle_id", logger.SanitizeLogString(result.BundleID)).
+				Str("bundle_path", logger.SanitizeLogString(result.BundlePath)).
+				Str("error", logger.SanitizeLogString(result.Error)).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return result, err
 	}
-	return ValidationResult{
+	result := ValidationResult{
 		OK:         true,
 		BundleID:   compiled.BundleID,
 		BundlePath: compiled.BundlePath,
 		BundleHash: compiled.BundleHash,
-	}, nil
+	}
+	if event := logger.DebugEvent("waf", "validate_end"); event != nil {
+		event.Bool("ok", true).
+			Str("bundle_id", logger.SanitizeLogString(result.BundleID)).
+			Str("bundle_path", logger.SanitizeLogString(result.BundlePath)).
+			Str("bundle_hash", logger.SanitizeLogString(result.BundleHash)).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
+	return result, nil
 }
 
 func (rt *Runtime) Reload(cfg models.WAFConfig, bundleID string, bundlePath string) (Status, error) {
@@ -123,20 +169,54 @@ func (rt *Runtime) Reload(cfg models.WAFConfig, bundleID string, bundlePath stri
 		return Status{}, fmt.Errorf("WAF runtime is not initialized")
 	}
 	cfg = NormalizeConfig(cfg, rt.defaultRulesDir)
+	start := time.Now()
+	if event := logger.DebugEvent("waf", "reload_start"); event != nil {
+		event.Bool("enabled", cfg.Enabled).
+			Str("mode", logger.SanitizeLogString(cfg.Mode)).
+			Str("rules_dir", logger.SanitizeLogString(cfg.RulesDir)).
+			Str("bundle_id", logger.SanitizeLogString(bundleID)).
+			Str("bundle_path", logger.SanitizeLogString(bundlePath)).
+			Send()
+	}
 	if !IsActive(cfg) {
 		rt.current.Store((*CompiledRuntime)(nil))
 		rt.config.Store(cfg)
 		rt.lastError.Store("")
+		if event := logger.DebugEvent("waf", "reload_end"); event != nil {
+			status := rt.Status()
+			event.Bool("enabled", status.Enabled).
+				Bool("loaded", status.Loaded).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return rt.Status(), nil
 	}
 	compiled, err := buildCompiledRuntime(cfg, rt.defaultRulesDir, bundleID, bundlePath)
 	if err != nil {
 		rt.lastError.Store(err.Error())
+		if event := logger.DebugEvent("waf", "reload_failed"); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).
+				Str("bundle_id", logger.SanitizeLogString(bundleID)).
+				Str("bundle_path", logger.SanitizeLogString(bundlePath)).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return rt.Status(), err
 	}
 	rt.current.Store(compiled)
 	rt.config.Store(compiled.Config)
 	rt.lastError.Store("")
+	if event := logger.DebugEvent("waf", "reload_end"); event != nil {
+		status := rt.Status()
+		event.Bool("enabled", status.Enabled).
+			Bool("loaded", status.Loaded).
+			Str("mode", logger.SanitizeLogString(status.Mode)).
+			Str("bundle_id", logger.SanitizeLogString(status.BundleID)).
+			Str("bundle_hash", logger.SanitizeLogString(status.BundleHash)).
+			Int("pending_events", status.PendingEvents).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
 	return rt.Status(), nil
 }
 
@@ -152,15 +232,36 @@ func (rt *Runtime) Evaluate(r *http.Request, ctx EvaluateContext) Decision {
 	if rt == nil || r == nil {
 		return decision
 	}
+	start := time.Now()
 	cfg := rt.Config()
 	decision.Enabled = IsActive(cfg)
 	decision.Mode = cfg.Mode
 	decision.DetectionOnly = cfg.Mode == ModeDetection
 	if !decision.Enabled || rt.isExcluded(r) {
+		if event := logger.DebugEvent("waf", "evaluate_skipped"); event != nil {
+			event.Bool("enabled", decision.Enabled).
+				Bool("excluded", decision.Enabled).
+				Str("method", r.Method).
+				Str("host", logger.SanitizeLogString(r.Host)).
+				Str("path", logger.SanitizeLogString(r.URL.Path)).
+				Str("route_type", logger.SanitizeLogString(ctx.RouteType)).
+				Str("route_key", logger.SanitizeLogString(ctx.RouteKey)).
+				Send()
+		}
 		return decision
 	}
 	compiled := rt.compiled()
 	if compiled == nil || compiled.WAF == nil {
+		if event := logger.DebugEvent("waf", "evaluate_skipped"); event != nil {
+			event.Bool("enabled", decision.Enabled).
+				Bool("loaded", false).
+				Str("method", r.Method).
+				Str("host", logger.SanitizeLogString(r.Host)).
+				Str("path", logger.SanitizeLogString(r.URL.Path)).
+				Str("route_type", logger.SanitizeLogString(ctx.RouteType)).
+				Str("route_key", logger.SanitizeLogString(ctx.RouteKey)).
+				Send()
+		}
 		return decision
 	}
 
@@ -216,6 +317,20 @@ func (rt *Runtime) Evaluate(r *http.Request, ctx EvaluateContext) Decision {
 	rules := collectRuleMatches(tx.MatchedRules(), interruption)
 	ruleIDs := uniqueRuleIDs(rules, interruption)
 	if len(rules) == 0 && interruption == nil && decision.Err == nil {
+		if event := logger.DebugEvent("waf", "evaluate_end"); event != nil {
+			event.Bool("allowed", true).
+				Str("mode", logger.SanitizeLogString(cfg.Mode)).
+				Str("method", r.Method).
+				Str("host", logger.SanitizeLogString(r.Host)).
+				Str("path", logger.SanitizeLogString(r.URL.Path)).
+				Str("query", logger.SanitizeURL("?"+r.URL.RawQuery)).
+				Str("route_type", logger.SanitizeLogString(ctx.RouteType)).
+				Str("route_key", logger.SanitizeLogString(ctx.RouteKey)).
+				Str("upstream", logger.SanitizeURL(ctx.Upstream)).
+				Int("rule_match_count", 0).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return decision
 	}
 
@@ -246,6 +361,32 @@ func (rt *Runtime) Evaluate(r *http.Request, ctx EvaluateContext) Decision {
 	event := buildEvent(r, ctx, compiled, traceID, cfg.Mode, action, status, ruleIDs, rules, interruption, decision.Err)
 	rt.events.Add(event)
 	decision.Event = &event
+	if debugEvent := logger.DebugEvent("waf", "evaluate_end"); debugEvent != nil {
+		debugEvent.Bool("allowed", decision.Allowed).
+			Str("mode", logger.SanitizeLogString(cfg.Mode)).
+			Str("action", logger.SanitizeLogString(action)).
+			Int("status", status).
+			Str("trace_id", logger.SanitizeLogString(traceID)).
+			Str("bundle_id", logger.SanitizeLogString(compiled.BundleID)).
+			Str("method", r.Method).
+			Str("host", logger.SanitizeLogString(r.Host)).
+			Str("path", logger.SanitizeLogString(r.URL.Path)).
+			Str("query", logger.SanitizeURL("?"+r.URL.RawQuery)).
+			Str("route_type", logger.SanitizeLogString(ctx.RouteType)).
+			Str("route_key", logger.SanitizeLogString(ctx.RouteKey)).
+			Str("upstream", logger.SanitizeURL(ctx.Upstream)).
+			Ints("rule_ids", ruleIDs).
+			Int("rule_match_count", len(rules)).
+			Bool("interrupted", interruption != nil).
+			Str("error", func() string {
+				if decision.Err == nil {
+					return ""
+				}
+				return logger.SanitizeLogString(decision.Err.Error())
+			}()).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
 	return decision
 }
 

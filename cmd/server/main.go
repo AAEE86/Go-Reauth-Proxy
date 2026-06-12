@@ -316,16 +316,39 @@ func main() {
 			resolvedAdminPort = 7996
 		}
 	}
+	logger.SetDebugAdminPortForRedaction(resolvedAdminPort)
+	if event := logger.DebugEvent("server", "startup_config_loaded"); event != nil {
+		event.Str("config_path", logger.SanitizeLogString(configPath)).
+			Str("runtime_dir", logger.SanitizeLogString(configDir)).
+			Str("gateway_logs_dir", logger.SanitizeLogString(logsDir)).
+			Interface("proxy_port", logger.SanitizePort(*proxyPort)).
+			Int("path_rule_count", len(initialCfg.Rules)).
+			Int("host_rule_count", len(initialCfg.HostRules)).
+			Int("stream_rule_count", len(initialCfg.StreamRules)).
+			Bool("proxy_protocol_force", initialCfg.ProxyProtocolForce).
+			Bool("waf_enabled", initialCfg.WAF.Enabled).
+			Send()
+	}
 
 	systemEventClient := events.NewClient(nil)
 	proxyHandler := proxy.NewHandler(resolvedAdminPort, *proxyPort, cfgManager, initialCfg, logsDir, systemEventClient)
 	configuredStreamRules := proxyHandler.GetStreamRules()
 	normalizedStreamRules := configuredStreamRules
 	if validatedStreamRules, err := proxyHandler.ValidateStreamRules(configuredStreamRules); err != nil {
+		if event := logger.DebugEvent("server", "stream_initial_validation_failed"); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).
+				Int("stream_rule_count", len(configuredStreamRules)).
+				Send()
+		}
 		log.Printf("Initial stream rules contain invalid entries and will be loaded in best-effort mode: %v", err)
 	} else {
 		normalizedStreamRules = validatedStreamRules
 		if err := proxyHandler.SetStreamRules(normalizedStreamRules); err != nil {
+			if event := logger.DebugEvent("server", "stream_initial_normalize_failed"); event != nil {
+				event.Str("error", logger.SanitizeLogString(err.Error())).
+					Int("stream_rule_count", len(normalizedStreamRules)).
+					Send()
+			}
 			log.Printf("Failed to normalize initial stream rules in config manager: %v", err)
 		}
 	}
@@ -336,9 +359,18 @@ func main() {
 	streamManager := stream.NewManager(proxyHandler)
 	startedStreamRules, startupWarnings := streamManager.ReconcileBestEffort(normalizedStreamRules)
 	for _, warning := range startupWarnings {
+		if event := logger.DebugEvent("server", "stream_startup_warning"); event != nil {
+			event.Str("warning", logger.SanitizeLogString(warning.Error())).Send()
+		}
 		log.Printf("Stream startup warning: %v", warning)
 	}
 	if len(startupWarnings) > 0 {
+		if event := logger.DebugEvent("server", "stream_startup_partial"); event != nil {
+			event.Int("started_rule_count", len(startedStreamRules)).
+				Int("configured_rule_count", len(normalizedStreamRules)).
+				Int("warning_count", len(startupWarnings)).
+				Send()
+		}
 		log.Printf(
 			"Stream manager started %d of %d configured rules; skipped rules can be fixed later from the admin UI",
 			len(startedStreamRules),
@@ -374,7 +406,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if proxyHandler.HasSSLCertificates() {
+			if proxyHandler.HasSSLCertificates() && proxy.ShouldRedirectHTTPToHTTPS(r, proxyHandler.GetAuthConfig()) {
 				target := proxy.BuildHTTPSRedirectURL(r, proxyHandler.GetAuthConfig())
 				if target == "" {
 					target = "https://" + r.Host + r.URL.String()
@@ -423,7 +455,17 @@ func main() {
 
 	proxyStack := newProxyStack(*proxyPort, proxyHandler, httpServer, httpsServer)
 	if err := proxyStack.Start(); err != nil {
+		if event := logger.DebugEvent("server", "proxy_stack_start_failed"); event != nil {
+			event.Interface("proxy_port", logger.SanitizePort(*proxyPort)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		logger.Fatalf("Failed to start proxy stack: %v", err)
+	}
+	if event := logger.DebugEvent("server", "proxy_stack_started"); event != nil {
+		event.Interface("proxy_port", logger.SanitizePort(*proxyPort)).
+			Str("listen_addr", logger.SanitizeLogString(proxyStack.ListenAddr())).
+			Send()
 	}
 
 	proxyHandler.SetProxyProtocolForceChangeHook(func() {
@@ -437,6 +479,9 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down...")
+	if event := logger.DebugEvent("server", "shutdown_started"); event != nil {
+		event.Send()
+	}
 	streamManager.Stop()
 	proxyStack.Stop()
 }

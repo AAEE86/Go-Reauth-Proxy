@@ -32,6 +32,27 @@ func TestLoggerDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestDebugLogEnvironmentDoesNotEnableAdminHTTPLogs(t *testing.T) {
+	t.Setenv(AdminHTTPLogEnv, "")
+	t.Setenv(logger.ConsoleLogEnv, "")
+	t.Setenv(logger.DebugLogEnv, "1")
+
+	var buf bytes.Buffer
+	restoreLogger(t, &buf)
+
+	handler := Logger(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/info", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if got := buf.String(); got != "" {
+		t.Fatalf("expected no admin HTTP log from debug env, got %q", got)
+	}
+}
+
 func TestLoggerEnabledByEnvironment(t *testing.T) {
 	t.Setenv(AdminHTTPLogEnv, "1")
 	t.Setenv(logger.ConsoleLogEnv, "")

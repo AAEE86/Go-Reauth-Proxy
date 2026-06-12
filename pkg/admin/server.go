@@ -52,6 +52,7 @@ type authConfigPatch struct {
 	PublicHTTPPort        *int    `json:"public_http_port"`
 	PublicHTTPSPort       *int    `json:"public_https_port"`
 	AuthHost              *string `json:"auth_host"`
+	TrustForwardedProto   *bool   `json:"trust_forwarded_proto"`
 }
 
 type reverseProxyThrottleExemptIPsRuntimeResponse = models.ReverseProxyThrottleExemptIPsRuntime
@@ -854,6 +855,9 @@ func mergeAuthConfig(current models.AuthConfig, patch authConfigPatch) (models.A
 	}
 	if patch.AuthHost != nil {
 		merged.AuthHost = *patch.AuthHost
+	}
+	if patch.TrustForwardedProto != nil {
+		merged.TrustForwardedProto = *patch.TrustForwardedProto
 	}
 
 	merged.NormalizeEdgeClientIPSelection()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"go-reauth-proxy/pkg/gatewaylog"
+	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/proxy"
 	"io"
@@ -45,6 +46,39 @@ type streamRuleKey struct {
 
 func (k streamRuleKey) String() string {
 	return k.Protocol + "/" + strconv.Itoa(k.ListenPort)
+}
+
+func debugStreamKeys(keys []streamRuleKey) []map[string]any {
+	out := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, map[string]any{
+			"protocol":    logger.SanitizeLogString(key.Protocol),
+			"listen_port": logger.SanitizePort(key.ListenPort),
+			"key":         logger.SanitizeLogString(key.String()),
+		})
+	}
+	return out
+}
+
+func debugStreamRuleSummaries(rules []models.StreamRule) []map[string]any {
+	out := make([]map[string]any, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, map[string]any{
+			"protocol":    logger.SanitizeLogString(rule.Protocol),
+			"listen_port": logger.SanitizePort(rule.ListenPort),
+			"target":      logger.SanitizeLogString(rule.Target),
+			"use_auth":    rule.UseAuth,
+		})
+	}
+	return out
+}
+
+func debugSanitizeStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, logger.SanitizeLogString(value))
+	}
+	return out
 }
 
 type managedListener interface {
@@ -113,8 +147,20 @@ func NewManager(handler *proxy.Handler) *Manager {
 }
 
 func (m *Manager) Reconcile(rules []models.StreamRule) error {
+	start := time.Now()
+	if event := logger.DebugEvent("stream", "reconcile_start"); event != nil {
+		event.Int("requested_rule_count", len(rules)).
+			Interface("rules", debugStreamRuleSummaries(rules)).
+			Send()
+	}
 	normalizedRules, err := m.normalizeRules(rules)
 	if err != nil {
+		if event := logger.DebugEvent("stream", "reconcile_failed"); event != nil {
+			event.Str("phase", "normalize").
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return err
 	}
 
@@ -133,6 +179,11 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 	m.mu.RLock()
 	if m.closed {
 		m.mu.RUnlock()
+		if event := logger.DebugEvent("stream", "reconcile_failed"); event != nil {
+			event.Str("phase", "closed").
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return fmt.Errorf("stream manager is closed")
 	}
 	currentKeys := make([]streamRuleKey, 0, len(m.listeners))
@@ -168,6 +219,14 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 			for _, candidate := range created {
 				candidate.close()
 			}
+			if event := logger.DebugEvent("stream", "reconcile_failed"); event != nil {
+				event.Str("phase", "listener_create").
+					Str("key", logger.SanitizeLogString(key.String())).
+					Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Int64("duration_ms", time.Since(start).Milliseconds()).
+					Send()
+			}
 			return err
 		}
 		created[key] = state
@@ -178,6 +237,11 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 		m.mu.Unlock()
 		for _, candidate := range created {
 			candidate.close()
+		}
+		if event := logger.DebugEvent("stream", "reconcile_failed"); event != nil {
+			event.Str("phase", "closed_after_create").
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
 		}
 		return fmt.Errorf("stream manager is closed")
 	}
@@ -199,11 +263,26 @@ func (m *Manager) Reconcile(rules []models.StreamRule) error {
 	for _, state := range removed {
 		state.close()
 	}
+	if event := logger.DebugEvent("stream", "reconcile_end"); event != nil {
+		event.Int("normalized_rule_count", len(normalizedRules)).
+			Int("added_listener_count", len(toAdd)).
+			Int("removed_listener_count", len(toRemove)).
+			Interface("added_listeners", debugStreamKeys(toAdd)).
+			Interface("removed_listeners", debugStreamKeys(toRemove)).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
 
 	return nil
 }
 
 func (m *Manager) ReconcileBestEffort(rules []models.StreamRule) ([]models.StreamRule, []error) {
+	start := time.Now()
+	if event := logger.DebugEvent("stream", "reconcile_best_effort_start"); event != nil {
+		event.Int("requested_rule_count", len(rules)).
+			Interface("rules", debugStreamRuleSummaries(rules)).
+			Send()
+	}
 	startedRules := make([]models.StreamRule, 0, len(rules))
 	warnings := make([]error, 0)
 
@@ -212,16 +291,36 @@ func (m *Manager) ReconcileBestEffort(rules []models.StreamRule) ([]models.Strea
 		if err != nil {
 			key := streamRuleKey{Protocol: fallbackStreamProtocol(rule.Protocol), ListenPort: rule.ListenPort}
 			warnings = append(warnings, fmt.Errorf("skipping stream rule %s -> %s: %w", key.String(), strings.TrimSpace(rule.Target), err))
+			if event := logger.DebugEvent("stream", "reconcile_best_effort_skip"); event != nil {
+				event.Str("key", logger.SanitizeLogString(key.String())).
+					Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+					Str("target", logger.SanitizeLogString(rule.Target)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			continue
 		}
 
 		if err := m.Reconcile(append(startedRules, nextRule)); err != nil {
 			warnings = append(warnings, fmt.Errorf("skipping stream rule %s -> %s: %w", streamRuleKeyFromRule(nextRule).String(), nextRule.Target, err))
+			if event := logger.DebugEvent("stream", "reconcile_best_effort_skip"); event != nil {
+				event.Str("key", logger.SanitizeLogString(streamRuleKeyFromRule(nextRule).String())).
+					Interface("listen_port", logger.SanitizePort(nextRule.ListenPort)).
+					Str("target", logger.SanitizeLogString(nextRule.Target)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			continue
 		}
 		startedRules = append(startedRules, nextRule)
 	}
 
+	if event := logger.DebugEvent("stream", "reconcile_best_effort_end"); event != nil {
+		event.Int("started_rule_count", len(startedRules)).
+			Int("warning_count", len(warnings)).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
 	return startedRules, warnings
 }
 
@@ -243,6 +342,9 @@ func (m *Manager) Stop() {
 
 	for _, state := range states {
 		state.close()
+	}
+	if event := logger.DebugEvent("stream", "manager_stopped"); event != nil {
+		event.Int("listener_count", len(states)).Send()
 	}
 }
 
@@ -280,6 +382,13 @@ func newTCPListenerState(key streamRuleKey, handler func(net.Conn, streamRuleKey
 		ln, err := net.Listen(network, addr)
 		if err != nil {
 			if network == "tcp6" {
+				if event := logger.DebugEvent("stream", "listener_ipv6_unavailable"); event != nil {
+					event.Str("protocol", key.Protocol).
+						Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+						Str("addr", logger.SanitizeLogString(addr)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				log.Printf("Stream IPv6 listener unavailable on %s for %s: %v", addr, key.String(), err)
 				continue
 			}
@@ -312,6 +421,12 @@ func newTCPListenerState(key streamRuleKey, handler func(net.Conn, streamRuleKey
 	}
 
 	log.Printf("Stream listener started for %s on %s", key.String(), strings.Join(listenAddrs, ", "))
+	if event := logger.DebugEvent("stream", "listener_started"); event != nil {
+		event.Str("protocol", key.Protocol).
+			Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+			Interface("listen_addrs", debugSanitizeStrings(listenAddrs)).
+			Send()
+	}
 	return state, nil
 }
 
@@ -328,12 +443,24 @@ func (s *tcpListenerState) acceptLoop(ln net.Listener, handler func(net.Conn, st
 			}
 
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if event := logger.DebugEvent("stream", "tcp_accept_temporary_error"); event != nil {
+					event.Str("key", logger.SanitizeLogString(s.key.String())).
+						Interface("listen_port", logger.SanitizePort(s.key.ListenPort)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				log.Printf("Temporary stream accept error on %s: %v", s.key.String(), err)
 				time.Sleep(streamAcceptBackoff)
 				continue
 			}
 			if isClosedConnErr(err) {
 				return
+			}
+			if event := logger.DebugEvent("stream", "tcp_accept_error"); event != nil {
+				event.Str("key", logger.SanitizeLogString(s.key.String())).
+					Interface("listen_port", logger.SanitizePort(s.key.ListenPort)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
 			}
 			log.Printf("Stream accept error on %s: %v", s.key.String(), err)
 			return
@@ -396,6 +523,12 @@ func (s *tcpListenerState) close() {
 		_ = conn.Close()
 	}
 	s.wg.Wait()
+	if event := logger.DebugEvent("stream", "tcp_listener_closed"); event != nil {
+		event.Str("key", logger.SanitizeLogString(s.key.String())).
+			Interface("listen_port", logger.SanitizePort(s.key.ListenPort)).
+			Int("closed_connection_count", len(conns)).
+			Send()
+	}
 }
 
 func newUDPListenerState(key streamRuleKey, handler func(*udpListenerState, net.PacketConn, net.Addr, []byte, streamRuleKey)) (*udpListenerState, error) {
@@ -413,6 +546,13 @@ func newUDPListenerState(key streamRuleKey, handler func(*udpListenerState, net.
 		pc, err := net.ListenPacket(network, addr)
 		if err != nil {
 			if network == "udp6" {
+				if event := logger.DebugEvent("stream", "listener_ipv6_unavailable"); event != nil {
+					event.Str("protocol", key.Protocol).
+						Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+						Str("addr", logger.SanitizeLogString(addr)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				log.Printf("Stream IPv6 packet listener unavailable on %s for %s: %v", addr, key.String(), err)
 				continue
 			}
@@ -445,6 +585,12 @@ func newUDPListenerState(key streamRuleKey, handler func(*udpListenerState, net.
 	}
 
 	log.Printf("Stream listener started for %s on %s", key.String(), strings.Join(listenAddrs, ", "))
+	if event := logger.DebugEvent("stream", "listener_started"); event != nil {
+		event.Str("protocol", key.Protocol).
+			Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+			Interface("listen_addrs", debugSanitizeStrings(listenAddrs)).
+			Send()
+	}
 	return state, nil
 }
 
@@ -462,12 +608,24 @@ func (s *udpListenerState) readLoop(pc net.PacketConn, handler func(*udpListener
 			}
 
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if event := logger.DebugEvent("stream", "udp_read_temporary_error"); event != nil {
+					event.Str("key", logger.SanitizeLogString(s.key.String())).
+						Interface("listen_port", logger.SanitizePort(s.key.ListenPort)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				log.Printf("Temporary stream packet read error on %s: %v", s.key.String(), err)
 				time.Sleep(streamAcceptBackoff)
 				continue
 			}
 			if isClosedConnErr(err) {
 				return
+			}
+			if event := logger.DebugEvent("stream", "udp_read_error"); event != nil {
+				event.Str("key", logger.SanitizeLogString(s.key.String())).
+					Interface("listen_port", logger.SanitizePort(s.key.ListenPort)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
 			}
 			log.Printf("Stream packet read error on %s: %v", s.key.String(), err)
 			return
@@ -543,6 +701,12 @@ func (s *udpListenerState) close() {
 		session.close()
 	}
 	s.wg.Wait()
+	if event := logger.DebugEvent("stream", "udp_listener_closed"); event != nil {
+		event.Str("key", logger.SanitizeLogString(s.key.String())).
+			Interface("listen_port", logger.SanitizePort(s.key.ListenPort)).
+			Int("closed_session_count", len(sessions)).
+			Send()
+	}
 }
 
 func (s *udpSession) addBytesIn(bytes int) {
@@ -607,11 +771,32 @@ func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 		remoteAddr = client.RemoteAddr().String()
 		clientIP = extractRemoteIP(client.RemoteAddr())
 	}
+	if event := logger.DebugEvent("stream", "tcp_connection_start"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+			Str("remote_addr", logger.SanitizeLogString(remoteAddr)).
+			Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Send()
+	}
 
 	entry := newStreamEntry(key, remoteAddr, clientIP)
 
 	defer func() {
 		m.logStreamEntry(entry, start)
+		if event := logger.DebugEvent("stream", "tcp_connection_end"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+				Str("remote_addr", logger.SanitizeLogString(remoteAddr)).
+				Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Str("upstream", logger.SanitizeLogString(entry.Upstream)).
+				Int("status", entry.Status).
+				Str("auth_decision", logger.SanitizeLogString(entry.AuthDecision)).
+				Bool("logged_in", entry.LoggedIn).
+				Uint64("bytes_in", entry.BytesIn).
+				Uint64("bytes_out", entry.BytesOut).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		if client != nil {
 			_ = client.Close()
 		}
@@ -622,15 +807,32 @@ func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 		entry.Matched = false
 		entry.Status = http.StatusNotFound
 		entry.AuthDecision = "rule_missing"
+		if event := logger.DebugEvent("stream", "tcp_rule_missing"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+				Send()
+		}
 		return
 	}
 
 	entry.AuthRequired = rule.UseAuth
 	entry.Upstream = rule.Target
+	if event := logger.DebugEvent("stream", "tcp_rule_matched"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+			Str("target", logger.SanitizeLogString(rule.Target)).
+			Bool("auth_required", rule.UseAuth).
+			Send()
+	}
 
 	if !m.handler.IsClientIPVisible(clientIP) {
 		entry.Status = 499
 		entry.AuthDecision = "visibility_denied"
+		if event := logger.DebugEvent("stream", "tcp_visibility_denied"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Send()
+		}
 		return
 	}
 
@@ -641,9 +843,29 @@ func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 		if !allowed {
 			entry.Status = status
 			if err != nil {
+				if event := logger.DebugEvent("stream", "tcp_auth_rejected"); event != nil {
+					event.Str("key", logger.SanitizeLogString(key.String())).
+						Str("client_ip", logger.SanitizeLogString(clientIP)).
+						Int("status", status).
+						Str("decision", logger.SanitizeLogString(decision)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				log.Printf("Stream auth rejected on %s for %s: %v", key.String(), clientIP, err)
+			} else if event := logger.DebugEvent("stream", "tcp_auth_rejected"); event != nil {
+				event.Str("key", logger.SanitizeLogString(key.String())).
+					Str("client_ip", logger.SanitizeLogString(clientIP)).
+					Int("status", status).
+					Str("decision", logger.SanitizeLogString(decision)).
+					Send()
 			}
 			return
+		}
+		if event := logger.DebugEvent("stream", "tcp_auth_allowed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Str("decision", logger.SanitizeLogString(decision)).
+				Send()
 		}
 		m.handler.MarkLoggedInActiveByClientIP(clientIP, time.Now())
 	} else {
@@ -657,8 +879,19 @@ func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 	upstream, err := dialer.Dial(rule.Protocol, rule.Target)
 	if err != nil {
 		entry.Status = http.StatusBadGateway
+		if event := logger.DebugEvent("stream", "tcp_upstream_dial_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(rule.Target)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		log.Printf("Stream upstream dial failed on %s to %s: %v", key.String(), rule.Target, err)
 		return
+	}
+	if event := logger.DebugEvent("stream", "tcp_upstream_dialed"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Str("target", logger.SanitizeLogString(rule.Target)).
+			Send()
 	}
 	defer upstream.Close()
 
@@ -667,7 +900,21 @@ func (m *Manager) handleConn(client net.Conn, key streamRuleKey) {
 	entry.BytesOut = bytesOut
 	if relayErr != nil {
 		entry.Status = http.StatusBadGateway
+		if event := logger.DebugEvent("stream", "tcp_relay_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(rule.Target)).
+				Uint64("bytes_in", bytesIn).
+				Uint64("bytes_out", bytesOut).
+				Str("error", logger.SanitizeLogString(relayErr.Error())).
+				Send()
+		}
 		log.Printf("Stream relay failed on %s to %s: %v", key.String(), rule.Target, relayErr)
+	} else if event := logger.DebugEvent("stream", "tcp_relay_completed"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Str("target", logger.SanitizeLogString(rule.Target)).
+			Uint64("bytes_in", bytesIn).
+			Uint64("bytes_out", bytesOut).
+			Send()
 	}
 }
 
@@ -682,6 +929,12 @@ func (m *Manager) handleUDPPacket(listener *udpListenerState, packetConn net.Pac
 		entry.Matched = false
 		entry.Status = http.StatusNotFound
 		entry.AuthDecision = "rule_missing"
+		if event := logger.DebugEvent("stream", "udp_rule_missing"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+				Str("client_addr", logger.SanitizeLogString(addrString(clientAddr))).
+				Send()
+		}
 		m.logStreamEntry(entry, time.Now())
 		return
 	}
@@ -697,6 +950,13 @@ func (m *Manager) handleUDPPacket(listener *udpListenerState, packetConn net.Pac
 
 	if err := session.upstream.SetDeadline(time.Now().Add(udpSessionIdleTimeout)); err != nil {
 		_, target := session.routeInfo()
+		if event := logger.DebugEvent("stream", "udp_deadline_refresh_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(target)).
+				Str("client_addr", logger.SanitizeLogString(addrString(clientAddr))).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		log.Printf("Failed to refresh UDP session deadline on %s for %s: %v", key.String(), target, err)
 	}
 
@@ -706,12 +966,29 @@ func (m *Manager) handleUDPPacket(listener *udpListenerState, packetConn net.Pac
 	}
 	if err != nil {
 		session.setStatus(http.StatusBadGateway)
+		if event := logger.DebugEvent("stream", "udp_upstream_write_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(rule.Target)).
+				Str("client_addr", logger.SanitizeLogString(addrString(clientAddr))).
+				Int("payload_bytes", len(payload)).
+				Int("written_bytes", written).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		log.Printf("UDP upstream write failed on %s to %s for %s: %v", key.String(), rule.Target, addrString(clientAddr), err)
 		session.close()
 		return
 	}
 	if written != len(payload) {
 		session.setStatus(http.StatusBadGateway)
+		if event := logger.DebugEvent("stream", "udp_upstream_short_write"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(rule.Target)).
+				Str("client_addr", logger.SanitizeLogString(addrString(clientAddr))).
+				Int("payload_bytes", len(payload)).
+				Int("written_bytes", written).
+				Send()
+		}
 		log.Printf("UDP upstream short write on %s to %s for %s: wrote %d of %d bytes", key.String(), rule.Target, addrString(clientAddr), written, len(payload))
 		session.close()
 	}
@@ -724,10 +1001,24 @@ func (m *Manager) createUDPSession(listener *udpListenerState, packetConn net.Pa
 	entry := newStreamEntry(key, addrString(clientAddr), clientIP)
 	entry.AuthRequired = rule.UseAuth
 	entry.Upstream = rule.Target
+	if event := logger.DebugEvent("stream", "udp_session_start"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Interface("listen_port", logger.SanitizePort(key.ListenPort)).
+			Str("target", logger.SanitizeLogString(rule.Target)).
+			Str("client_addr", logger.SanitizeLogString(addrString(clientAddr))).
+			Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Bool("auth_required", rule.UseAuth).
+			Send()
+	}
 
 	if !m.handler.IsClientIPVisible(clientIP) {
 		entry.Status = 499
 		entry.AuthDecision = "visibility_denied"
+		if event := logger.DebugEvent("stream", "udp_visibility_denied"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Send()
+		}
 		m.logStreamEntry(entry, start)
 		return nil
 	}
@@ -739,10 +1030,30 @@ func (m *Manager) createUDPSession(listener *udpListenerState, packetConn net.Pa
 		if !allowed {
 			entry.Status = status
 			if err != nil {
+				if event := logger.DebugEvent("stream", "udp_auth_rejected"); event != nil {
+					event.Str("key", logger.SanitizeLogString(key.String())).
+						Str("client_ip", logger.SanitizeLogString(clientIP)).
+						Int("status", status).
+						Str("decision", logger.SanitizeLogString(decision)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				log.Printf("Stream auth rejected on %s for %s: %v", key.String(), clientIP, err)
+			} else if event := logger.DebugEvent("stream", "udp_auth_rejected"); event != nil {
+				event.Str("key", logger.SanitizeLogString(key.String())).
+					Str("client_ip", logger.SanitizeLogString(clientIP)).
+					Int("status", status).
+					Str("decision", logger.SanitizeLogString(decision)).
+					Send()
 			}
 			m.logStreamEntry(entry, start)
 			return nil
+		}
+		if event := logger.DebugEvent("stream", "udp_auth_allowed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Str("decision", logger.SanitizeLogString(decision)).
+				Send()
 		}
 		m.handler.MarkLoggedInActiveByClientIP(clientIP, time.Now())
 	} else {
@@ -752,9 +1063,20 @@ func (m *Manager) createUDPSession(listener *udpListenerState, packetConn net.Pa
 	upstream, err := net.DialTimeout(rule.Protocol, rule.Target, streamDialTimeout)
 	if err != nil {
 		entry.Status = http.StatusBadGateway
+		if event := logger.DebugEvent("stream", "udp_upstream_dial_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(rule.Target)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		log.Printf("Stream upstream dial failed on %s to %s: %v", key.String(), rule.Target, err)
 		m.logStreamEntry(entry, start)
 		return nil
+	}
+	if event := logger.DebugEvent("stream", "udp_upstream_dialed"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Str("target", logger.SanitizeLogString(rule.Target)).
+			Send()
 	}
 
 	session := &udpSession{
@@ -767,19 +1089,40 @@ func (m *Manager) createUDPSession(listener *udpListenerState, packetConn net.Pa
 	}
 
 	if err := session.upstream.SetDeadline(time.Now().Add(udpSessionIdleTimeout)); err != nil {
+		if event := logger.DebugEvent("stream", "udp_deadline_init_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("target", logger.SanitizeLogString(rule.Target)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		log.Printf("Failed to initialize UDP session deadline on %s for %s: %v", key.String(), rule.Target, err)
 	}
 
 	storedSession, loaded, ok := listener.storeSession(session)
 	if !ok {
 		session.close()
+		if event := logger.DebugEvent("stream", "udp_session_store_failed"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("session_id", logger.SanitizeLogString(session.id)).
+				Send()
+		}
 		return nil
 	}
 	if loaded {
 		session.close()
+		if event := logger.DebugEvent("stream", "udp_session_reused"); event != nil {
+			event.Str("key", logger.SanitizeLogString(key.String())).
+				Str("session_id", logger.SanitizeLogString(session.id)).
+				Send()
+		}
 		return storedSession
 	}
 
+	if event := logger.DebugEvent("stream", "udp_session_stored"); event != nil {
+		event.Str("key", logger.SanitizeLogString(key.String())).
+			Str("session_id", logger.SanitizeLogString(session.id)).
+			Send()
+	}
 	go m.runUDPSession(listener, storedSession)
 	return storedSession
 }
@@ -789,7 +1132,20 @@ func (m *Manager) runUDPSession(listener *udpListenerState, session *udpSession)
 	defer listener.removeSession(session.id, session)
 	defer session.close()
 	defer func() {
-		m.logStreamEntry(session.snapshotEntry(), session.start)
+		entry := session.snapshotEntry()
+		m.logStreamEntry(entry, session.start)
+		if event := logger.DebugEvent("stream", "udp_session_end"); event != nil {
+			event.Str("route_key", logger.SanitizeLogString(entry.RouteKey)).
+				Str("upstream", logger.SanitizeLogString(entry.Upstream)).
+				Str("remote_addr", logger.SanitizeLogString(entry.RemoteAddr)).
+				Str("remote_ip", logger.SanitizeLogString(entry.RemoteIP)).
+				Int("status", entry.Status).
+				Str("auth_decision", logger.SanitizeLogString(entry.AuthDecision)).
+				Uint64("bytes_in", entry.BytesIn).
+				Uint64("bytes_out", entry.BytesOut).
+				Int64("duration_ms", entry.DurationMs).
+				Send()
+		}
 	}()
 
 	buffer := make([]byte, udpPacketBufferSize)
@@ -805,6 +1161,15 @@ func (m *Manager) runUDPSession(listener *udpListenerState, session *udpSession)
 				if !isClosedConnErr(writeErr) {
 					session.setStatus(http.StatusBadGateway)
 					routeKey, target := session.routeInfo()
+					if event := logger.DebugEvent("stream", "udp_downstream_write_failed"); event != nil {
+						event.Str("route_key", logger.SanitizeLogString(routeKey)).
+							Str("target", logger.SanitizeLogString(target)).
+							Str("client_addr", logger.SanitizeLogString(addrString(session.clientAddr))).
+							Int("payload_bytes", n).
+							Int("written_bytes", written).
+							Str("error", logger.SanitizeLogString(writeErr.Error())).
+							Send()
+					}
 					log.Printf("UDP downstream write failed on %s to %s for %s: %v", routeKey, target, addrString(session.clientAddr), writeErr)
 				}
 				return
@@ -812,6 +1177,14 @@ func (m *Manager) runUDPSession(listener *udpListenerState, session *udpSession)
 			if written != n {
 				session.setStatus(http.StatusBadGateway)
 				routeKey, target := session.routeInfo()
+				if event := logger.DebugEvent("stream", "udp_downstream_short_write"); event != nil {
+					event.Str("route_key", logger.SanitizeLogString(routeKey)).
+						Str("target", logger.SanitizeLogString(target)).
+						Str("client_addr", logger.SanitizeLogString(addrString(session.clientAddr))).
+						Int("payload_bytes", n).
+						Int("written_bytes", written).
+						Send()
+				}
 				log.Printf("UDP downstream short write on %s to %s for %s: wrote %d of %d bytes", routeKey, target, addrString(session.clientAddr), written, n)
 				return
 			}
@@ -822,6 +1195,13 @@ func (m *Manager) runUDPSession(listener *udpListenerState, session *udpSession)
 			}
 			session.setStatus(http.StatusBadGateway)
 			routeKey, target := session.routeInfo()
+			if event := logger.DebugEvent("stream", "udp_upstream_read_failed"); event != nil {
+				event.Str("route_key", logger.SanitizeLogString(routeKey)).
+					Str("target", logger.SanitizeLogString(target)).
+					Str("client_addr", logger.SanitizeLogString(addrString(session.clientAddr))).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			log.Printf("UDP upstream read failed on %s to %s for %s: %v", routeKey, target, addrString(session.clientAddr), err)
 			return
 		}
@@ -831,6 +1211,12 @@ func (m *Manager) runUDPSession(listener *udpListenerState, session *udpSession)
 func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, string, error) {
 	authConfig := m.handler.GetAuthConfig()
 	if authConfig.AuthPort <= 0 {
+		if event := logger.DebugEvent("stream", "auth_verify_skipped_missing_port"); event != nil {
+			event.Str("protocol", logger.SanitizeLogString(rule.Protocol)).
+				Interface("listen_port", logger.SanitizePort(rule.ListenPort)).
+				Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Send()
+		}
 		return false, http.StatusBadGateway, "auth_unconfigured", fmt.Errorf("auth_port is not configured")
 	}
 
@@ -839,12 +1225,26 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 		authPath = "/api/auth/verify"
 	}
 	verifyURL := fmt.Sprintf("http://127.0.0.1:%d%s", authConfig.AuthPort, authPath)
+	start := time.Now()
+	if event := logger.DebugEvent("stream", "auth_verify_start"); event != nil {
+		event.Str("url", logger.SanitizeURL(verifyURL)).
+			Str("protocol", logger.SanitizeLogString(rule.Protocol)).
+			Interface("listen_port", logger.SanitizePort(rule.ListenPort)).
+			Str("target", logger.SanitizeLogString(rule.Target)).
+			Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Send()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), streamAuthTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
 	if err != nil {
+		if event := logger.DebugEvent("stream", "auth_verify_create_failed"); event != nil {
+			event.Str("url", logger.SanitizeURL(verifyURL)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return false, http.StatusBadGateway, "auth_error", err
 	}
 
@@ -858,7 +1258,19 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 	resp, err := m.authClient.Do(req)
 	if err != nil {
 		if isTimeoutErr(err) {
+			if event := logger.DebugEvent("stream", "auth_verify_failed"); event != nil {
+				event.Str("decision", "timeout").
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Int64("duration_ms", time.Since(start).Milliseconds()).
+					Send()
+			}
 			return false, http.StatusGatewayTimeout, "timeout", err
+		}
+		if event := logger.DebugEvent("stream", "auth_verify_failed"); event != nil {
+			event.Str("decision", "auth_error").
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
 		}
 		return false, http.StatusBadGateway, "auth_error", err
 	}
@@ -866,6 +1278,13 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAuthBodyBytes))
 	if readErr != nil {
+		if event := logger.DebugEvent("stream", "auth_verify_failed"); event != nil {
+			event.Int("status", resp.StatusCode).
+				Str("decision", "auth_error").
+				Str("error", logger.SanitizeLogString(readErr.Error())).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return false, http.StatusBadGateway, "auth_error", readErr
 	}
 
@@ -873,19 +1292,53 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &payload); err != nil {
 			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				if event := logger.DebugEvent("stream", "auth_verify_end"); event != nil {
+					event.Int("status", resp.StatusCode).
+						Bool("allowed", false).
+						Str("decision", "denied").
+						Int64("duration_ms", time.Since(start).Milliseconds()).
+						Send()
+				}
 				return false, http.StatusForbidden, "denied", nil
+			}
+			if event := logger.DebugEvent("stream", "auth_verify_failed"); event != nil {
+				event.Int("status", resp.StatusCode).
+					Str("decision", "invalid_response").
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Int64("duration_ms", time.Since(start).Milliseconds()).
+					Send()
 			}
 			return false, http.StatusBadGateway, "invalid_response", err
 		}
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 && payload.Success {
+		if event := logger.DebugEvent("stream", "auth_verify_end"); event != nil {
+			event.Int("status", resp.StatusCode).
+				Bool("allowed", true).
+				Str("decision", "passed").
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return true, http.StatusOK, "passed", nil
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if event := logger.DebugEvent("stream", "auth_verify_end"); event != nil {
+			event.Int("status", resp.StatusCode).
+				Bool("allowed", false).
+				Str("decision", "denied").
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return false, http.StatusForbidden, "denied", nil
 	}
 	if resp.StatusCode >= 500 {
+		if event := logger.DebugEvent("stream", "auth_verify_failed"); event != nil {
+			event.Int("status", resp.StatusCode).
+				Str("decision", "auth_error").
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return false, http.StatusBadGateway, "auth_error", fmt.Errorf("auth service returned %d", resp.StatusCode)
 	}
 	if !payload.Success {
@@ -893,9 +1346,23 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 		if message == "" {
 			message = fmt.Sprintf("auth service denied access with status %d", resp.StatusCode)
 		}
+		if event := logger.DebugEvent("stream", "auth_verify_end"); event != nil {
+			event.Int("status", resp.StatusCode).
+				Bool("allowed", false).
+				Str("decision", "denied").
+				Str("message", logger.SanitizeLogString(message)).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return false, http.StatusForbidden, "denied", errors.New(message)
 	}
 
+	if event := logger.DebugEvent("stream", "auth_verify_failed"); event != nil {
+		event.Int("status", resp.StatusCode).
+			Str("decision", "auth_error").
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
 	return false, http.StatusBadGateway, "auth_error", fmt.Errorf("unexpected auth response status %d", resp.StatusCode)
 }
 

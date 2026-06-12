@@ -13,6 +13,7 @@ import (
 	"go-reauth-proxy/pkg/errors"
 	"go-reauth-proxy/pkg/events"
 	"go-reauth-proxy/pkg/gatewaylog"
+	"go-reauth-proxy/pkg/logger"
 
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/response"
@@ -32,6 +33,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http/httpguts"
+
+	"github.com/rs/zerolog"
 )
 
 type Handler struct {
@@ -108,6 +111,82 @@ type authCheckResult struct {
 	authenticated   bool
 	suppressToolbar bool
 	decision        string
+}
+
+func debugProxyEvent(eventName string, requestID string) *zerolog.Event {
+	event := logger.DebugEvent("proxy", eventName)
+	if event == nil {
+		return nil
+	}
+	if requestID != "" {
+		event.Str("request_id", requestID)
+	}
+	return event
+}
+
+func debugRuleSummaries(rules []models.Rule) []map[string]any {
+	out := make([]map[string]any, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, map[string]any{
+			"path":          logger.SanitizeLogString(rule.Path),
+			"target":        logger.SanitizeURL(rule.Target),
+			"use_auth":      rule.UseAuth,
+			"strip_path":    rule.StripPath,
+			"rewrite_html":  rule.RewriteHTML,
+			"use_root_mode": rule.UseRootMode,
+		})
+	}
+	return out
+}
+
+func debugHostRuleSummaries(rules []models.HostRule) []map[string]any {
+	out := make([]map[string]any, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, map[string]any{
+			"host":               logger.SanitizeLogString(rule.Host),
+			"target":             logger.SanitizeURL(rule.Target),
+			"use_auth":           rule.UseAuth,
+			"access_mode":        logger.SanitizeLogString(rule.AccessMode),
+			"suppress_toolbar":   rule.SuppressToolbar,
+			"preserve_host":      rule.PreserveHost,
+			"basic_auth_enabled": rule.BasicAuth.Enabled,
+			"location_count":     len(rule.Locations),
+		})
+	}
+	return out
+}
+
+func debugStreamRuleSummaries(rules []models.StreamRule) []map[string]any {
+	out := make([]map[string]any, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, map[string]any{
+			"protocol":    logger.SanitizeLogString(rule.Protocol),
+			"listen_port": logger.SanitizePort(rule.ListenPort),
+			"target":      logger.SanitizeLogString(rule.Target),
+			"use_auth":    rule.UseAuth,
+		})
+	}
+	return out
+}
+
+func debugAuthConfigSummary(cfg models.AuthConfig) map[string]any {
+	return map[string]any{
+		"auth_port":                logger.SanitizePort(cfg.AuthPort),
+		"auth_url":                 logger.SanitizeLogString(cfg.AuthURL),
+		"login_url":                logger.SanitizeLogString(cfg.LoginURL),
+		"logout_url":               logger.SanitizeLogString(cfg.LogoutURL),
+		"preflight_url":            logger.SanitizeLogString(cfg.PreflightURL),
+		"auth_cache_ttl_seconds":   cfg.AuthCacheTTL,
+		"auth_cache_fail_ttl_secs": cfg.AuthCacheFailTTL,
+		"edge_client_ip_enabled":   cfg.EdgeClientIPEnabled,
+		"aliyun_esa_enabled":       cfg.AliyunESAEnabled,
+		"tencent_edgeone_enabled":  cfg.TencentEdgeOneEnabled,
+		"public_auth_base_url":     logger.SanitizeURL(cfg.PublicAuthBaseURL),
+		"public_http_port":         logger.SanitizePort(cfg.PublicHTTPPort),
+		"public_https_port":        logger.SanitizePort(cfg.PublicHTTPSPort),
+		"auth_host":                logger.SanitizeLogString(cfg.AuthHost),
+		"trust_forwarded_proto":    cfg.TrustForwardedProto,
+	}
 }
 
 func (h *Handler) snapshotForRequest() requestSnapshot {
@@ -335,13 +414,7 @@ func firstForwardedValue(v string) string {
 }
 
 func requestScheme(r *http.Request) string {
-	if proto := firstForwardedValue(r.Header.Get("X-Forwarded-Proto")); proto != "" {
-		return proto
-	}
-	if r.TLS != nil {
-		return "https"
-	}
-	return "http"
+	return publicRequestScheme(r)
 }
 
 const (
@@ -467,12 +540,18 @@ func (h *Handler) shouldOmitPreserveHost(target *url.URL) bool {
 	return h.preserveHost.shouldOmit(target)
 }
 
-func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string) preflightDecision {
+func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string, requestID string) preflightDecision {
 	if r.Header.Get(internalPreflightHeader) == "1" {
+		if event := debugProxyEvent("preflight_skipped_internal", requestID); event != nil {
+			event.Send()
+		}
 		return preflightDecision{}
 	}
 
 	if authConfig.AuthPort <= 0 {
+		if event := debugProxyEvent("preflight_skipped_no_auth_port", requestID); event != nil {
+			event.Send()
+		}
 		return preflightDecision{}
 	}
 	now := time.Now()
@@ -485,12 +564,23 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 				h.preflightCache.mu.Lock()
 				h.preflightCache.deleteEntryLocked(lookup.cacheKey)
 				h.preflightCache.mu.Unlock()
+				if event := debugProxyEvent("preflight_cache_bypassed", requestID); event != nil {
+					event.Str("reason", "fn_app_negative").Send()
+				}
 			} else {
+				if event := debugProxyEvent("preflight_cache_hit", requestID); event != nil {
+					event.Bool("deny", entry.decision.deny).
+						Str("redirect_location", logger.SanitizeURL(entry.decision.redirectLocation)).
+						Send()
+				}
 				return entry.decision
 			}
 		}
 	}
 	if skipUntil := h.preflightSkipUntilUnixNano.Load(); skipUntil > now.UnixNano() {
+		if event := debugProxyEvent("preflight_skipped_cooldown", requestID); event != nil {
+			event.Time("skip_until", time.Unix(0, skipUntil)).Send()
+		}
 		return preflightDecision{}
 	}
 
@@ -501,15 +591,28 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 					h.preflightCache.mu.Lock()
 					h.preflightCache.deleteEntryLocked(lookup.cacheKey)
 					h.preflightCache.mu.Unlock()
+					if event := debugProxyEvent("preflight_cache_bypassed", requestID); event != nil {
+						event.Str("reason", "fn_app_negative_singleflight").Send()
+					}
 				} else {
+					if event := debugProxyEvent("preflight_cache_hit", requestID); event != nil {
+						event.Bool("deny", entry.decision.deny).
+							Str("redirect_location", logger.SanitizeURL(entry.decision.redirectLocation)).
+							Send()
+					}
 					return preflightCacheExecution{entry: &entry}, nil
 				}
 			}
 
-			decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
+			decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode, requestID)
 			if err != nil {
 				cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
 				h.preflightSkipUntilUnixNano.Store(cooldownUntil)
+				if event := debugProxyEvent("preflight_request_failed", requestID); event != nil {
+					event.Str("error", logger.SanitizeLogString(err.Error())).
+						Time("cooldown_until", time.Unix(0, cooldownUntil)).
+						Send()
+				}
 				log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
 				return preflightCacheExecution{}, nil
 			}
@@ -533,10 +636,15 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 		return execution.decision
 	}
 
-	decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode)
+	decision, err := h.performPreflight(r, authConfig, clientIP, isMatch, accessMode, requestID)
 	if err != nil {
 		cooldownUntil := time.Now().Add(preflightFailureCooldown).UnixNano()
 		h.preflightSkipUntilUnixNano.Store(cooldownUntil)
+		if event := debugProxyEvent("preflight_request_failed", requestID); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).
+				Time("cooldown_until", time.Unix(0, cooldownUntil)).
+				Send()
+		}
 		log.Printf("Preflight request failed, skipping checks for %s: %v", preflightFailureCooldown, err)
 		return preflightDecision{}
 	}
@@ -544,15 +652,34 @@ func (h *Handler) runPreflight(r *http.Request, authConfig models.AuthConfig, cl
 	return decision
 }
 
-func (h *Handler) performPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string) (preflightDecision, error) {
+func (h *Handler) performPreflight(r *http.Request, authConfig models.AuthConfig, clientIP string, isMatch bool, accessMode string, requestID string) (preflightDecision, error) {
 	preflightURLPath := authConfig.PreflightURL
 	if preflightURLPath == "" {
 		preflightURLPath = "/api/auth/preflight"
 	}
 	preflightURL := localServiceURL(authConfig.AuthPort, preflightURLPath)
+	start := time.Now()
+	if event := debugProxyEvent("preflight_request_start", requestID); event != nil {
+		event.Str("url", logger.SanitizeURL(preflightURL)).
+			Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Bool("matched", isMatch).
+			Str("access_mode", logger.SanitizeLogString(accessMode)).
+			Interface("forwarded_headers", logger.SanitizeHeader(http.Header{
+				"X-Forwarded-Path":  []string{r.URL.RequestURI()},
+				"X-Forwarded-Host":  []string{r.Host},
+				"X-Forwarded-Proto": []string{requestScheme(r)},
+				"X-Match":           []string{strconv.FormatBool(isMatch)},
+			})).
+			Send()
+	}
 
 	preflightReq, err := http.NewRequest(http.MethodHead, preflightURL, nil)
 	if err != nil {
+		if event := debugProxyEvent("preflight_request_create_failed", requestID); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).
+				Str("url", logger.SanitizeURL(preflightURL)).
+				Send()
+		}
 		log.Printf("Failed to create preflight request: %v", err)
 		return preflightDecision{}, err
 	}
@@ -598,6 +725,14 @@ func (h *Handler) performPreflight(r *http.Request, authConfig models.AuthConfig
 			decision.redirectLocation = location
 		}
 	}
+	if event := debugProxyEvent("preflight_request_end", requestID); event != nil {
+		event.Int("status", resp.StatusCode).
+			Bool("deny", decision.deny).
+			Str("redirect_location", logger.SanitizeURL(decision.redirectLocation)).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Interface("response_headers", logger.SanitizeHeader(resp.Header)).
+			Send()
+	}
 	return decision, nil
 }
 
@@ -612,6 +747,7 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 }
 
 func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initialCfg *config.AppConfig, logsDir string, systemEventClient *events.Client) *Handler {
+	logger.SetDebugAdminPortForRedaction(adminPort)
 	logConfig := gatewaylog.NormalizeConfig(initialCfg.Logging)
 	normalizedForwardedHeaders, _ := normalizeForwardedHeadersConfig(initialCfg.ForwardedHeaders)
 	normalizedPreserveHost, _ := normalizePreserveHostConfig(initialCfg.PreserveHost)
@@ -661,6 +797,17 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		preserveHost:      newPreserveHostConfig(normalizedPreserveHost),
 		wafRuntime:        wafRuntime,
 		systemEventClient: systemEventClient,
+	}
+	if event := debugProxyEvent("handler_initialized", ""); event != nil {
+		event.Interface("proxy_port", logger.SanitizePort(proxyPort)).
+			Int("path_rule_count", len(h.Rules)).
+			Int("host_rule_count", len(h.HostRules)).
+			Int("stream_rule_count", len(h.StreamRules)).
+			Bool("proxy_protocol_force", h.ProxyProtocolForce).
+			Bool("gateway_logging_enabled", h.LoggingConfig.Enabled).
+			Bool("waf_enabled", h.WAFConfig.Enabled).
+			Str("gateway_logs_dir", logger.SanitizeLogString(logsDir)).
+			Send()
 	}
 	h.reverseProxyThrottle = newReverseProxyThrottle(h.ReverseProxyThrottle)
 	h.reverseProxyThrottleExempt = newReverseProxyThrottleExemptIPsRuntime(
@@ -777,7 +924,19 @@ func (h *Handler) saveConfigLocked() {
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
 		return nil
 	}); err != nil {
+		if event := debugProxyEvent("config_save_failed", ""); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).Send()
+		}
 		log.Printf("Failed to save config: %v", err)
+		return
+	}
+	if event := debugProxyEvent("config_saved", ""); event != nil {
+		event.Int("path_rule_count", len(rulesCopy)).
+			Int("host_rule_count", len(hostRulesCopy)).
+			Int("stream_rule_count", len(streamRulesCopy)).
+			Bool("gateway_logging_enabled", h.LoggingConfig.Enabled).
+			Bool("waf_enabled", h.WAFConfig.Enabled).
+			Send()
 	}
 }
 
@@ -795,6 +954,9 @@ func (h *Handler) SetProxyProtocolForce(force bool) {
 	h.saveConfigLocked()
 	hook := h.getProxyProtocolForceChangeHook()
 	h.mu.Unlock()
+	if event := debugProxyEvent("proxy_protocol_force_set", ""); event != nil {
+		event.Bool("enabled", force).Bool("changed", changed).Send()
+	}
 	if changed && hook != nil {
 		hook()
 	}
@@ -933,10 +1095,22 @@ func (h *Handler) emitGatewayThrottleBlockedEvent(args struct {
 func (h *Handler) SetSSLDeployment(config models.SSLConfig) error {
 	normalized, err := normalizeSSLConfig(config)
 	if err != nil {
+		if event := debugProxyEvent("ssl_deployment_invalid", ""); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).
+				Str("deployment_mode", string(config.DeploymentMode)).
+				Int("certificate_count", len(config.Certificates)).
+				Send()
+		}
 		return err
 	}
 	bundle, err := newSSLRuntimeBundle(normalized)
 	if err != nil {
+		if event := debugProxyEvent("ssl_deployment_load_failed", ""); event != nil {
+			event.Str("error", logger.SanitizeLogString(err.Error())).
+				Str("deployment_mode", string(normalized.DeploymentMode)).
+				Int("certificate_count", len(normalized.Certificates)).
+				Send()
+		}
 		return err
 	}
 
@@ -948,6 +1122,12 @@ func (h *Handler) SetSSLDeployment(config models.SSLConfig) error {
 	h.mu.Unlock()
 	if hook != nil {
 		hook()
+	}
+	if event := debugProxyEvent("ssl_deployment_set", ""); event != nil {
+		event.Str("deployment_mode", string(normalized.DeploymentMode)).
+			Int("certificate_count", len(normalized.Certificates)).
+			Bool("enabled", len(normalized.Certificates) > 0).
+			Send()
 	}
 	return nil
 }
@@ -1060,6 +1240,14 @@ func (h *Handler) AddRule(newRule models.Rule) error {
 	h.Rules = nextRules
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("path_rule_upserted", ""); event != nil {
+		event.Str("path", logger.SanitizeLogString(newRule.Path)).
+			Str("target", logger.SanitizeURL(newRule.Target)).
+			Bool("updated", updated).
+			Bool("use_auth", newRule.UseAuth).
+			Int("path_rule_count", len(h.Rules)).
+			Send()
+	}
 	return nil
 }
 
@@ -1200,6 +1388,11 @@ func (h *Handler) RemoveRule(path string) {
 	h.Rules = newRules
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("path_rule_removed", ""); event != nil {
+		event.Str("path", logger.SanitizeLogString(path)).
+			Int("path_rule_count", len(h.Rules)).
+			Send()
+	}
 }
 
 func (h *Handler) FlushRules() {
@@ -1209,6 +1402,9 @@ func (h *Handler) FlushRules() {
 	h.Rules = make([]models.Rule, 0)
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("path_rules_flushed", ""); event != nil {
+		event.Send()
+	}
 }
 
 func (h *Handler) GetRules() []models.Rule {
@@ -1452,6 +1648,16 @@ func (h *Handler) AddHostRule(newRule models.HostRule) error {
 	h.HostRules = nextRules
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("host_rule_upserted", ""); event != nil {
+		event.Str("host", logger.SanitizeLogString(newRule.Host)).
+			Str("target", logger.SanitizeURL(newRule.Target)).
+			Bool("updated", updated).
+			Bool("use_auth", newRule.UseAuth).
+			Int("location_count", len(newRule.Locations)).
+			Bool("basic_auth_enabled", newRule.BasicAuth.Enabled).
+			Int("host_rule_count", len(h.HostRules)).
+			Send()
+	}
 	return nil
 }
 
@@ -1480,6 +1686,11 @@ func (h *Handler) SetHostRules(rules []models.HostRule) error {
 	h.HostRules = normalizedRules
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("host_rules_set", ""); event != nil {
+		event.Int("host_rule_count", len(normalizedRules)).
+			Interface("host_rules", debugHostRuleSummaries(normalizedRules)).
+			Send()
+	}
 	return nil
 }
 
@@ -1490,6 +1701,9 @@ func (h *Handler) FlushHostRules() {
 	h.HostRules = make([]models.HostRule, 0)
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("host_rules_flushed", ""); event != nil {
+		event.Send()
+	}
 }
 
 func (h *Handler) GetHostRules() []models.HostRule {
@@ -1530,6 +1744,11 @@ func (h *Handler) SetStreamRules(rules []models.StreamRule) error {
 
 	h.StreamRules = normalized
 	h.saveConfigLocked()
+	if event := debugProxyEvent("stream_rules_set", ""); event != nil {
+		event.Int("stream_rule_count", len(normalized)).
+			Interface("stream_rules", debugStreamRuleSummaries(normalized)).
+			Send()
+	}
 	return nil
 }
 
@@ -1539,6 +1758,9 @@ func (h *Handler) FlushStreamRules() {
 
 	h.StreamRules = make([]models.StreamRule, 0)
 	h.saveConfigLocked()
+	if event := debugProxyEvent("stream_rules_flushed", ""); event != nil {
+		event.Send()
+	}
 }
 
 func (h *Handler) GetStreamRules() []models.StreamRule {
@@ -1566,6 +1788,9 @@ func (h *Handler) SetDefaultRoute(route string) {
 	}
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
+	if event := debugProxyEvent("default_route_set", ""); event != nil {
+		event.Str("route", logger.SanitizeLogString(h.DefaultRoute)).Send()
+	}
 }
 
 func (h *Handler) GetAuthConfig() models.AuthConfig {
@@ -1591,6 +1816,11 @@ func (h *Handler) SetLoggingConfig(cfg models.LoggingConfig) gatewaylog.ConfigIn
 	h.LoggingConfig = normalized
 	h.saveConfigLocked()
 	h.mu.Unlock()
+	if event := debugProxyEvent("gateway_logging_config_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Int("max_days", normalized.MaxDays).
+			Send()
+	}
 
 	if h.gatewayLogManager == nil {
 		return gatewaylog.ConfigInfo{
@@ -1648,12 +1878,26 @@ func (h *Handler) SetWAFConfig(cfg models.WAFConfig) (proxywaf.Status, error) {
 	}
 	normalized, err := h.wafRuntime.SetConfig(cfg)
 	if err != nil {
+		if event := debugProxyEvent("waf_config_set_failed", ""); event != nil {
+			event.Bool("enabled", cfg.Enabled).
+				Str("mode", logger.SanitizeLogString(cfg.Mode)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return h.wafRuntime.Status(), err
 	}
 	h.mu.Lock()
 	h.WAFConfig = normalized
 	h.saveConfigLocked()
 	h.mu.Unlock()
+	if event := debugProxyEvent("waf_config_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Str("mode", logger.SanitizeLogString(normalized.Mode)).
+			Str("rules_dir", logger.SanitizeLogString(normalized.RulesDir)).
+			Int("disabled_host_count", len(normalized.DisabledHosts)).
+			Int("disabled_path_prefix_count", len(normalized.DisabledPathPrefixes)).
+			Send()
+	}
 	return h.wafRuntime.Status(), nil
 }
 
@@ -1661,7 +1905,16 @@ func (h *Handler) ValidateWAFBundle(cfg models.WAFConfig, bundleID string, bundl
 	if h.wafRuntime == nil {
 		return proxywaf.ValidationResult{}, fmt.Errorf("WAF runtime is not initialized")
 	}
-	return h.wafRuntime.Validate(cfg, bundleID, bundlePath)
+	result, err := h.wafRuntime.Validate(cfg, bundleID, bundlePath)
+	if event := debugProxyEvent("waf_bundle_validate", ""); event != nil {
+		event.Bool("ok", result.OK).
+			Str("bundle_id", logger.SanitizeLogString(result.BundleID)).
+			Str("bundle_path", logger.SanitizeLogString(result.BundlePath)).
+			Str("bundle_hash", logger.SanitizeLogString(result.BundleHash)).
+			Str("error", logger.SanitizeLogString(result.Error)).
+			Send()
+	}
+	return result, err
 }
 
 func (h *Handler) ReloadWAFBundle(cfg models.WAFConfig, bundleID string, bundlePath string) (proxywaf.Status, error) {
@@ -1670,6 +1923,12 @@ func (h *Handler) ReloadWAFBundle(cfg models.WAFConfig, bundleID string, bundleP
 	}
 	status, err := h.wafRuntime.Reload(cfg, bundleID, bundlePath)
 	if err != nil {
+		if event := debugProxyEvent("waf_bundle_reload_failed", ""); event != nil {
+			event.Str("bundle_id", logger.SanitizeLogString(bundleID)).
+				Str("bundle_path", logger.SanitizeLogString(bundlePath)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return status, err
 	}
 	normalized := h.wafRuntime.Config()
@@ -1677,6 +1936,14 @@ func (h *Handler) ReloadWAFBundle(cfg models.WAFConfig, bundleID string, bundleP
 	h.WAFConfig = normalized
 	h.saveConfigLocked()
 	h.mu.Unlock()
+	if event := debugProxyEvent("waf_bundle_reloaded", ""); event != nil {
+		event.Bool("enabled", status.Enabled).
+			Bool("loaded", status.Loaded).
+			Str("mode", logger.SanitizeLogString(status.Mode)).
+			Str("bundle_id", logger.SanitizeLogString(status.BundleID)).
+			Str("bundle_hash", logger.SanitizeLogString(status.BundleHash)).
+			Send()
+	}
 	return status, nil
 }
 
@@ -1725,6 +1992,10 @@ func (h *Handler) SetAuthConfig(config models.AuthConfig) error {
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	h.clearAuthCache()
+	if event := debugProxyEvent("auth_config_set", ""); event != nil {
+		event.Interface("auth_config", debugAuthConfigSummary(config)).
+			Send()
+	}
 	return nil
 }
 
@@ -1833,6 +2104,13 @@ func (h *Handler) SetReverseProxyThrottle(cfg models.ReverseProxyThrottleConfig)
 	if throttle != nil {
 		throttle.updateConfig(normalized)
 	}
+	if event := debugProxyEvent("reverse_proxy_throttle_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Int("requests_per_second", normalized.RequestsPerSecond).
+			Int("burst", normalized.Burst).
+			Int("block_seconds", normalized.BlockSeconds).
+			Send()
+	}
 }
 
 func (h *Handler) SetGatewayVisibility(cfg models.GatewayVisibilityConfig) error {
@@ -1856,6 +2134,12 @@ func (h *Handler) SetGatewayVisibility(cfg models.GatewayVisibilityConfig) error
 	visibility.prefixes = prefixes
 	visibility.mu.Unlock()
 
+	if event := debugProxyEvent("gateway_visibility_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Int("cidr_count", len(normalized.CIDRs)).
+			Str("updated_at", logger.SanitizeLogString(normalized.UpdatedAt)).
+			Send()
+	}
 	return nil
 }
 
@@ -1873,6 +2157,12 @@ func (h *Handler) SetForwardedHeadersConfig(cfg models.ForwardedHeadersConfig) {
 	h.mu.Unlock()
 
 	forwardedHeaders.updateConfig(normalized)
+	if event := debugProxyEvent("forwarded_headers_config_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Int("omit_target_count", len(normalized.OmitTargets)).
+			Str("updated_at", logger.SanitizeLogString(normalized.UpdatedAt)).
+			Send()
+	}
 }
 
 func (h *Handler) SetPreserveHostConfig(cfg models.PreserveHostConfig) {
@@ -1889,6 +2179,12 @@ func (h *Handler) SetPreserveHostConfig(cfg models.PreserveHostConfig) {
 	h.mu.Unlock()
 
 	preserveHost.updateConfig(normalized)
+	if event := debugProxyEvent("preserve_host_config_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Int("omit_target_count", len(normalized.OmitTargets)).
+			Str("updated_at", logger.SanitizeLogString(normalized.UpdatedAt)).
+			Send()
+	}
 }
 
 func (h *Handler) GetGatewayPortalConfig() models.GatewayPortalConfig {
@@ -1905,6 +2201,9 @@ func (h *Handler) SetGatewayPortalConfig(cfg models.GatewayPortalConfig) models.
 	h.publishRequestSnapshotLocked()
 	h.saveConfigLocked()
 	h.mu.Unlock()
+	if event := debugProxyEvent("gateway_portal_config_set", ""); event != nil {
+		event.Str("display_style", logger.SanitizeLogString(normalized.DisplayStyle)).Send()
+	}
 
 	return normalized
 }
@@ -1919,6 +2218,11 @@ func (h *Handler) SetFnosPortIconHijackConfig(cfg models.FnosPortIconHijackConfi
 	h.FnosPortIconHijack = normalized
 	h.saveConfigLocked()
 	h.mu.Unlock()
+	if event := debugProxyEvent("fnos_port_icon_hijack_config_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Str("updated_at", logger.SanitizeLogString(normalized.UpdatedAt)).
+			Send()
+	}
 
 	return normalized
 }
@@ -1935,6 +2239,14 @@ func (h *Handler) SetReverseProxyThrottleExemptIPs(cfg models.ReverseProxyThrott
 	h.mu.Unlock()
 
 	runtime.updateConfig(cfg)
+	normalized := runtime.getConfig()
+	if event := debugProxyEvent("reverse_proxy_throttle_exempt_ips_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Int("ip_count", len(normalized.IPs)).
+			Int("cidr_count", len(normalized.CIDRs)).
+			Str("updated_at", logger.SanitizeLogString(normalized.UpdatedAt)).
+			Send()
+	}
 }
 
 func (h *Handler) GetCommonLocationExemptions() models.CommonLocationExemptionsRuntime {
@@ -1966,6 +2278,14 @@ func (h *Handler) SetCommonLocationExemptions(cfg models.CommonLocationExemption
 	h.mu.Unlock()
 
 	runtime.updateConfig(cfg)
+	normalized := runtime.getConfig()
+	if event := debugProxyEvent("common_location_exemptions_set", ""); event != nil {
+		event.Bool("enabled", normalized.Enabled).
+			Bool("waf_enabled", normalized.WAFEnabled).
+			Int("cidr_count", len(normalized.CIDRs)).
+			Str("updated_at", logger.SanitizeLogString(normalized.UpdatedAt)).
+			Send()
+	}
 }
 
 type TrafficStats struct {
@@ -2535,6 +2855,10 @@ func wrapRequestBodyForTraffic(r *http.Request, h *Handler, metrics *requestTraf
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	requestID := ""
+	if logger.DebugEnabled() {
+		requestID = logger.NextDebugRequestID()
+	}
 	h.trafficActive.Add(1)
 	metrics := &requestTrafficMetrics{statusCode: http.StatusOK}
 	accessEntry := gatewaylog.Entry{
@@ -2561,8 +2885,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	tw := &trafficResponseWriter{ResponseWriter: w, handler: h, metrics: metrics}
 	w = tw
+	if event := debugProxyEvent("request_start", requestID); event != nil {
+		event.Str("method", r.Method).
+			Str("scheme", requestScheme(r)).
+			Str("host", logger.SanitizeLogString(r.Host)).
+			Str("path", logger.SanitizeLogString(r.URL.Path)).
+			Str("query", logger.SanitizeURL("?"+r.URL.RawQuery)).
+			Str("request_uri", logger.SanitizeURL(r.URL.RequestURI())).
+			Str("protocol", r.Proto).
+			Str("remote_addr", logger.SanitizeLogString(r.RemoteAddr)).
+			Bool("tls", r.TLS != nil).
+			Bool("websocket", strings.EqualFold(r.Header.Get("Upgrade"), "websocket")).
+			Interface("headers", logger.SanitizeHeader(r.Header)).
+			Send()
+	}
 
 	defer func() {
+		rec := recover()
 		h.trafficActive.Add(-1)
 		if metrics.statusCode >= 500 {
 			h.trafficError5xx.Add(1)
@@ -2585,26 +2924,67 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !tw.skipAccessLog && h.gatewayLogManager != nil {
 			h.gatewayLogManager.Log(accessEntry)
 		}
-		if rec := recover(); rec != nil {
+		if event := debugProxyEvent("request_end", requestID); event != nil {
+			event.Str("method", r.Method).
+				Str("host", logger.SanitizeLogString(accessEntry.Host)).
+				Str("path", logger.SanitizeLogString(accessEntry.Path)).
+				Str("route_type", accessEntry.RouteType).
+				Str("route_key", logger.SanitizeLogString(accessEntry.RouteKey)).
+				Str("upstream", logger.SanitizeURL(accessEntry.Upstream)).
+				Int("status", accessEntry.Status).
+				Int64("duration_ms", accessEntry.DurationMs).
+				Uint64("bytes_in", accessEntry.BytesIn).
+				Uint64("bytes_out", accessEntry.BytesOut).
+				Str("remote_ip", logger.SanitizeLogString(accessEntry.RemoteIP)).
+				Bool("logged_in", accessEntry.LoggedIn).
+				Bool("auth_required", accessEntry.AuthRequired).
+				Str("auth_decision", accessEntry.AuthDecision).
+				Bool("matched", accessEntry.Matched).
+				Bool("access_log_suppressed", tw.skipAccessLog).
+				Bool("panic", rec != nil).
+				Send()
+		}
+		if rec != nil {
 			panic(rec)
 		}
 	}()
 
 	snapshot := h.snapshotForRequest()
+	originalPath := r.URL.Path
 	cleanedPath := path.Clean(r.URL.Path)
 	if strings.HasSuffix(r.URL.Path, "/") && cleanedPath != "/" {
 		cleanedPath += "/"
 	}
 	r.URL.Path = cleanedPath
+	if originalPath != cleanedPath {
+		if event := debugProxyEvent("path_normalized", requestID); event != nil {
+			event.Str("original_path", logger.SanitizeLogString(originalPath)).
+				Str("cleaned_path", logger.SanitizeLogString(cleanedPath)).
+				Send()
+		}
+	}
 
 	clientIP = resolveClientIP(r, snapshot.authConfig, snapshot.proxyProtocolForce)
 	accessEntry.RemoteIP = clientIP
+	if event := debugProxyEvent("client_ip_resolved", requestID); event != nil {
+		event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Bool("proxy_protocol_force", snapshot.proxyProtocolForce).
+			Bool("edge_client_ip_active", snapshot.authConfig.EdgeClientIPActive()).
+			Str("x_forwarded_for", logger.SanitizeLogString(firstForwardedValue(r.Header.Get("X-Forwarded-For")))).
+			Str("x_real_ip", logger.SanitizeLogString(r.Header.Get("X-Real-IP"))).
+			Str("ali_real_client_ip", logger.SanitizeLogString(r.Header.Get("Ali-Real-Client-IP"))).
+			Str("eo_connecting_ip", logger.SanitizeLogString(r.Header.Get("EO-Connecting-IP"))).
+			Send()
+	}
 
 	if !h.IsClientIPVisible(clientIP) {
 		accessEntry.RouteType = "visibility"
 		accessEntry.RouteKey = "cidr"
 		accessEntry.AuthDecision = "visibility_denied"
 		loggedStatusCode = 499
+		if event := debugProxyEvent("visibility_denied", requestID); event != nil {
+			event.Str("client_ip", logger.SanitizeLogString(clientIP)).Send()
+		}
 		h.abortConnection(w)
 		return
 	}
@@ -2613,6 +2993,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.RouteType = "favicon"
 		accessEntry.RouteKey = r.URL.Path
 		accessEntry.Matched = true
+		if event := debugProxyEvent("favicon_served", requestID); event != nil {
+			event.Str("path", logger.SanitizeLogString(r.URL.Path)).Send()
+		}
 		response.ServeFavicon(w, r)
 		return
 	}
@@ -2641,6 +3024,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if matchedRule == nil && snapshot.defaultRule != nil {
 		matchedRule = copyRule(*snapshot.defaultRule)
 	}
+	if event := debugProxyEvent("route_match_evaluated", requestID); event != nil {
+		event.Bool("select_route", isSelectRoute).
+			Bool("auth_route", isAuthRoute).
+			Bool("host_rule_matched", matchedHostRule != nil).
+			Bool("host_location_matched", matchedHostLocation != nil).
+			Bool("path_rule_matched", matchedRule != nil).
+			Str("needs_slash_redirect", logger.SanitizeLogString(needsSlashRedirect)).
+			Str("host_rule", func() string {
+				if matchedHostRule == nil {
+					return ""
+				}
+				return logger.SanitizeLogString(matchedHostRule.Host)
+			}()).
+			Str("path_rule", func() string {
+				if matchedRule == nil {
+					return ""
+				}
+				return logger.SanitizeLogString(matchedRule.Path)
+			}()).
+			Send()
+	}
 	throttleCheckedAt := time.Now()
 	throttleDecision := h.evaluateReverseProxyThrottleRequest(
 		isAuthRoute,
@@ -2651,6 +3055,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		throttleCheckedAt,
 	)
 	if !throttleDecision.Allowed {
+		if event := debugProxyEvent("throttle_blocked", requestID); event != nil {
+			event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Bool("newly_blocked", throttleDecision.NewlyBlocked).
+				Time("blocked_until", throttleDecision.BlockedUntil).
+				Str("route_type", classifyReverseProxyRouteType(r.URL.Path, isAuthRoute, matchedHostRule, matchedHostLocation, matchedRule)).
+				Send()
+		}
 		if throttleDecision.NewlyBlocked {
 			go h.emitGatewayThrottleBlockedEvent(struct {
 				ClientIP     string
@@ -2676,6 +3087,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.abortConnection(w)
 		return
 	}
+	if event := debugProxyEvent("throttle_allowed", requestID); event != nil {
+		event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Str("route_type", classifyReverseProxyRouteType(r.URL.Path, isAuthRoute, matchedHostRule, matchedHostLocation, matchedRule)).
+			Send()
+	}
 	wafRouteType, wafRouteKey, wafUpstream := wafRouteContext(r, snapshot, isAuthRoute, matchedHostRule, matchedHostLocation, matchedRule)
 	h.mu.RLock()
 	commonLocationExemptions := h.commonLocationExemptions
@@ -2690,6 +3106,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Scheme:     requestScheme(r),
 			RemoteAddr: r.RemoteAddr,
 		})
+		if event := debugProxyEvent("waf_evaluated", requestID); event != nil {
+			event.Bool("enabled", decision.Enabled).
+				Bool("allowed", decision.Allowed).
+				Str("mode", decision.Mode).
+				Str("action", decision.Action).
+				Int("status", decision.Status).
+				Str("trace_id", decision.TraceID).
+				Ints("rule_ids", decision.RuleIDs).
+				Str("route_type", wafRouteType).
+				Str("route_key", logger.SanitizeLogString(wafRouteKey)).
+				Str("upstream", logger.SanitizeURL(wafUpstream)).
+				Send()
+		}
 		if decision.Enabled && decision.TraceID != "" {
 			accessEntry.WAFTraceID = decision.TraceID
 			accessEntry.WAFMode = decision.Mode
@@ -2716,20 +3145,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isMatch := isSelectRoute || isAuthRoute || matchedHostRule != nil || matchedRule != nil || r.URL.Path == "/"
 	accessEntry.Matched = isMatch
 	accessEntry.AccessMode = accessMode
-	preflight := h.runPreflight(r, snapshot.authConfig, clientIP, isMatch, accessMode)
+	preflight := h.runPreflight(r, snapshot.authConfig, clientIP, isMatch, accessMode, requestID)
 	if preflight.deny {
 		accessEntry.RouteType = "preflight"
 		accessEntry.AuthDecision = "denied"
 		loggedStatusCode = 499
 		suppressAccessLog(w)
+		if event := debugProxyEvent("preflight_denied", requestID); event != nil {
+			event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Bool("matched", isMatch).
+				Str("access_mode", accessMode).
+				Send()
+		}
 		h.abortConnection(w)
 		return
 	}
 	if preflight.redirectLocation != "" {
 		accessEntry.RouteType = "preflight"
 		accessEntry.AuthDecision = "redirected"
+		if event := debugProxyEvent("preflight_redirected", requestID); event != nil {
+			event.Str("redirect_location", logger.SanitizeURL(preflight.redirectLocation)).
+				Bool("matched", isMatch).
+				Str("access_mode", accessMode).
+				Send()
+		}
 		http.Redirect(w, r, preflight.redirectLocation, http.StatusFound)
 		return
+	}
+	if event := debugProxyEvent("preflight_allowed", requestID); event != nil {
+		event.Bool("matched", isMatch).
+			Str("access_mode", accessMode).
+			Send()
 	}
 	if needsSlashRedirect != "" {
 		accessEntry.RouteType = "slash_redirect"
@@ -2738,6 +3184,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.URL.RawQuery != "" {
 			newPath += "?" + r.URL.RawQuery
 		}
+		if event := debugProxyEvent("slash_redirect", requestID); event != nil {
+			event.Str("target", logger.SanitizeURL(newPath)).Send()
+		}
 		http.Redirect(w, r, newPath, http.StatusMovedPermanently)
 		return
 	}
@@ -2745,9 +3194,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.RouteType = "select"
 		accessEntry.RouteKey = r.URL.Path
 		accessEntry.AuthRequired = snapshot.authConfig.AuthURL != ""
-		authResult := h.handleSelectRoute(w, r, snapshot, clientIP)
+		authResult := h.handleSelectRoute(w, r, snapshot, clientIP, requestID)
 		accessEntry.LoggedIn = authResult.authenticated
 		accessEntry.AuthDecision = authResult.decision
+		if event := debugProxyEvent("select_route_served", requestID); event != nil {
+			event.Bool("auth_required", accessEntry.AuthRequired).
+				Bool("authenticated", authResult.authenticated).
+				Str("auth_decision", authResult.decision).
+				Send()
+		}
 		return
 	}
 	if isAuthRoute {
@@ -2757,6 +3212,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			accessEntry.Upstream = fmt.Sprintf("http://127.0.0.1:%d", snapshot.authConfig.AuthPort)
 		}
 		accessEntry.AuthDecision = "proxy"
+		if event := debugProxyEvent("auth_proxy_route", requestID); event != nil {
+			event.Str("path", logger.SanitizeLogString(r.URL.Path)).
+				Str("upstream", logger.SanitizeURL(accessEntry.Upstream)).
+				Send()
+		}
 		h.handleAuthProxyRoute(w, r, snapshot, clientIP)
 		return
 	}
@@ -2778,40 +3238,65 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.AuthRequired = matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != ""
 		authResult := authCheckResult{allowed: true, decision: "not_required"}
 		if accessEntry.AuthRequired {
-			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode, authUpstreamTarget)
+			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode, authUpstreamTarget, requestID)
 			accessEntry.LoggedIn = authResult.authenticated
 			accessEntry.AuthDecision = authResult.decision
 			if !authResult.allowed {
 				if authResult.decision == "denied" {
 					loggedStatusCode = 499
 				}
+				if event := debugProxyEvent("host_auth_rejected", requestID); event != nil {
+					event.Str("host", logger.SanitizeLogString(matchedHostRule.Host)).
+						Str("auth_decision", authResult.decision).
+						Send()
+				}
 				return
 			}
 		} else if !matchedHostRule.SuppressToolbar && shouldProbeAuthForToolbar(r, snapshot.authConfig) {
-			authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP)
+			authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
 			accessEntry.AuthDecision = authResult.decision
 		} else {
 			accessEntry.AuthDecision = authResult.decision
 		}
 		accessEntry.LoggedIn = authResult.authenticated
 		if matchedHostLocation != nil {
+			if event := debugProxyEvent("host_location_selected", requestID); event != nil {
+				event.Str("route_key", logger.SanitizeLogString(hostLocationRouteKey(matchedHostRule, matchedHostLocation))).
+					Str("action", logger.SanitizeLogString(matchedHostLocation.Action)).
+					Str("upstream", logger.SanitizeURL(accessEntry.Upstream)).
+					Bool("auth_required", accessEntry.AuthRequired).
+					Bool("authenticated", authResult.authenticated).
+					Str("auth_decision", authResult.decision).
+					Send()
+			}
 			switch matchedHostLocation.Action {
 			case models.HostLocationActionResponse:
 				serveHostLocationResponse(w, *matchedHostLocation)
 			case models.HostLocationActionProxy:
-				h.proxyToHostLocationTarget(w, r, snapshot, *matchedHostRule, *matchedHostLocation, clientIP, authResult)
+				h.proxyToHostLocationTarget(w, r, snapshot, *matchedHostRule, *matchedHostLocation, clientIP, authResult, requestID)
 			default:
 				response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid host location configuration", snapshot.rules)
 			}
 			return
 		}
-		h.proxyToHostTarget(w, r, snapshot, *matchedHostRule, clientIP, authResult)
+		if event := debugProxyEvent("host_rule_selected", requestID); event != nil {
+			event.Str("host", logger.SanitizeLogString(matchedHostRule.Host)).
+				Str("upstream", logger.SanitizeURL(matchedHostRule.Target)).
+				Bool("auth_required", accessEntry.AuthRequired).
+				Bool("authenticated", authResult.authenticated).
+				Str("auth_decision", authResult.decision).
+				Send()
+		}
+		h.proxyToHostTarget(w, r, snapshot, *matchedHostRule, clientIP, authResult, requestID)
 		return
 	}
 	if matchedRule == nil {
 		accessEntry.RouteType = "not_found"
 		accessEntry.RouteKey = r.URL.Path
 		accessEntry.AuthDecision = "not_required"
+		if event := debugProxyEvent("route_not_found", requestID); event != nil {
+			event.Str("path", logger.SanitizeLogString(r.URL.Path)).Send()
+		}
 		h.handleNoMatchRoute(w, r, snapshot, clientIP)
 		return
 	}
@@ -2826,33 +3311,49 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Value: matchedRule.Path,
 			Path:  "/",
 		})
+		if event := debugProxyEvent("root_mode_redirect", requestID); event != nil {
+			event.Str("path_rule", logger.SanitizeLogString(matchedRule.Path)).Send()
+		}
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 	authResult := authCheckResult{allowed: true, decision: "not_required"}
 	if accessEntry.AuthRequired {
-		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "", matchedRule.Target)
+		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "", matchedRule.Target, requestID)
 		accessEntry.LoggedIn = authResult.authenticated
 		accessEntry.AuthDecision = authResult.decision
 		if !authResult.allowed {
 			if authResult.decision == "denied" {
 				loggedStatusCode = 499
 			}
+			if event := debugProxyEvent("path_auth_rejected", requestID); event != nil {
+				event.Str("path_rule", logger.SanitizeLogString(matchedRule.Path)).
+					Str("auth_decision", authResult.decision).
+					Send()
+			}
 			return
 		}
 	} else if shouldProbeAuthForToolbar(r, snapshot.authConfig) {
-		authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP)
+		authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
 		accessEntry.AuthDecision = authResult.decision
 	} else {
 		accessEntry.AuthDecision = authResult.decision
 	}
 	accessEntry.LoggedIn = authResult.authenticated
-	h.proxyToRuleTarget(w, r, snapshot, *matchedRule, clientIP, authResult)
+	if event := debugProxyEvent("path_rule_selected", requestID); event != nil {
+		event.Str("path_rule", logger.SanitizeLogString(matchedRule.Path)).
+			Str("upstream", logger.SanitizeURL(matchedRule.Target)).
+			Bool("auth_required", accessEntry.AuthRequired).
+			Bool("authenticated", authResult.authenticated).
+			Str("auth_decision", authResult.decision).
+			Send()
+	}
+	h.proxyToRuleTarget(w, r, snapshot, *matchedRule, clientIP, authResult, requestID)
 }
 
-func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string) authCheckResult {
+func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string, requestID string) authCheckResult {
 	if snapshot.authConfig.AuthURL != "" {
-		authResult := h.checkAuth(w, r, snapshot.authConfig, clientIP, "", "")
+		authResult := h.checkAuth(w, r, snapshot.authConfig, clientIP, "", "", requestID)
 		if !authResult.allowed {
 			return authResult
 		}
@@ -3162,9 +3663,16 @@ func serveHostLocationResponse(w http.ResponseWriter, location models.HostLocati
 	_, _ = io.WriteString(w, location.Response.Body)
 }
 
-func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, location models.HostLocation, clientIP string, authResult authCheckResult) {
+func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, location models.HostLocation, clientIP string, authResult authCheckResult, requestID string) {
 	targetURL, err := url.Parse(location.Target)
 	if err != nil {
+		if event := debugProxyEvent("reverse_proxy_target_invalid", requestID); event != nil {
+			event.Str("route_type", "host_location").
+				Str("route_key", logger.SanitizeLogString(hostLocationRouteKey(&matchedRule, &location))).
+				Str("target", logger.SanitizeURL(location.Target)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
 		return
 	}
@@ -3184,6 +3692,17 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
+	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
+		event.Str("route_type", "host_location").
+			Str("route_key", logger.SanitizeLogString(hostLocationRouteKey(&matchedRule, &location))).
+			Str("target", logger.SanitizeURL(targetURL.String())).
+			Bool("omit_forwarded_headers", omitForwardedHeaders).
+			Bool("preserve_host", preserveHost).
+			Bool("strip_path", location.StripPath).
+			Bool("rewrite_html", location.RewriteHTML).
+			Bool("toolbar_candidate", authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Send()
+	}
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -3229,8 +3748,21 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 			if location.RewriteHTML || (authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA) {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
+			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
+				event.Str("route_type", "host_location").
+					Str("target_url", logger.SanitizeURL(pr.Out.URL.String())).
+					Str("out_host", logger.SanitizeLogString(pr.Out.Host)).
+					Interface("out_header_names", logger.SanitizedHeaderNames(pr.Out.Header)).
+					Send()
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if event := debugProxyEvent("reverse_proxy_error", requestID); event != nil {
+				event.Str("route_type", "host_location").
+					Str("target", logger.SanitizeURL(targetURL.String())).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			log.Printf("Host location proxy error: %v", err)
 			response.HTML(w, r, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
 		},
@@ -3249,6 +3781,16 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 
 		needsRewrite := location.RewriteHTML
 		needsToolbar := authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
+			event.Str("route_type", "host_location").
+				Int("status", resp.StatusCode).
+				Str("content_type", logger.SanitizeLogString(resp.Header.Get("Content-Type"))).
+				Bool("rewrite_html", needsRewrite).
+				Bool("toolbar", needsToolbar).
+				Int64("content_length", resp.ContentLength).
+				Interface("response_headers", logger.SanitizeHeader(resp.Header)).
+				Send()
+		}
 		if !needsRewrite && !needsToolbar {
 			return nil
 		}
@@ -3314,9 +3856,16 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 	proxy.ServeHTTP(w, r)
 }
 
-func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult) {
+func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult, requestID string) {
 	targetURL, err := url.Parse(matchedRule.Target)
 	if err != nil {
+		if event := debugProxyEvent("reverse_proxy_target_invalid", requestID); event != nil {
+			event.Str("route_type", "host_rule").
+				Str("route_key", logger.SanitizeLogString(matchedRule.Host)).
+				Str("target", logger.SanitizeURL(matchedRule.Target)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
 		return
 	}
@@ -3336,6 +3885,15 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
+	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
+		event.Str("route_type", "host_rule").
+			Str("route_key", logger.SanitizeLogString(matchedRule.Host)).
+			Str("target", logger.SanitizeURL(targetURL.String())).
+			Bool("omit_forwarded_headers", omitForwardedHeaders).
+			Bool("preserve_host", preserveHost).
+			Bool("toolbar_candidate", authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Send()
+	}
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -3365,8 +3923,21 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			if authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
+			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
+				event.Str("route_type", "host_rule").
+					Str("target_url", logger.SanitizeURL(pr.Out.URL.String())).
+					Str("out_host", logger.SanitizeLogString(pr.Out.Host)).
+					Interface("out_header_names", logger.SanitizedHeaderNames(pr.Out.Header)).
+					Send()
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if event := debugProxyEvent("reverse_proxy_error", requestID); event != nil {
+				event.Str("route_type", "host_rule").
+					Str("target", logger.SanitizeURL(targetURL.String())).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			log.Printf("Host proxy error: %v", err)
 			response.HTML(w, r, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
 		},
@@ -3384,6 +3955,15 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 
 		needsToolbar := authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
+			event.Str("route_type", "host_rule").
+				Int("status", resp.StatusCode).
+				Str("content_type", logger.SanitizeLogString(resp.Header.Get("Content-Type"))).
+				Bool("toolbar", needsToolbar).
+				Int64("content_length", resp.ContentLength).
+				Interface("response_headers", logger.SanitizeHeader(resp.Header)).
+				Send()
+		}
 		if !needsToolbar {
 			return nil
 		}
@@ -3434,9 +4014,16 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	proxy.ServeHTTP(w, r)
 }
 
-func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.Rule, clientIP string, authResult authCheckResult) {
+func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.Rule, clientIP string, authResult authCheckResult, requestID string) {
 	targetURL, err := url.Parse(matchedRule.Target)
 	if err != nil {
+		if event := debugProxyEvent("reverse_proxy_target_invalid", requestID); event != nil {
+			event.Str("route_type", "path_rule").
+				Str("route_key", logger.SanitizeLogString(matchedRule.Path)).
+				Str("target", logger.SanitizeURL(matchedRule.Target)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		response.HTML(w, r, errors.CodeProxyTargetInvalid, "Invalid target URL configuration", snapshot.rules)
 		return
 	}
@@ -3454,6 +4041,16 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 	preserveHost := !h.shouldOmitPreserveHost(targetURL)
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
+		event.Str("route_type", "path_rule").
+			Str("route_key", logger.SanitizeLogString(matchedRule.Path)).
+			Str("target", logger.SanitizeURL(targetURL.String())).
+			Bool("preserve_host", preserveHost).
+			Bool("strip_path", matchedRule.StripPath).
+			Bool("rewrite_html", matchedRule.RewriteHTML).
+			Bool("toolbar_candidate", authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Send()
+	}
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -3499,8 +4096,21 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
+			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
+				event.Str("route_type", "path_rule").
+					Str("target_url", logger.SanitizeURL(pr.Out.URL.String())).
+					Str("out_host", logger.SanitizeLogString(pr.Out.Host)).
+					Interface("out_header_names", logger.SanitizedHeaderNames(pr.Out.Header)).
+					Send()
+			}
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if event := debugProxyEvent("reverse_proxy_error", requestID); event != nil {
+				event.Str("route_type", "path_rule").
+					Str("target", logger.SanitizeURL(targetURL.String())).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			log.Printf("Proxy error: %v", err)
 			response.HTML(w, r, errors.CodeProxyTimeout, "Upstream unavailable: "+err.Error(), h.GetRules())
 		},
@@ -3514,6 +4124,16 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 
 		needsRewrite := matchedRule.RewriteHTML && !matchedRule.UseRootMode
 		needsToolbar := authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA
+		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
+			event.Str("route_type", "path_rule").
+				Int("status", resp.StatusCode).
+				Str("content_type", logger.SanitizeLogString(resp.Header.Get("Content-Type"))).
+				Bool("rewrite_html", needsRewrite).
+				Bool("toolbar", needsToolbar).
+				Int64("content_length", resp.ContentLength).
+				Interface("response_headers", logger.SanitizeHeader(resp.Header)).
+				Send()
+		}
 		if !needsRewrite && !needsToolbar {
 			return nil
 		}
@@ -3688,7 +4308,7 @@ type authCheckExecution struct {
 	plan  authCheckPlan
 }
 
-func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string) authCheckPlan {
+func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, requestID string) authCheckPlan {
 	client := h.authClient
 	if client == nil {
 		client = &http.Client{
@@ -3698,6 +4318,9 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 	}
 
 	if authConfig.AuthPort <= 0 {
+		if event := debugProxyEvent("auth_check_missing_port", requestID); event != nil {
+			event.Send()
+		}
 		log.Printf("Auth check requested but AuthPort is not configured")
 		return authCheckPlan{
 			result: authCheckResult{decision: "error"},
@@ -3714,9 +4337,28 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 		authURLPath = "/api/auth/verify"
 	}
 	authURL := localServiceURL(authConfig.AuthPort, authURLPath)
+	start := time.Now()
+	if event := debugProxyEvent("auth_check_start", requestID); event != nil {
+		event.Str("url", logger.SanitizeURL(authURL)).
+			Str("client_ip", logger.SanitizeLogString(clientIP)).
+			Str("access_mode", logger.SanitizeLogString(accessMode)).
+			Interface("forwarded_headers", logger.SanitizeHeader(http.Header{
+				"X-Forwarded-Path":  []string{r.URL.RequestURI()},
+				"X-Forwarded-Host":  []string{r.Host},
+				"X-Forwarded-Proto": []string{requestScheme(r)},
+			})).
+			Bool("has_cookie", r.Header.Get("Cookie") != "").
+			Bool("has_authorization", r.Header.Get("Authorization") != "").
+			Send()
+	}
 
 	authReq, err := http.NewRequest("GET", authURL, nil)
 	if err != nil {
+		if event := debugProxyEvent("auth_check_create_failed", requestID); event != nil {
+			event.Str("url", logger.SanitizeURL(authURL)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		log.Printf("Failed to create auth request: %v", err)
 		return authCheckPlan{
 			result: authCheckResult{decision: "error"},
@@ -3748,6 +4390,12 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 
 	resp, err := client.Do(authReq)
 	if err != nil {
+		if event := debugProxyEvent("auth_check_request_failed", requestID); event != nil {
+			event.Str("url", logger.SanitizeURL(authURL)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		log.Printf("Auth request failed: %v", err)
 		return authCheckPlan{
 			result: authCheckResult{decision: "error"},
@@ -3767,6 +4415,13 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&authResponse); err != nil {
+		if event := debugProxyEvent("auth_check_decode_failed", requestID); event != nil {
+			event.Int("status", resp.StatusCode).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Interface("response_headers", logger.SanitizeHeader(resp.Header)).
+				Send()
+		}
 		log.Printf("Failed to decode auth response: %v", err)
 		return authCheckPlan{
 			result: authCheckResult{decision: "error"},
@@ -3778,6 +4433,16 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 		}
 	}
 	if authResponse.Success {
+		if event := debugProxyEvent("auth_check_end", requestID); event != nil {
+			event.Int("status", resp.StatusCode).
+				Bool("success", true).
+				Str("decision", "passed").
+				Bool("suppress_toolbar", strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share")).
+				Int("set_cookie_count", len(setCookies)).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Interface("response_headers", logger.SanitizeHeader(resp.Header)).
+				Send()
+		}
 		return authCheckPlan{
 			result: authCheckResult{
 				allowed:         true,
@@ -3790,6 +4455,15 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 	}
 	log.Printf("Auth failed: %s", authResponse.Message)
 	if accessMode == "strict_whitelist" {
+		if event := debugProxyEvent("auth_check_end", requestID); event != nil {
+			event.Int("status", resp.StatusCode).
+				Bool("success", false).
+				Str("decision", "denied").
+				Str("message", logger.SanitizeLogString(authResponse.Message)).
+				Int("set_cookie_count", len(setCookies)).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
 		return authCheckPlan{
 			result:          authCheckResult{decision: "denied"},
 			setCookies:      setCookies,
@@ -3798,6 +4472,16 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 	}
 	if redirectLocation := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); redirectLocation != "" {
 		if strings.HasPrefix(redirectLocation, "/") || strings.HasPrefix(redirectLocation, "http://") || strings.HasPrefix(redirectLocation, "https://") {
+			if event := debugProxyEvent("auth_check_end", requestID); event != nil {
+				event.Int("status", resp.StatusCode).
+					Bool("success", false).
+					Str("decision", "redirected").
+					Str("redirect_location", logger.SanitizeURL(redirectLocation)).
+					Str("message", logger.SanitizeLogString(authResponse.Message)).
+					Int("set_cookie_count", len(setCookies)).
+					Int64("duration_ms", time.Since(start).Milliseconds()).
+					Send()
+			}
 			return authCheckPlan{
 				result:           authCheckResult{decision: "redirected"},
 				setCookies:       setCookies,
@@ -3824,6 +4508,16 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 		loginURL.RawQuery = q.Encode()
 	}
 
+	if event := debugProxyEvent("auth_check_end", requestID); event != nil {
+		event.Int("status", resp.StatusCode).
+			Bool("success", false).
+			Str("decision", "redirected").
+			Str("redirect_location", logger.SanitizeURL(loginURL.String())).
+			Str("message", logger.SanitizeLogString(authResponse.Message)).
+			Int("set_cookie_count", len(setCookies)).
+			Int64("duration_ms", time.Since(start).Milliseconds()).
+			Send()
+	}
 	return authCheckPlan{
 		result:           authCheckResult{decision: "redirected"},
 		setCookies:       setCookies,
@@ -3895,10 +4589,16 @@ func shouldProbeAuthForToolbar(r *http.Request, authConfig models.AuthConfig) bo
 		!response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 }
 
-func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string) authCheckExecution {
+func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, requestID string) authCheckExecution {
 	now := time.Now()
 	useCache := authCacheEnabled(authConfig)
 	lookup, canLookup := buildAuthCacheLookup(r, clientIP, accessMode)
+	if event := debugProxyEvent("auth_cache_lookup", requestID); event != nil {
+		event.Bool("enabled", useCache).
+			Bool("can_lookup", canLookup).
+			Str("access_mode", logger.SanitizeLogString(accessMode)).
+			Send()
+	}
 
 	if useCache && canLookup {
 		if entry, ok := h.authCacheGet(lookup.cacheKey, now); ok {
@@ -3906,7 +4606,17 @@ func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig
 				h.authCache.mu.Lock()
 				h.authCache.deleteEntryLocked(lookup.cacheKey)
 				h.authCache.mu.Unlock()
+				if event := debugProxyEvent("auth_cache_bypassed", requestID); event != nil {
+					event.Str("reason", "fn_app_unauthorized").Send()
+				}
 			} else {
+				if event := debugProxyEvent("auth_cache_hit", requestID); event != nil {
+					event.Str("decision", entry.result.decision).
+						Bool("allowed", entry.result.allowed).
+						Bool("authenticated", entry.result.authenticated).
+						Time("expires_at", entry.expiresAt).
+						Send()
+				}
 				return authCheckExecution{entry: &entry}
 			}
 		}
@@ -3917,12 +4627,22 @@ func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig
 					h.authCache.mu.Lock()
 					h.authCache.deleteEntryLocked(lookup.cacheKey)
 					h.authCache.mu.Unlock()
+					if event := debugProxyEvent("auth_cache_bypassed", requestID); event != nil {
+						event.Str("reason", "fn_app_unauthorized_singleflight").Send()
+					}
 				} else {
+					if event := debugProxyEvent("auth_cache_hit", requestID); event != nil {
+						event.Str("decision", entry.result.decision).
+							Bool("allowed", entry.result.allowed).
+							Bool("authenticated", entry.result.authenticated).
+							Time("expires_at", entry.expiresAt).
+							Send()
+					}
 					return authCheckExecution{entry: &entry}, nil
 				}
 			}
 
-			plan := h.performAuthCheck(r, authConfig, clientIP, accessMode)
+			plan := h.performAuthCheck(r, authConfig, clientIP, accessMode, requestID)
 			if plan.errorPage == nil && len(plan.setCookies) == 0 {
 				if ttl := authCacheTTL(authConfig, plan.result); ttl > 0 {
 					entry := authCacheEntry{
@@ -3935,6 +4655,13 @@ func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig
 					}
 					if !shouldBypassFNAppUnauthorizedAuthCache(r, plan.result) {
 						h.authCacheStore(lookup.cacheKey, entry, time.Now())
+						if event := debugProxyEvent("auth_cache_store", requestID); event != nil {
+							event.Str("decision", entry.result.decision).
+								Bool("allowed", entry.result.allowed).
+								Bool("authenticated", entry.result.authenticated).
+								Time("expires_at", entry.expiresAt).
+								Send()
+						}
 					}
 					return authCheckExecution{entry: &entry}, nil
 				}
@@ -3947,7 +4674,7 @@ func (h *Handler) executeAuthCheck(r *http.Request, authConfig models.AuthConfig
 		return execution
 	}
 
-	plan := h.performAuthCheck(r, authConfig, clientIP, accessMode)
+	plan := h.performAuthCheck(r, authConfig, clientIP, accessMode, requestID)
 	return authCheckExecution{plan: plan}
 }
 
@@ -3976,16 +4703,16 @@ func (h *Handler) applyToolbarAuthCheckPlan(w http.ResponseWriter, r *http.Reque
 	return authCheckResult{allowed: true, decision: "not_required"}
 }
 
-func (h *Handler) checkAuthForToolbar(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string) authCheckResult {
-	execution := h.executeAuthCheck(r, authConfig, clientIP, "")
+func (h *Handler) checkAuthForToolbar(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, requestID string) authCheckResult {
+	execution := h.executeAuthCheck(r, authConfig, clientIP, "", requestID)
 	if execution.entry != nil {
 		return h.applyToolbarAuthCacheEntry(w, r, *execution.entry, clientIP)
 	}
 	return h.applyToolbarAuthCheckPlan(w, r, execution.plan, clientIP)
 }
 
-func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string) authCheckResult {
-	execution := h.executeAuthCheck(r, authConfig, clientIP, accessMode)
+func (h *Handler) checkAuth(w http.ResponseWriter, r *http.Request, authConfig models.AuthConfig, clientIP string, accessMode string, upstreamTarget string, requestID string) authCheckResult {
+	execution := h.executeAuthCheck(r, authConfig, clientIP, accessMode, requestID)
 	if execution.entry != nil {
 		return h.applyAuthCacheEntry(w, r, *execution.entry, clientIP, upstreamTarget)
 	}

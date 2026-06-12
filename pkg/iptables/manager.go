@@ -3,6 +3,7 @@ package iptables
 import (
 	"fmt"
 	"go-reauth-proxy/pkg/errors"
+	"go-reauth-proxy/pkg/logger"
 	"net"
 	"os/exec"
 	"strconv"
@@ -65,6 +66,22 @@ var localCIDRv4 = []string{
 var localCIDRv6 = []string{
 	"fc00::/7",
 	"fe80::/10",
+}
+
+func debugArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		out = append(out, logger.SanitizeLogString(arg))
+	}
+	return out
+}
+
+func debugPorts(ports []int) []any {
+	out := make([]any, 0, len(ports))
+	for _, port := range ports {
+		out = append(out, logger.SanitizePort(port))
+	}
+	return out
 }
 
 func parseParentChains(value interface{}) []string {
@@ -160,6 +177,13 @@ func (m *Manager) hasTable(table string) bool {
 func (m *Manager) runTable(table string, args ...string) error {
 	output, err := m.runner.CombinedOutput(table, args...)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "command_failed"); event != nil {
+			event.Str("table", logger.SanitizeLogString(table)).
+				Interface("args", debugArgs(args)).
+				Str("output", logger.SanitizeLogString(string(output))).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return fmt.Errorf("%s command failed: %s, output: %s", table, strings.Join(args, " "), string(output))
 	}
 	return nil
@@ -168,6 +192,13 @@ func (m *Manager) runTable(table string, args ...string) error {
 func (m *Manager) runTableOutput(table string, args ...string) (string, error) {
 	output, err := m.runner.CombinedOutput(table, args...)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "command_failed"); event != nil {
+			event.Str("table", logger.SanitizeLogString(table)).
+				Interface("args", debugArgs(args)).
+				Str("output", logger.SanitizeLogString(string(output))).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return "", fmt.Errorf("%s command failed: %s, output: %s", table, strings.Join(args, " "), string(output))
 	}
 	return string(output), nil
@@ -196,6 +227,13 @@ func (m *Manager) runTableRestore(table string, input string) error {
 		"--noflush",
 	)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "restore_command_failed"); event != nil {
+			event.Str("table", logger.SanitizeLogString(table)).
+				Str("command", logger.SanitizeLogString(restoreCommand)).
+				Str("output", logger.SanitizeLogString(string(output))).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return fmt.Errorf(
 			"%s command failed: %s, output: %s",
 			restoreCommand,
@@ -234,9 +272,22 @@ func (m *Manager) tableForAddress(address string) (string, error) {
 }
 
 func (m *Manager) Init() error {
+	if event := logger.DebugEvent("iptables", "init_start"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).
+			Interface("parent_chains", debugArgs(m.ParentChains)).
+			Interface("exempt_ports", debugArgs(m.ExemptPorts)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	for _, table := range m.tables {
 		if err := m.runTable(table, "-L", m.Chain, "-n"); err != nil {
 			if err := m.runTable(table, "-N", m.Chain); err != nil {
+				if event := logger.DebugEvent("iptables", "init_failed"); event != nil {
+					event.Str("table", logger.SanitizeLogString(table)).
+						Str("chain", logger.SanitizeLogString(m.Chain)).
+						Str("error", logger.SanitizeLogString(err.Error())).
+						Send()
+				}
 				return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to create chain (%s): %v", table, err))
 			}
 		}
@@ -244,6 +295,13 @@ func (m *Manager) Init() error {
 		for _, parent := range m.ParentChains {
 			if err := m.runTable(table, "-C", parent, "-j", m.Chain); err != nil {
 				if err := m.runTable(table, "-I", parent, "1", "-j", m.Chain); err != nil {
+					if event := logger.DebugEvent("iptables", "init_failed"); event != nil {
+						event.Str("table", logger.SanitizeLogString(table)).
+							Str("chain", logger.SanitizeLogString(m.Chain)).
+							Str("parent_chain", logger.SanitizeLogString(parent)).
+							Str("error", logger.SanitizeLogString(err.Error())).
+							Send()
+					}
 					return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to link chain to %s (%s): %v", parent, table, err))
 				}
 			}
@@ -251,24 +309,61 @@ func (m *Manager) Init() error {
 
 		// Re-initialize chain rules to keep a deterministic default-deny policy.
 		if err := m.runTable(table, "-F", m.Chain); err != nil {
+			if event := logger.DebugEvent("iptables", "init_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(m.Chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to flush chain (%s): %v", table, err))
 		}
 		if err := m.applyBaseRules(table); err != nil {
+			if event := logger.DebugEvent("iptables", "init_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(m.Chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to apply base rules (%s): %v", table, err))
 		}
 	}
 
+	if event := logger.DebugEvent("iptables", "init_end"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	return nil
 }
 
 func (m *Manager) Flush() error {
+	if event := logger.DebugEvent("iptables", "flush_start"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	for _, table := range m.tables {
 		if err := m.runTable(table, "-F", m.Chain); err != nil {
+			if event := logger.DebugEvent("iptables", "flush_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(m.Chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to flush chain (%s): %v", table, err))
 		}
 		if err := m.applyBaseRules(table); err != nil {
+			if event := logger.DebugEvent("iptables", "flush_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(m.Chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to reapply base rules (%s): %v", table, err))
 		}
+	}
+	if event := logger.DebugEvent("iptables", "flush_end"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).Send()
 	}
 	return nil
 }
@@ -462,9 +557,24 @@ func (m *Manager) SyncTCPPortAccessPolicy(policy TCPPortAccessPolicy) error {
 		IncludeLocalCIDRs: policy.IncludeLocalCIDRs,
 		DefaultAction:     defaultAction,
 	}
+	if event := logger.DebugEvent("iptables", "tcp_port_access_policy_sync_start"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(chain)).
+			Interface("parent_chains", debugArgs(parents)).
+			Interface("ports", debugPorts(ports)).
+			Int("allow_source_count", len(allowSources)).
+			Int("block_source_count", len(blockSources)).
+			Bool("include_local_cidrs", policy.IncludeLocalCIDRs).
+			Str("default_action", logger.SanitizeLogString(defaultAction)).
+			Send()
+	}
 
 	tables, err := m.tablesForAccessPolicy(normalizedPolicy)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_port_access_policy_sync_failed"); event != nil {
+			event.Str("chain", logger.SanitizeLogString(chain)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 	if len(ports) == 0 || len(tables) == 0 {
@@ -482,6 +592,12 @@ func (m *Manager) SyncTCPPortAccessPolicy(policy TCPPortAccessPolicy) error {
 		}
 
 		if err := m.ensureChain(table, chain); err != nil {
+			if event := logger.DebugEvent("iptables", "tcp_port_access_policy_sync_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to create SSH chain (%s): %v", table, err))
 		}
 		for _, parent := range parents {
@@ -491,16 +607,35 @@ func (m *Manager) SyncTCPPortAccessPolicy(policy TCPPortAccessPolicy) error {
 			m.deleteParentJumpsToChain(table, parent, chain)
 			for _, port := range ports {
 				if err := m.addTCPPortJump(table, parent, chain, port); err != nil {
+					if event := logger.DebugEvent("iptables", "tcp_port_access_policy_sync_failed"); event != nil {
+						event.Str("table", logger.SanitizeLogString(table)).
+							Str("parent_chain", logger.SanitizeLogString(parent)).
+							Str("chain", logger.SanitizeLogString(chain)).
+							Interface("port", logger.SanitizePort(port)).
+							Str("error", logger.SanitizeLogString(err.Error())).
+							Send()
+					}
 					return errors.New(errors.CodeIptablesInitError, fmt.Sprintf("Failed to link SSH chain to %s:%d (%s): %v", parent, port, table, err))
 				}
 			}
 		}
 
 		if err := m.applyTCPPortAccessPolicy(table, normalizedPolicy); err != nil {
+			if event := logger.DebugEvent("iptables", "tcp_port_access_policy_sync_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return err
 		}
 	}
 
+	if event := logger.DebugEvent("iptables", "tcp_port_access_policy_sync_end"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(chain)).
+			Interface("tables", debugArgs(tables)).
+			Send()
+	}
 	return nil
 }
 
@@ -579,6 +714,12 @@ func (m *Manager) ClearTCPPortAccessPolicy(chain string, parents []string) error
 	for _, table := range m.tables {
 		m.clearTCPPortAccessPolicyForTable(table, chain, parents)
 	}
+	if event := logger.DebugEvent("iptables", "tcp_port_access_policy_cleared"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(chain)).
+			Interface("parent_chains", debugArgs(parents)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	return nil
 }
 
@@ -641,6 +782,12 @@ func (m *Manager) applyBaseRules(table string) error {
 }
 
 func (m *Manager) Destroy() error {
+	if event := logger.DebugEvent("iptables", "destroy_start"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).
+			Interface("parent_chains", debugArgs(m.ParentChains)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	for _, table := range m.tables {
 		for _, parent := range m.ParentChains {
 			for {
@@ -653,21 +800,48 @@ func (m *Manager) Destroy() error {
 		_ = m.runTable(table, "-F", m.Chain)
 		_ = m.runTable(table, "-X", m.Chain)
 	}
+	if event := logger.DebugEvent("iptables", "destroy_end"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).Send()
+	}
 	return nil
 }
 
 func (m *Manager) BlockAll() error {
+	if event := logger.DebugEvent("iptables", "block_all_start"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).Send()
+	}
 	_ = m.RemoveBlockAll()
 	for _, table := range m.tables {
 		if err := m.runTable(table, "-A", m.Chain, "-j", "DROP"); err != nil {
+			if event := logger.DebugEvent("iptables", "block_all_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Str("chain", logger.SanitizeLogString(m.Chain)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to block all (%s): %v", table, err))
 		}
+	}
+	if event := logger.DebugEvent("iptables", "block_all_end"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).Send()
 	}
 	return nil
 }
 
 func (m *Manager) AllowAll() error {
-	return m.RemoveBlockAll()
+	err := m.RemoveBlockAll()
+	if event := logger.DebugEvent("iptables", "allow_all"); event != nil {
+		event.Str("chain", logger.SanitizeLogString(m.Chain)).
+			Bool("ok", err == nil).
+			Str("error", func() string {
+				if err == nil {
+					return ""
+				}
+				return logger.SanitizeLogString(err.Error())
+			}()).
+			Send()
+	}
+	return err
 }
 
 func (m *Manager) RemoveBlockAll() error {
@@ -682,27 +856,69 @@ func (m *Manager) RemoveBlockAll() error {
 }
 
 func (m *Manager) AllowIP(ip string) error {
+	if event := logger.DebugEvent("iptables", "allow_ip_start"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Str("chain", logger.SanitizeLogString(m.Chain)).
+			Send()
+	}
 	_ = m.RemoveIPRule(ip)
 	table, err := m.tableForAddress(ip)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "allow_ip_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 	insertPos := strconv.Itoa(m.baseRuleCountForTable(table) + 1)
 	if err := m.runTable(table, "-I", m.Chain, insertPos, "-s", ip, "-j", "ACCEPT"); err != nil {
+		if event := logger.DebugEvent("iptables", "allow_ip_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Str("table", logger.SanitizeLogString(table)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to allow IP %s (%s): %v", ip, table, err))
+	}
+	if event := logger.DebugEvent("iptables", "allow_ip_end"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Str("table", logger.SanitizeLogString(table)).
+			Send()
 	}
 	return nil
 }
 
 func (m *Manager) BlockIP(ip string) error {
+	if event := logger.DebugEvent("iptables", "block_ip_start"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Str("chain", logger.SanitizeLogString(m.Chain)).
+			Send()
+	}
 	_ = m.RemoveIPRule(ip)
 	table, err := m.tableForAddress(ip)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "block_ip_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 	insertPos := strconv.Itoa(m.baseRuleCountForTable(table) + 1)
 	if err := m.runTable(table, "-I", m.Chain, insertPos, "-s", ip, "-j", "DROP"); err != nil {
+		if event := logger.DebugEvent("iptables", "block_ip_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Str("table", logger.SanitizeLogString(table)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return errors.New(errors.CodeIptablesCommandError, fmt.Sprintf("Failed to block IP %s (%s): %v", ip, table, err))
+	}
+	if event := logger.DebugEvent("iptables", "block_ip_end"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Str("table", logger.SanitizeLogString(table)).
+			Send()
 	}
 	return nil
 }
@@ -712,10 +928,31 @@ func (m *Manager) BlockTCPPortForIP(ip string, port int) error {
 }
 
 func (m *Manager) ensureTCPPortRule(ip string, port int, action string) error {
+	if event := logger.DebugEvent("iptables", "tcp_port_rule_start"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Interface("port", logger.SanitizePort(port)).
+			Str("action", logger.SanitizeLogString(action)).
+			Str("chain", logger.SanitizeLogString(m.Chain)).
+			Send()
+	}
 	if action != "ACCEPT" && action != "DROP" {
+		if event := logger.DebugEvent("iptables", "tcp_port_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Interface("port", logger.SanitizePort(port)).
+				Str("action", logger.SanitizeLogString(action)).
+				Str("error", "action must be ACCEPT or DROP").
+				Send()
+		}
 		return errors.New(errors.CodeBadRequest, "action must be ACCEPT or DROP")
 	}
 	if err := validatePort(port); err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_port_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Interface("port", logger.SanitizePort(port)).
+				Str("action", logger.SanitizeLogString(action)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
@@ -723,6 +960,13 @@ func (m *Manager) ensureTCPPortRule(ip string, port int, action string) error {
 
 	table, err := m.tableForAddress(ip)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_port_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Interface("port", logger.SanitizePort(port)).
+				Str("action", logger.SanitizeLogString(action)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
@@ -735,32 +979,70 @@ func (m *Manager) ensureTCPPortRule(ip string, port int, action string) error {
 		"--dport", strconv.Itoa(port),
 		"-j", action,
 	); err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_port_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Interface("port", logger.SanitizePort(port)).
+				Str("action", logger.SanitizeLogString(action)).
+				Str("table", logger.SanitizeLogString(table)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return errors.New(
 			errors.CodeIptablesCommandError,
 			fmt.Sprintf("Failed to add TCP port rule for IP %s port %d (%s): %v", ip, port, table, err),
 		)
 	}
 
+	if event := logger.DebugEvent("iptables", "tcp_port_rule_end"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Interface("port", logger.SanitizePort(port)).
+			Str("action", logger.SanitizeLogString(action)).
+			Str("table", logger.SanitizeLogString(table)).
+			Send()
+	}
 	return nil
 }
 
 func (m *Manager) RemoveIPRule(ip string) error {
 	table, err := m.tableForAddress(ip)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "remove_ip_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 	_ = m.runTable(table, "-D", m.Chain, "-s", ip, "-j", "ACCEPT")
 	_ = m.runTable(table, "-D", m.Chain, "-s", ip, "-j", "DROP")
+	if event := logger.DebugEvent("iptables", "remove_ip_rule"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Str("table", logger.SanitizeLogString(table)).
+			Str("chain", logger.SanitizeLogString(m.Chain)).
+			Send()
+	}
 	return nil
 }
 
 func (m *Manager) RemoveTCPPortRule(ip string, port int) error {
 	if err := validatePort(port); err != nil {
+		if event := logger.DebugEvent("iptables", "remove_tcp_port_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Interface("port", logger.SanitizePort(port)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
 	table, err := m.tableForAddress(ip)
 	if err != nil {
+		if event := logger.DebugEvent("iptables", "remove_tcp_port_rule_failed"); event != nil {
+			event.Str("ip", logger.SanitizeLogString(ip)).
+				Interface("port", logger.SanitizePort(port)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
@@ -790,14 +1072,39 @@ func (m *Manager) RemoveTCPPortRule(ip string, port int) error {
 		}
 	}
 
+	if event := logger.DebugEvent("iptables", "remove_tcp_port_rule"); event != nil {
+		event.Str("ip", logger.SanitizeLogString(ip)).
+			Interface("port", logger.SanitizePort(port)).
+			Str("table", logger.SanitizeLogString(table)).
+			Str("chain", logger.SanitizeLogString(m.Chain)).
+			Send()
+	}
 	return nil
 }
 
 func (m *Manager) EnsureTCPRedirect(listenPort int, targetPort int) error {
+	if event := logger.DebugEvent("iptables", "tcp_redirect_ensure_start"); event != nil {
+		event.Interface("listen_port", logger.SanitizePort(listenPort)).
+			Interface("target_port", logger.SanitizePort(targetPort)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	if err := validatePort(listenPort); err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_redirect_ensure_failed"); event != nil {
+			event.Interface("listen_port", logger.SanitizePort(listenPort)).
+				Interface("target_port", logger.SanitizePort(targetPort)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 	if err := validatePort(targetPort); err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_redirect_ensure_failed"); event != nil {
+			event.Interface("listen_port", logger.SanitizePort(listenPort)).
+				Interface("target_port", logger.SanitizePort(targetPort)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
@@ -806,27 +1113,69 @@ func (m *Manager) EnsureTCPRedirect(listenPort int, targetPort int) error {
 			return err
 		}
 		if err := m.runTable(table, redirectInsertArgs(listenPort, targetPort)...); err != nil {
+			if event := logger.DebugEvent("iptables", "tcp_redirect_ensure_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Interface("listen_port", logger.SanitizePort(listenPort)).
+					Interface("target_port", logger.SanitizePort(targetPort)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return errors.New(
 				errors.CodeIptablesCommandError,
 				fmt.Sprintf("Failed to add TCP redirect %d->%d (%s): %v", listenPort, targetPort, table, err),
 			)
 		}
 	}
+	if event := logger.DebugEvent("iptables", "tcp_redirect_ensure_end"); event != nil {
+		event.Interface("listen_port", logger.SanitizePort(listenPort)).
+			Interface("target_port", logger.SanitizePort(targetPort)).
+			Send()
+	}
 	return nil
 }
 
 func (m *Manager) ClearTCPRedirect(listenPort int, targetPort int) error {
+	if event := logger.DebugEvent("iptables", "tcp_redirect_clear_start"); event != nil {
+		event.Interface("listen_port", logger.SanitizePort(listenPort)).
+			Interface("target_port", logger.SanitizePort(targetPort)).
+			Interface("tables", debugArgs(m.tables)).
+			Send()
+	}
 	if err := validatePort(listenPort); err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_redirect_clear_failed"); event != nil {
+			event.Interface("listen_port", logger.SanitizePort(listenPort)).
+				Interface("target_port", logger.SanitizePort(targetPort)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 	if err := validatePort(targetPort); err != nil {
+		if event := logger.DebugEvent("iptables", "tcp_redirect_clear_failed"); event != nil {
+			event.Interface("listen_port", logger.SanitizePort(listenPort)).
+				Interface("target_port", logger.SanitizePort(targetPort)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
 	for _, table := range m.tables {
 		if err := m.clearTCPRedirectForTable(table, listenPort, targetPort); err != nil {
+			if event := logger.DebugEvent("iptables", "tcp_redirect_clear_failed"); event != nil {
+				event.Str("table", logger.SanitizeLogString(table)).
+					Interface("listen_port", logger.SanitizePort(listenPort)).
+					Interface("target_port", logger.SanitizePort(targetPort)).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return err
 		}
+	}
+	if event := logger.DebugEvent("iptables", "tcp_redirect_clear_end"); event != nil {
+		event.Interface("listen_port", logger.SanitizePort(listenPort)).
+			Interface("target_port", logger.SanitizePort(targetPort)).
+			Send()
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"go-reauth-proxy/pkg/gatewaylog"
+	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/models"
 	"os"
 	"path/filepath"
@@ -386,12 +387,36 @@ func (m *Manager) Load() (*AppConfig, error) {
 
 	cfg, existed, migrated, err := m.loadUnlocked()
 	if err != nil {
+		if event := logger.DebugEvent("config", "load_failed"); event != nil {
+			event.Str("path", logger.SanitizeLogString(m.filePath)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return nil, err
 	}
 	if !existed || migrated {
 		if err := m.saveUnlocked(cfg); err != nil {
+			if event := logger.DebugEvent("config", "save_failed"); event != nil {
+				event.Str("path", logger.SanitizeLogString(m.filePath)).
+					Bool("created_default", !existed).
+					Bool("migrated", migrated).
+					Str("error", logger.SanitizeLogString(err.Error())).
+					Send()
+			}
 			return nil, err
 		}
+	}
+	if event := logger.DebugEvent("config", "load_end"); event != nil {
+		event.Str("path", logger.SanitizeLogString(m.filePath)).
+			Bool("existed", existed).
+			Bool("created_default", !existed).
+			Bool("migrated", migrated).
+			Int("path_rule_count", len(cfg.Rules)).
+			Int("host_rule_count", len(cfg.HostRules)).
+			Int("stream_rule_count", len(cfg.StreamRules)).
+			Bool("gateway_logging_enabled", cfg.Logging.Enabled).
+			Bool("waf_enabled", cfg.WAF.Enabled).
+			Send()
 	}
 	return cfg, nil
 }
@@ -400,7 +425,19 @@ func (m *Manager) Save(config *AppConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	applyDefaults(config)
-	return m.saveUnlocked(config)
+	err := m.saveUnlocked(config)
+	if event := logger.DebugEvent("config", "save"); event != nil {
+		event.Str("path", logger.SanitizeLogString(m.filePath)).
+			Bool("ok", err == nil).
+			Str("error", func() string {
+				if err == nil {
+					return ""
+				}
+				return logger.SanitizeLogString(err.Error())
+			}()).
+			Send()
+	}
+	return err
 }
 
 func (m *Manager) Update(updateFn func(*AppConfig) error) error {
@@ -409,13 +446,40 @@ func (m *Manager) Update(updateFn func(*AppConfig) error) error {
 
 	cfg, _, _, err := m.loadUnlocked()
 	if err != nil {
+		if event := logger.DebugEvent("config", "update_load_failed"); event != nil {
+			event.Str("path", logger.SanitizeLogString(m.filePath)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
 	if err := updateFn(cfg); err != nil {
+		if event := logger.DebugEvent("config", "update_callback_failed"); event != nil {
+			event.Str("path", logger.SanitizeLogString(m.filePath)).
+				Str("error", logger.SanitizeLogString(err.Error())).
+				Send()
+		}
 		return err
 	}
 
 	applyDefaults(cfg)
-	return m.saveUnlocked(cfg)
+	err = m.saveUnlocked(cfg)
+	if event := logger.DebugEvent("config", "update_saved"); event != nil {
+		event.Str("path", logger.SanitizeLogString(m.filePath)).
+			Bool("ok", err == nil).
+			Int("path_rule_count", len(cfg.Rules)).
+			Int("host_rule_count", len(cfg.HostRules)).
+			Int("stream_rule_count", len(cfg.StreamRules)).
+			Bool("gateway_logging_enabled", cfg.Logging.Enabled).
+			Bool("waf_enabled", cfg.WAF.Enabled).
+			Str("error", func() string {
+				if err == nil {
+					return ""
+				}
+				return logger.SanitizeLogString(err.Error())
+			}()).
+			Send()
+	}
+	return err
 }

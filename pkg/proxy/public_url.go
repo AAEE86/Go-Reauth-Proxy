@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"go-reauth-proxy/pkg/models"
 	"net"
 	"net/http"
@@ -15,6 +16,14 @@ func BuildHTTPSRedirectURL(r *http.Request, authConfig models.AuthConfig) string
 		return ""
 	}
 	return target.String()
+}
+
+func IsPublicHTTPSRequest(r *http.Request) bool {
+	return publicRequestScheme(r) == "https"
+}
+
+func ShouldRedirectHTTPToHTTPS(r *http.Request, authConfig models.AuthConfig) bool {
+	return !authConfig.TrustForwardedProto || !IsPublicHTTPSRequest(r)
 }
 
 func buildPublicRequestURL(r *http.Request, authConfig models.AuthConfig, schemeOverride string) *url.URL {
@@ -37,11 +46,11 @@ func buildPublicRequestURL(r *http.Request, authConfig models.AuthConfig, scheme
 }
 
 func normalizedPublicScheme(r *http.Request, schemeOverride string) string {
-	if scheme := strings.ToLower(strings.TrimSpace(schemeOverride)); scheme != "" {
+	if scheme := normalizePublicSchemeValue(schemeOverride); scheme != "" {
 		return scheme
 	}
 
-	if scheme := strings.ToLower(strings.TrimSpace(requestScheme(r))); scheme != "" {
+	if scheme := publicRequestScheme(r); scheme != "" {
 		return scheme
 	}
 
@@ -103,11 +112,85 @@ func resolvedPublicPort(r *http.Request, authConfig models.AuthConfig, scheme st
 		return requestHostPort
 	}
 
-	if authConfig.EdgeClientIPActive() {
+	return ""
+}
+
+func publicRequestScheme(r *http.Request) string {
+	if r == nil {
+		return "http"
+	}
+
+	if proto := forwardedHeaderParam(r.Header.Get("Forwarded"), "proto"); proto != "" {
+		return proto
+	}
+	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); proto != "" {
+		return proto
+	}
+	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Forwarded-Scheme"))); proto != "" {
+		return proto
+	}
+	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Original-Proto"))); proto != "" {
+		return proto
+	}
+	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Original-Scheme"))); proto != "" {
+		return proto
+	}
+	if proto := cloudflareVisitorScheme(r.Header.Get("CF-Visitor")); proto != "" {
+		return proto
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func forwardedHeaderParam(value string, key string) string {
+	first := firstForwardedValue(value)
+	if first == "" {
+		return ""
+	}
+	key = strings.ToLower(strings.TrimSpace(key))
+	if key == "" {
 		return ""
 	}
 
-	return localRequestPort(r)
+	for _, segment := range strings.Split(first, ";") {
+		name, rawValue, ok := strings.Cut(segment, "=")
+		if !ok || strings.ToLower(strings.TrimSpace(name)) != key {
+			continue
+		}
+		normalized := normalizePublicSchemeValue(strings.Trim(strings.TrimSpace(rawValue), `"`))
+		if normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func cloudflareVisitorScheme(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+
+	var visitor struct {
+		Scheme string `json:"scheme"`
+	}
+	if err := json.Unmarshal([]byte(value), &visitor); err != nil {
+		return ""
+	}
+	return normalizePublicSchemeValue(visitor.Scheme)
+}
+
+func normalizePublicSchemeValue(value string) string {
+	scheme := strings.ToLower(strings.TrimSpace(value))
+	scheme = strings.TrimSuffix(scheme, ":")
+	switch scheme {
+	case "http", "https":
+		return scheme
+	default:
+		return ""
+	}
 }
 
 func configuredPublicPort(authConfig models.AuthConfig, scheme string) string {

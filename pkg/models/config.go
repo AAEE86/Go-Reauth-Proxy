@@ -79,6 +79,7 @@ type AuthConfig struct {
 	PublicHTTPPort        int    `json:"public_http_port,omitempty" example:"80"`
 	PublicHTTPSPort       int    `json:"public_https_port,omitempty" example:"443"`
 	AuthHost              string `json:"auth_host,omitempty" example:"auth.example.com"`
+	TrustForwardedProto   bool   `json:"trust_forwarded_proto,omitempty" example:"false"`
 }
 
 func (c *AuthConfig) NormalizeEdgeClientIPSelection() bool {
