@@ -30,6 +30,7 @@ type AppConfig struct {
 	Visibility           models.GatewayVisibilityConfig    `json:"visibility,omitempty"`
 	ForwardedHeaders     models.ForwardedHeadersConfig     `json:"forwarded_headers,omitempty"`
 	PreserveHost         models.PreserveHostConfig         `json:"preserve_host,omitempty"`
+	Portal               models.GatewayPortalConfig        `json:"portal,omitempty"`
 	FnosPortIconHijack   models.FnosPortIconHijackConfig   `json:"fnos_port_icon_hijack,omitempty"`
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
@@ -101,6 +102,9 @@ func defaultConfig() *AppConfig {
 			Enabled:     true,
 			OmitTargets: []string{},
 			UpdatedAt:   "",
+		},
+		Portal: models.GatewayPortalConfig{
+			DisplayStyle: models.GatewayPortalDisplayStyleDomain,
 		},
 		FnosPortIconHijack: models.FnosPortIconHijackConfig{
 			Enabled:   false,
@@ -211,6 +215,11 @@ func applyDefaults(cfg *AppConfig) bool {
 		changed = true
 	}
 	if cfg.AuthConfig.NormalizeEdgeClientIPSelection() {
+		changed = true
+	}
+	normalizedPortal := models.NormalizeGatewayPortalConfig(cfg.Portal)
+	if cfg.Portal != normalizedPortal {
+		cfg.Portal = normalizedPortal
 		changed = true
 	}
 

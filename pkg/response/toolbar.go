@@ -384,7 +384,8 @@ const toolbarTemplate = `
 	    if (hostRules.length > 0) {
 	        for (var i = 0; i < hostRules.length; i++) {
 	            var host = asString(hostRules[i].host);
-	            var hostLink = createMenuLink(host, '/', 'host-link', isActiveHost(host, toolbarData.current_host));
+	            var label = asString(hostRules[i].label) || host;
+	            var hostLink = createMenuLink(label, '/', 'host-link', isActiveHost(host, toolbarData.current_host));
 	            hostLink.setAttribute('data-host', host);
 	            menuScroll.appendChild(hostLink);
 	        }
@@ -744,7 +745,8 @@ type toolbarRuleData struct {
 }
 
 type toolbarHostRuleData struct {
-	Host string `json:"host"`
+	Host  string `json:"host"`
+	Label string `json:"label,omitempty"`
 }
 
 type toolbarData struct {
@@ -766,7 +768,16 @@ func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
 }
 
 func GenerateToolbar(rules []models.Rule, currentPath string) string {
-	return GenerateToolbarWithHosts(rules, nil, currentPath, "", "")
+	return GenerateToolbarWithHosts(rules, nil, currentPath, "", "", models.GatewayPortalConfig{})
+}
+
+func GatewayPortalHostLabel(rule models.HostRule, portalConfig models.GatewayPortalConfig) string {
+	if models.NormalizeGatewayPortalConfig(portalConfig).DisplayStyle == models.GatewayPortalDisplayStyleTitle {
+		if title := strings.TrimSpace(rule.Title); title != "" {
+			return title
+		}
+	}
+	return rule.Host
 }
 
 func normalizeToolbarHost(host string) string {
@@ -789,7 +800,7 @@ func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []
 	return filtered
 }
 
-func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string) string {
+func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
 
 	data := toolbarData{
@@ -802,7 +813,10 @@ func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, 
 		data.Rules = append(data.Rules, toolbarRuleData{Path: rule.Path})
 	}
 	for _, rule := range filteredHostRules {
-		data.HostRules = append(data.HostRules, toolbarHostRuleData{Host: rule.Host})
+		data.HostRules = append(data.HostRules, toolbarHostRuleData{
+			Host:  rule.Host,
+			Label: GatewayPortalHostLabel(rule, portalConfig),
+		})
 	}
 
 	payload, err := json.Marshal(data)

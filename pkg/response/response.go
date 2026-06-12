@@ -43,17 +43,18 @@ func Error(w http.ResponseWriter, code int, message string) {
 }
 
 type pageData struct {
-	Title       string
-	Message     string
-	Year        int
-	ShowBack    bool
-	Version     string
-	BodyClass   string
-	Rules       []models.Rule
-	HostRules   []models.HostRule
-	ToolbarHTML template.HTML
-	RequestHost string
-	RequestPath string
+	Title         string
+	Message       string
+	Year          int
+	ShowBack      bool
+	Version       string
+	BodyClass     string
+	Rules         []models.Rule
+	HostRules     []models.HostRule
+	GatewayPortal models.GatewayPortalConfig
+	ToolbarHTML   template.HTML
+	RequestHost   string
+	RequestPath   string
 }
 
 const baseStyle = `

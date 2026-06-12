@@ -49,6 +49,7 @@ type Handler struct {
 	GatewayVisibility     models.GatewayVisibilityConfig
 	ForwardedHeaders      models.ForwardedHeadersConfig
 	PreserveHost          models.PreserveHostConfig
+	GatewayPortal         models.GatewayPortalConfig
 	FnosPortIconHijack    models.FnosPortIconHijackConfig
 	WAFConfig             models.WAFConfig
 	sslBundle             atomic.Value
@@ -93,6 +94,7 @@ type requestSnapshot struct {
 	defaultRoute       string
 	defaultRule        *models.Rule
 	authConfig         models.AuthConfig
+	gatewayPortal      models.GatewayPortalConfig
 	proxyProtocolForce bool
 }
 
@@ -170,6 +172,7 @@ func (h *Handler) buildRequestSnapshotLocked() *requestSnapshot {
 		defaultRoute:       h.DefaultRoute,
 		defaultRule:        defaultRule,
 		authConfig:         h.AuthConfig,
+		gatewayPortal:      h.GatewayPortal,
 		proxyProtocolForce: h.ProxyProtocolForce,
 	}
 }
@@ -636,6 +639,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		GatewayVisibility:    initialCfg.Visibility,
 		ForwardedHeaders:     normalizedForwardedHeaders,
 		PreserveHost:         normalizedPreserveHost,
+		GatewayPortal:        models.NormalizeGatewayPortalConfig(initialCfg.Portal),
 		FnosPortIconHijack:   initialCfg.FnosPortIconHijack,
 		WAFConfig:            wafConfig,
 		configManager:        cfgManager,
@@ -766,6 +770,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.Visibility = h.GatewayVisibility
 		conf.ForwardedHeaders = h.ForwardedHeaders
 		conf.PreserveHost = h.PreserveHost
+		conf.Portal = h.GatewayPortal
 		conf.FnosPortIconHijack = h.FnosPortIconHijack
 		conf.WAF = h.WAFConfig
 		conf.SSL = copySSLConfig(h.sslConfig)
@@ -1374,6 +1379,7 @@ func (h *Handler) normalizeHostRule(newRule models.HostRule) (models.HostRule, e
 	if newRule.AccessMode == "" {
 		newRule.AccessMode = "login_first"
 	}
+	newRule.Title = strings.TrimSpace(newRule.Title)
 	basicAuth, err := normalizeBasicAuthConfig(newRule.BasicAuth)
 	if err != nil {
 		return models.HostRule{}, err
@@ -1883,6 +1889,24 @@ func (h *Handler) SetPreserveHostConfig(cfg models.PreserveHostConfig) {
 	h.mu.Unlock()
 
 	preserveHost.updateConfig(normalized)
+}
+
+func (h *Handler) GetGatewayPortalConfig() models.GatewayPortalConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return models.NormalizeGatewayPortalConfig(h.GatewayPortal)
+}
+
+func (h *Handler) SetGatewayPortalConfig(cfg models.GatewayPortalConfig) models.GatewayPortalConfig {
+	normalized := models.NormalizeGatewayPortalConfig(cfg)
+
+	h.mu.Lock()
+	h.GatewayPortal = normalized
+	h.publishRequestSnapshotLocked()
+	h.saveConfigLocked()
+	h.mu.Unlock()
+
+	return normalized
 }
 
 func (h *Handler) SetFnosPortIconHijackConfig(cfg models.FnosPortIconHijackConfig) models.FnosPortIconHijackConfig {
@@ -2832,10 +2856,10 @@ func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snap
 		if !authResult.allowed {
 			return authResult
 		}
-		response.SelectPage(w, r, snapshot.rules, snapshot.hostRules)
+		response.SelectPage(w, r, snapshot.rules, snapshot.hostRules, snapshot.gatewayPortal)
 		return authResult
 	}
-	response.SelectPage(w, r, snapshot.rules, snapshot.hostRules)
+	response.SelectPage(w, r, snapshot.rules, snapshot.hostRules, snapshot.gatewayPortal)
 	return authCheckResult{allowed: true, decision: "not_required"}
 }
 
@@ -3262,6 +3286,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 					r.URL.Path,
 					matchedRule.Host,
 					snapshot.authConfig.AuthHost,
+					snapshot.gatewayPortal,
 				),
 			)
 		}
@@ -3382,6 +3407,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 				r.URL.Path,
 				matchedRule.Host,
 				snapshot.authConfig.AuthHost,
+				snapshot.gatewayPortal,
 			),
 		)
 

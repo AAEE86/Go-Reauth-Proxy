@@ -105,6 +105,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/forwarded-headers", s.handleSetForwardedHeadersConfig).Methods("POST")
 	r.HandleFunc("/api/config/preserve-host", s.handleGetPreserveHostConfig).Methods("GET")
 	r.HandleFunc("/api/config/preserve-host", s.handleSetPreserveHostConfig).Methods("POST")
+	r.HandleFunc("/api/config/portal", s.handleGetGatewayPortalConfig).Methods("GET")
+	r.HandleFunc("/api/config/portal", s.handleSetGatewayPortalConfig).Methods("POST")
 	r.HandleFunc("/api/config/fnos-port-icon-hijack", s.handleGetFnosPortIconHijackConfig).Methods("GET")
 	r.HandleFunc("/api/config/fnos-port-icon-hijack", s.handleSetFnosPortIconHijackConfig).Methods("POST")
 	r.HandleFunc("/api/runtime/reverse-proxy-throttle-exempt-ips", s.handleGetReverseProxyThrottleExemptIPs).Methods("GET")
@@ -343,6 +345,7 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 		AccessMode      string                 `json:"access_mode"`
 		SuppressToolbar *bool                  `json:"suppress_toolbar"`
 		PreserveHost    *bool                  `json:"preserve_host"`
+		Title           string                 `json:"title"`
 		BasicAuth       models.BasicAuthConfig `json:"basic_auth"`
 		Locations       []hostLocationRequest  `json:"locations"`
 	}
@@ -383,6 +386,7 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 			AccessMode:      req.AccessMode,
 			SuppressToolbar: req.SuppressToolbar != nil && *req.SuppressToolbar,
 			PreserveHost:    req.PreserveHost == nil || *req.PreserveHost,
+			Title:           req.Title,
 			BasicAuth:       req.BasicAuth,
 			Locations:       locations,
 		})
@@ -710,6 +714,20 @@ func (s *Server) handleSetPreserveHostConfig(w http.ResponseWriter, r *http.Requ
 
 	s.ProxyHandler.SetPreserveHostConfig(req)
 	response.Success(w, s.ProxyHandler.GetPreserveHostConfig())
+}
+
+func (s *Server) handleGetGatewayPortalConfig(w http.ResponseWriter, r *http.Request) {
+	response.Success(w, s.ProxyHandler.GetGatewayPortalConfig())
+}
+
+func (s *Server) handleSetGatewayPortalConfig(w http.ResponseWriter, r *http.Request) {
+	var req models.GatewayPortalConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	response.Success(w, s.ProxyHandler.SetGatewayPortalConfig(req))
 }
 
 func (s *Server) handleGetFnosPortIconHijackConfig(w http.ResponseWriter, r *http.Request) {

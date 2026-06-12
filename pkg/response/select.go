@@ -16,6 +16,7 @@ var htmlFuncMap = template.FuncMap{
 		}
 		return path
 	},
+	"hostDisplayLabel": GatewayPortalHostLabel,
 }
 
 const selectStyle = `
@@ -322,7 +323,7 @@ const selectContent = `
 			{{range .HostRules}}
 			<a href="/" data-host="{{.Host}}" class="route-card host-route-card">
 				<div>
-					<div class="route-path">{{.Host}}</div>
+					<div class="route-path">{{hostDisplayLabel . $.GatewayPortal}}</div>
 					<div class="route-target">{{.Target}}</div>
 				</div>
 				<svg class="route-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -405,7 +406,7 @@ var selectTmpl = template.Must(
 		Parse(baseTemplate + selectContent),
 )
 
-func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hostRules []models.HostRule) {
+func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hostRules []models.HostRule, portalConfig models.GatewayPortalConfig) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
@@ -416,17 +417,18 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 
 	toolbarHTML := ""
 	if !ShouldSuppressToolbarForUserAgent(userAgent) {
-		toolbarHTML = GenerateToolbarWithHosts(rules, hostRules, "/__select__", "", "")
+		toolbarHTML = GenerateToolbarWithHosts(rules, hostRules, "/__select__", "", "", portalConfig)
 	}
 
 	data := pageData{
-		Title:       "Select Route",
-		Year:        time.Now().Year(),
-		Version:     version.Version,
-		BodyClass:   "select-page",
-		Rules:       rules,
-		HostRules:   hostRules,
-		ToolbarHTML: template.HTML(toolbarHTML),
+		Title:         "Select Route",
+		Year:          time.Now().Year(),
+		Version:       version.Version,
+		BodyClass:     "select-page",
+		Rules:         rules,
+		HostRules:     hostRules,
+		GatewayPortal: models.NormalizeGatewayPortalConfig(portalConfig),
+		ToolbarHTML:   template.HTML(toolbarHTML),
 	}
 
 	_ = selectTmpl.ExecuteTemplate(w, "layout", data)
