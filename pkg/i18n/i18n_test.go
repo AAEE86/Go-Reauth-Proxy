@@ -14,6 +14,8 @@ func TestNormalizeLocaleAliases(t *testing.T) {
 		"zh-TW":     LocaleZhHant,
 		"zh-Hant":   LocaleZhHant,
 		"en-US":     LocaleEn,
+		"ko":        LocaleKoKR,
+		"ko_KR":     LocaleKoKR,
 		"fr":        "",
 		"   zh-HK ": LocaleZhHant,
 	}
@@ -31,6 +33,9 @@ func TestResolveAcceptLanguage(t *testing.T) {
 	}
 	if got := ResolveAcceptLanguage("zh-TW, en;q=0.9"); got != LocaleZhHant {
 		t.Fatalf("ResolveAcceptLanguage preferred %q, want %q", got, LocaleZhHant)
+	}
+	if got := ResolveAcceptLanguage("ko-KR, en;q=0.9"); got != LocaleKoKR {
+		t.Fatalf("ResolveAcceptLanguage preferred %q, want %q", got, LocaleKoKR)
 	}
 }
 
@@ -59,7 +64,7 @@ func TestLocaleMessageKeysComplete(t *testing.T) {
 		t.Fatal("default locale messages are empty")
 	}
 
-	for _, locale := range []string{LocaleZhCN, LocaleZhHant, LocaleEn} {
+	for _, locale := range []string{LocaleZhCN, LocaleZhHant, LocaleEn, LocaleKoKR} {
 		values := messages[locale]
 		if len(values) == 0 {
 			t.Fatalf("locale %s messages are empty", locale)
