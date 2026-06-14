@@ -3,6 +3,7 @@ package response
 import (
 	"encoding/json"
 	"go-reauth-proxy/pkg/errors"
+	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/version"
 	"html/template"
@@ -35,7 +36,7 @@ func JSON(w http.ResponseWriter, success bool, code int, message string, data in
 }
 
 func Success(w http.ResponseWriter, data interface{}) {
-	JSON(w, true, 200, "Success", data)
+	JSON(w, true, 200, i18n.T(i18n.DefaultLocaleValue(), "gateway.success"), data)
 }
 
 func Error(w http.ResponseWriter, code int, message string) {
@@ -55,6 +56,8 @@ type pageData struct {
 	ToolbarHTML   template.HTML
 	RequestHost   string
 	RequestPath   string
+	HTMLLang      string
+	Labels        map[string]string
 }
 
 const baseStyle = `
@@ -66,7 +69,7 @@ const baseStyle = `
 const baseTemplate = `
 {{define "layout"}}
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{.HTMLLang}}">
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -113,7 +116,7 @@ const errorContent = `
 	          text-white bg-black hover:bg-gray-900 
 	          transition-colors duration-150 
 	          border border-black">
-		Go to Select
+		{{index .Labels "goToSelect"}}
 	</a>
 	{{end}}
 
@@ -137,13 +140,13 @@ const routeNotFoundContent = `
 	<p class="text-xl text-gray-600 mb-8">{{.Message}}</p>
 
 	<div style="margin:0 auto 2rem;max-width:32rem;text-align:left;border:1px solid #e5e7eb;border-radius:18px;padding:1rem 1.25rem;background:#fafafa;">
-		<div style="font-size:.75rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.9rem;">Request</div>
+		<div style="font-size:.75rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.9rem;">{{index .Labels "request"}}</div>
 		<div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;margin-bottom:.75rem;">
-			<span style="color:#6b7280;">Host</span>
+			<span style="color:#6b7280;">{{index .Labels "host"}}</span>
 			<code style="font-size:.875rem;color:#111;word-break:break-all;text-align:right;">{{if .RequestHost}}{{.RequestHost}}{{else}}-{{end}}</code>
 		</div>
 		<div style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;">
-			<span style="color:#6b7280;">Path</span>
+			<span style="color:#6b7280;">{{index .Labels "path"}}</span>
 			<code style="font-size:.875rem;color:#111;word-break:break-all;text-align:right;">{{if .RequestPath}}{{.RequestPath}}{{else}}-{{end}}</code>
 		</div>
 	</div>
@@ -154,7 +157,7 @@ const routeNotFoundContent = `
 	          text-white bg-black hover:bg-gray-900 
 	          transition-colors duration-150 
 	          border border-black">
-		Go to Select
+		{{index .Labels "goToSelect"}}
 	</a>
 	{{end}}
 
@@ -171,6 +174,7 @@ var routeNotFoundTmpl = template.Must(
 )
 
 func buildPageData(r *http.Request, rules []models.Rule) pageData {
+	locale := i18n.ResolveRequestLocale(r)
 	userAgent := ""
 	if r != nil {
 		userAgent = r.UserAgent()
@@ -178,7 +182,7 @@ func buildPageData(r *http.Request, rules []models.Rule) pageData {
 
 	var toolbarHTML template.HTML
 	if len(rules) > 0 && !ShouldSuppressToolbarForUserAgent(userAgent) {
-		toolbarHTML = template.HTML(GenerateToolbar(rules, ""))
+		toolbarHTML = template.HTML(GenerateToolbarForLocale(locale, rules, ""))
 	}
 
 	data := pageData{
@@ -186,6 +190,8 @@ func buildPageData(r *http.Request, rules []models.Rule) pageData {
 		Version:     version.Version,
 		BodyClass:   "flex items-center justify-center h-screen bg-white",
 		ToolbarHTML: toolbarHTML,
+		HTMLLang:    i18n.T(locale, "gateway.htmlLang"),
+		Labels:      gatewayLabels(locale),
 	}
 
 	if r != nil {
@@ -200,7 +206,9 @@ func buildPageData(r *http.Request, rules []models.Rule) pageData {
 }
 
 func HTML(w http.ResponseWriter, r *http.Request, code int, message string, rules []models.Rule) {
+	locale := i18n.ResolveRequestLocale(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Language", locale)
 
 	httpStatus := mapHTTPStatus(code)
 	w.WriteHeader(httpStatus)
@@ -214,27 +222,48 @@ func HTML(w http.ResponseWriter, r *http.Request, code int, message string, rule
 }
 
 func Welcome(w http.ResponseWriter, r *http.Request, rules []models.Rule) {
+	locale := i18n.ResolveRequestLocale(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Language", locale)
 	w.WriteHeader(http.StatusOK)
 
 	data := buildPageData(r, rules)
-	data.Title = "It's working!"
-	data.Message = "Welcome to Go Reauth Proxy"
+	data.Title = i18n.T(locale, "gateway.welcomeTitle")
+	data.Message = i18n.T(locale, "gateway.welcomeMessage")
 	data.ShowBack = false
 
 	_ = errorTmpl.ExecuteTemplate(w, "layout", data)
 }
 
 func RouteNotFound(w http.ResponseWriter, r *http.Request, rules []models.Rule) {
+	locale := i18n.ResolveRequestLocale(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Language", locale)
 	w.WriteHeader(http.StatusNotFound)
 
 	data := buildPageData(r, rules)
-	data.Title = "No Matching Route"
-	data.Message = "This request did not match any configured route."
+	data.Title = i18n.T(locale, "gateway.routeNotFoundTitle")
+	data.Message = i18n.T(locale, "gateway.routeNotFoundMessage")
 	data.ShowBack = len(rules) > 0
 
 	_ = routeNotFoundTmpl.ExecuteTemplate(w, "layout", data)
+}
+
+func gatewayLabels(locale string) map[string]string {
+	return map[string]string{
+		"goToSelect":        i18n.T(locale, "gateway.goToSelect"),
+		"request":           i18n.T(locale, "gateway.request"),
+		"host":              i18n.T(locale, "gateway.host"),
+		"path":              i18n.T(locale, "gateway.path"),
+		"selectDescription": i18n.T(locale, "gateway.selectDescription"),
+		"routesEmpty":       i18n.T(locale, "gateway.routesEmpty"),
+		"logout":            i18n.T(locale, "gateway.logout"),
+		"logoutTitle":       i18n.T(locale, "gateway.logoutConfirmTitle"),
+		"logoutMessage":     i18n.T(locale, "gateway.logoutConfirmMessage"),
+		"cancel":            i18n.T(locale, "gateway.cancel"),
+		"confirm":           i18n.T(locale, "gateway.confirm"),
+		"traceId":           i18n.T(locale, "gateway.traceId"),
+	}
 }
 
 func mapHTTPStatus(code int) int {

@@ -2,7 +2,9 @@ package response
 
 import (
 	"encoding/json"
+	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/models"
+	"net/http"
 	"strings"
 )
 
@@ -118,9 +120,9 @@ const toolbarTemplate = `
             font-size: 14px;
             border-bottom: 1px solid #f3f4f6;
             transition: background-color 0.15s, color 0.15s;
-            display: flex; /* 关键修改：使 menu-item 成为 Flex 容器 */
-            align-items: center; /* 关键：垂直居中所有内容 */
-            justify-content: space-between; /* 关键：路径居左，圆点/Go居右 */
+            display: flex; /* Make menu items flex containers. */
+            align-items: center; /* Vertically center all content. */
+            justify-content: space-between; /* Keep the path left and status/action right. */
             white-space: nowrap;
             overflow: hidden;
             position: relative;
@@ -139,26 +141,26 @@ const toolbarTemplate = `
         .menu-item.active:hover {
             background-color: #f9fafb;
         }
-        /* 新的路径部分样式 */
+        /* Path segment styles. */
         .menu-item-path {
-            flex-grow: 1; /* 路径占满剩余空间 */
+            flex-grow: 1; /* Let the path take the remaining space. */
             overflow: hidden;
             text-overflow: ellipsis;
         }
-        /* 新的右侧内容样式 */
+        /* Right-side status/action styles. */
         .menu-item-right-content {
-            display: flex; /* 为内部圆点/文字提供 Flex 环境 */
-            align-items: center; /* 垂直居中圆点和文字 */
-            gap: 6px; /* 激活时圆点和 Go 之间的间距（如果有的话） */
-            font-size: 12px; /* 设置右侧内容的大小 */
-            color: #6b7280; /* 默认颜色 */
-            margin-left: 12px; /* 路径和右侧内容之间的间距 */
+            display: flex; /* Provide flex layout for the dot/text. */
+            align-items: center; /* Vertically center the dot and text. */
+            gap: 6px; /* Space between the dot and Go text when active. */
+            font-size: 12px; /* Right-side content size. */
+            color: #6b7280; /* Default color. */
+            margin-left: 12px; /* Space between path and right-side content. */
         }
         .menu-item.active .menu-item-right-content {
-            color: #18181b; /* 激活时的文字颜色 */
+            color: #18181b; /* Active text color. */
         }
         .menu-item.active .menu-item-right-content .dot {
-            background-color: #10b981; /* 激活时的圆点颜色 */
+            background-color: #10b981; /* Active dot color. */
         }
         .menu-empty {
             padding: 12px 16px;
@@ -205,7 +207,7 @@ const toolbarTemplate = `
             align-items: center;
             gap: 6px;
         }
-        /* dot 样式在文件开头定义了 */
+        /* Dot styles are defined near the top of this file. */
         .toolbar-alert-overlay {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -283,6 +285,10 @@ const toolbarTemplate = `
     ` + "`" + `;
 
 	var toolbarData = __REAUTH_TOOLBAR_DATA__;
+	var toolbarLabels = toolbarData.labels || {};
+	function label(key, fallback) {
+	    return typeof toolbarLabels[key] === 'string' && toolbarLabels[key] ? toolbarLabels[key] : fallback;
+	}
 	var html = ` + "`" + `
 	    <div id="wrapper" style="position: relative;">
 	        <div id="menu">
@@ -291,7 +297,7 @@ const toolbarTemplate = `
 	            </div>
 	            <div class="menu-scroll"></div>
 	            <div class="menu-divider"></div>
-	            <a href="/__auth__/api/auth/logout" class="menu-item logout-btn">Logout</a>
+	            <a href="/__auth__/api/auth/logout" class="menu-item logout-btn">${label('logout', 'Logout')}</a>
 	        </div>
             <div id="fab">
                 <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -348,7 +354,7 @@ const toolbarTemplate = `
 	    } else {
 	        var go = document.createElement('span');
 	        go.className = 'menu-item-go-text';
-	        go.textContent = 'Go';
+	        go.textContent = label('go', 'Go');
 	        right.appendChild(go);
 	    }
 	    anchor.appendChild(right);
@@ -372,7 +378,7 @@ const toolbarTemplate = `
 	function appendEmptyMenu() {
 	    var empty = document.createElement('div');
 	    empty.className = 'menu-empty';
-	    empty.textContent = 'No routes configured';
+	    empty.textContent = label('noRoutesConfigured', 'No routes configured');
 	    menuScroll.appendChild(empty);
 	}
 
@@ -628,11 +634,11 @@ const toolbarTemplate = `
             var box = document.createElement('div');
             box.className = 'toolbar-alert-box';
             
-            var titleHtml = '<h3 class="toolbar-alert-title">Logout</h3>';
-            var msgHtml = '<p class="toolbar-alert-message">Are you sure you want to logout?</p>';
+            var titleHtml = '<h3 class="toolbar-alert-title">' + label('logoutTitle', 'Logout') + '</h3>';
+            var msgHtml = '<p class="toolbar-alert-message">' + label('logoutMessage', 'Are you sure you want to logout?') + '</p>';
             var actionsHtml = '<div class="toolbar-alert-actions">' +
-                '<button class="toolbar-alert-btn toolbar-alert-btn-cancel">Cancel</button>' +
-                '<button class="toolbar-alert-btn toolbar-alert-btn-confirm">Confirm</button>' +
+                '<button class="toolbar-alert-btn toolbar-alert-btn-cancel">' + label('cancel', 'Cancel') + '</button>' +
+                '<button class="toolbar-alert-btn toolbar-alert-btn-confirm">' + label('confirm', 'Confirm') + '</button>' +
                 '</div>';
                 
             box.innerHTML = titleHtml + msgHtml + actionsHtml;
@@ -754,6 +760,7 @@ type toolbarData struct {
 	HostRules   []toolbarHostRuleData `json:"host_rules"`
 	CurrentPath string                `json:"current_path"`
 	CurrentHost string                `json:"current_host"`
+	Labels      map[string]string     `json:"labels"`
 }
 
 func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
@@ -768,7 +775,15 @@ func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
 }
 
 func GenerateToolbar(rules []models.Rule, currentPath string) string {
-	return GenerateToolbarWithHosts(rules, nil, currentPath, "", "", models.GatewayPortalConfig{})
+	return GenerateToolbarForLocale(i18n.DefaultLocaleValue(), rules, currentPath)
+}
+
+func GenerateToolbarForRequest(r *http.Request, rules []models.Rule, currentPath string) string {
+	return GenerateToolbarForLocale(i18n.ResolveRequestLocale(r), rules, currentPath)
+}
+
+func GenerateToolbarForLocale(locale string, rules []models.Rule, currentPath string) string {
+	return GenerateToolbarWithHostsForLocale(locale, rules, nil, currentPath, "", "", models.GatewayPortalConfig{})
 }
 
 func GatewayPortalHostLabel(rule models.HostRule, portalConfig models.GatewayPortalConfig) string {
@@ -801,6 +816,14 @@ func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []
 }
 
 func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
+	return GenerateToolbarWithHostsForLocale(i18n.DefaultLocaleValue(), rules, hostRules, currentPath, currentHost, excludedHost, portalConfig)
+}
+
+func GenerateToolbarWithHostsForRequest(r *http.Request, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
+	return GenerateToolbarWithHostsForLocale(i18n.ResolveRequestLocale(r), rules, hostRules, currentPath, currentHost, excludedHost, portalConfig)
+}
+
+func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
 
 	data := toolbarData{
@@ -808,6 +831,15 @@ func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, 
 		HostRules:   make([]toolbarHostRuleData, 0, len(filteredHostRules)),
 		CurrentPath: currentPath,
 		CurrentHost: currentHost,
+		Labels: map[string]string{
+			"logout":             i18n.T(locale, "gateway.logout"),
+			"logoutTitle":        i18n.T(locale, "gateway.logoutConfirmTitle"),
+			"logoutMessage":      i18n.T(locale, "gateway.logoutConfirmMessage"),
+			"cancel":             i18n.T(locale, "gateway.cancel"),
+			"confirm":            i18n.T(locale, "gateway.confirm"),
+			"go":                 i18n.T(locale, "gateway.go"),
+			"noRoutesConfigured": i18n.T(locale, "gateway.noRoutesConfigured"),
+		},
 	}
 	for _, rule := range rules {
 		data.Rules = append(data.Rules, toolbarRuleData{Path: rule.Path})

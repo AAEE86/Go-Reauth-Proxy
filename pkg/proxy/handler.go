@@ -3822,7 +3822,8 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 		if needsToolbar {
 			bodyBytes = injectToolbarIntoHTMLBytes(
 				bodyBytes,
-				response.GenerateToolbarWithHosts(
+				response.GenerateToolbarWithHostsForRequest(
+					r,
 					snapshot.rules,
 					snapshot.hostRules,
 					r.URL.Path,
@@ -3981,7 +3982,8 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 
 		bodyBytes = injectToolbarIntoHTMLBytes(
 			bodyBytes,
-			response.GenerateToolbarWithHosts(
+			response.GenerateToolbarWithHostsForRequest(
+				r,
 				snapshot.rules,
 				snapshot.hostRules,
 				r.URL.Path,
@@ -4165,7 +4167,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		if needsToolbar {
 			bodyBytes = injectToolbarIntoHTMLBytes(
 				bodyBytes,
-				response.GenerateToolbar(snapshot.rules, matchedRule.Path),
+				response.GenerateToolbarForRequest(r, snapshot.rules, matchedRule.Path),
 			)
 		}
 

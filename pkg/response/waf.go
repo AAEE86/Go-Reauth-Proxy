@@ -2,6 +2,7 @@ package response
 
 import (
 	"encoding/json"
+	"go-reauth-proxy/pkg/i18n"
 	"html/template"
 	"net/http"
 	"strconv"
@@ -13,11 +14,6 @@ type WAFBlockPageOptions struct {
 	TraceID string
 }
 
-const (
-	wafBlockedTitle   = "Request blocked"
-	wafBlockedMessage = "Access denied by security policy."
-)
-
 const wafBlockedContent = `
 {{define "content"}}
 <div class="text-center px-5 max-w-md">
@@ -25,7 +21,7 @@ const wafBlockedContent = `
 	<h1 class="text-4xl font-semibold tracking-tight mb-4">{{.Title}}</h1>
 	<p class="text-lg text-gray-600 mb-8">{{.Message}}</p>
 	<div style="margin:0 auto 2rem;max-width:28rem;text-align:left;border:1px solid #e5e7eb;padding:1rem 1.25rem;background:#fafafa;">
-		<div style="font-size:.75rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.6rem;">Trace ID</div>
+		<div style="font-size:.75rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.6rem;">{{index .Labels "traceId"}}</div>
 		<code style="font-size:.875rem;color:#111;word-break:break-all;">{{.RequestPath}}</code>
 	</div>
 	<div class="mt-12">
@@ -41,6 +37,7 @@ var wafBlockedTmpl = template.Must(
 )
 
 func WAFBlocked(w http.ResponseWriter, r *http.Request, opts WAFBlockPageOptions) {
+	locale := i18n.ResolveRequestLocale(r)
 	status := opts.Status
 	if status < 400 || status > 599 {
 		status = http.StatusForbidden
@@ -48,6 +45,7 @@ func WAFBlocked(w http.ResponseWriter, r *http.Request, opts WAFBlockPageOptions
 	w.Header().Set("X-Fn-Knock-WAF-Blocked", "1")
 	w.Header().Set("X-Fn-Knock-WAF-Trace-ID", opts.TraceID)
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Language", locale)
 
 	if wantsJSON(r) {
 		w.Header().Set("Content-Type", "application/json")
@@ -60,7 +58,7 @@ func WAFBlocked(w http.ResponseWriter, r *http.Request, opts WAFBlockPageOptions
 		}{
 			Success: false,
 			Code:    "WAF_BLOCKED",
-			Message: "Request blocked by WAF",
+			Message: i18n.T(locale, "gateway.wafBlockedJson"),
 			TraceID: opts.TraceID,
 		})
 		return
@@ -70,8 +68,8 @@ func WAFBlocked(w http.ResponseWriter, r *http.Request, opts WAFBlockPageOptions
 	w.WriteHeader(status)
 
 	data := buildPageData(r, nil)
-	data.Title = wafBlockedTitle
-	data.Message = wafBlockedMessage
+	data.Title = i18n.T(locale, "gateway.wafBlockedTitle")
+	data.Message = i18n.T(locale, "gateway.wafBlockedMessage")
 	data.RequestPath = opts.TraceID
 	if data.RequestPath == "" {
 		data.RequestPath = strconv.Itoa(status)

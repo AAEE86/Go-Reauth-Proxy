@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"go-reauth-proxy/pkg/gatewaylog"
+	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/logger"
 	"go-reauth-proxy/pkg/models"
 	"os"
@@ -36,6 +37,7 @@ type AppConfig struct {
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
 	WAF                  models.WAFConfig                  `json:"waf,omitempty"`
+	Locale               models.LocaleConfig               `json:"locale,omitempty"`
 	SSL                  models.SSLConfig                  `json:"ssl,omitempty"`
 	SSLCert              string                            `json:"ssl_cert,omitempty"`
 	SSLKey               string                            `json:"ssl_key,omitempty"`
@@ -118,6 +120,9 @@ func defaultConfig() *AppConfig {
 		SSL: models.SSLConfig{
 			DeploymentMode: models.SSLDeploymentModeSingleActive,
 			Certificates:   []models.SSLDeployedCertificate{},
+		},
+		Locale: models.LocaleConfig{
+			DefaultLocale: i18n.DefaultLocale,
 		},
 	}
 }
@@ -223,6 +228,12 @@ func applyDefaults(cfg *AppConfig) bool {
 		cfg.Portal = normalizedPortal
 		changed = true
 	}
+	normalizedLocale := i18n.NormalizeConfig(i18n.LocaleConfig{DefaultLocale: cfg.Locale.DefaultLocale})
+	if cfg.Locale.DefaultLocale != normalizedLocale.DefaultLocale {
+		cfg.Locale.DefaultLocale = normalizedLocale.DefaultLocale
+		changed = true
+	}
+	i18n.SetDefaultLocale(cfg.Locale.DefaultLocale)
 
 	if cfg.AdminPort <= 0 {
 		cfg.AdminPort = 7996

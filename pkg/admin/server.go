@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go-reauth-proxy/pkg/config"
 	"go-reauth-proxy/pkg/errors"
+	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/iptables"
 	"go-reauth-proxy/pkg/middleware"
 	"go-reauth-proxy/pkg/models"
@@ -98,6 +99,8 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/config/default-route", s.handleSetDefaultRoute).Methods("POST")
 	r.HandleFunc("/api/config/proxy-protocol", s.handleGetProxyProtocolForce).Methods("GET")
 	r.HandleFunc("/api/config/proxy-protocol", s.handleSetProxyProtocolForce).Methods("POST")
+	r.HandleFunc("/api/config/locale", s.handleGetLocaleConfig).Methods("GET")
+	r.HandleFunc("/api/config/locale", s.handleSetLocaleConfig).Methods("POST")
 	r.HandleFunc("/api/config/reverse-proxy-throttle", s.handleGetReverseProxyThrottle).Methods("GET")
 	r.HandleFunc("/api/config/reverse-proxy-throttle", s.handleSetReverseProxyThrottle).Methods("POST")
 	r.HandleFunc("/api/config/visibility", s.handleGetGatewayVisibility).Methods("GET")
@@ -618,6 +621,47 @@ func (s *Server) handleSetProxyProtocolForce(w http.ResponseWriter, r *http.Requ
 
 	s.ProxyHandler.SetProxyProtocolForce(*req.ProxyProtocolForce)
 	response.Success(w, proxyProtocolForceResponse{ProxyProtocolForce: *req.ProxyProtocolForce})
+}
+
+func (s *Server) handleGetLocaleConfig(w http.ResponseWriter, r *http.Request) {
+	if s.ConfigManager == nil {
+		response.Error(w, errors.CodeInternal, "Config manager not initialized")
+		return
+	}
+
+	cfg, err := s.ConfigManager.Load()
+	if err != nil {
+		response.Error(w, errors.CodeInternal, "Failed to load config: "+err.Error())
+		return
+	}
+
+	normalized := i18n.NormalizeConfig(i18n.LocaleConfig{DefaultLocale: cfg.Locale.DefaultLocale})
+	response.Success(w, models.LocaleConfig{DefaultLocale: normalized.DefaultLocale})
+}
+
+func (s *Server) handleSetLocaleConfig(w http.ResponseWriter, r *http.Request) {
+	if s.ConfigManager == nil {
+		response.Error(w, errors.CodeInternal, "Config manager not initialized")
+		return
+	}
+
+	var req models.LocaleConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	normalized := i18n.NormalizeConfig(i18n.LocaleConfig{DefaultLocale: req.DefaultLocale})
+	if err := s.ConfigManager.Update(func(cfg *config.AppConfig) error {
+		cfg.Locale.DefaultLocale = normalized.DefaultLocale
+		return nil
+	}); err != nil {
+		response.Error(w, errors.CodeInternal, "Failed to save config: "+err.Error())
+		return
+	}
+
+	i18n.SetDefaultLocale(normalized.DefaultLocale)
+	response.Success(w, models.LocaleConfig{DefaultLocale: normalized.DefaultLocale})
 }
 
 func (s *Server) handleGetReverseProxyThrottle(w http.ResponseWriter, r *http.Request) {

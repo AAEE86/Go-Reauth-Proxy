@@ -197,6 +197,10 @@ type ReverseProxyThrottleExemptIPsRuntime struct {
 	UpdatedAt string   `json:"updated_at,omitempty"`
 }
 
+type LocaleConfig struct {
+	DefaultLocale string `json:"default_locale,omitempty" example:"zh-CN"`
+}
+
 type CommonLocationExemptionsRuntime struct {
 	Enabled    bool     `json:"enabled,omitempty"`
 	WAFEnabled bool     `json:"waf_enabled,omitempty"`

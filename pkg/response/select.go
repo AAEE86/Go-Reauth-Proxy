@@ -1,6 +1,7 @@
 package response
 
 import (
+	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/models"
 	"go-reauth-proxy/pkg/version"
 	"html/template"
@@ -304,7 +305,7 @@ const selectContent = `
 				<img src="/android-chrome-512x512.png" alt="Logo" style="width:50px;height:50px;border-radius:8px;flex-shrink:0;">
 				<div>
 				<h1 class="header-title">Go Reauth Proxy</h1>
-				<p class="header-desc">Choose a destination to continue</p>
+				<p class="header-desc">{{index .Labels "selectDescription"}}</p>
 			</div>
 			</div>
 			<button onclick="document.getElementById('logout-modal').classList.add('active')" class="btn-logout">
@@ -313,7 +314,7 @@ const selectContent = `
 					<polyline points="16 17 21 12 16 7"/>
 					<line x1="21" y1="12" x2="9" y2="12"/>
 				</svg>
-				Logout
+				{{index .Labels "logout"}}
 			</button>
 		</div>
 	</div>
@@ -351,7 +352,7 @@ const selectContent = `
 					<line x1="9" y1="9" x2="9.01" y2="9"/>
 					<line x1="15" y1="9" x2="15.01" y2="9"/>
 				</svg>
-				No routes available.
+				{{index .Labels "routesEmpty"}}
 			</div>
 		{{end}}
 	</div>
@@ -386,14 +387,14 @@ const selectContent = `
 
 <div id="logout-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
 	<div class="modal-content">
-		<h2 class="modal-title">Logout</h2>
-		<p class="modal-message">Are you sure you want to log out?</p>
+		<h2 class="modal-title">{{index .Labels "logoutTitle"}}</h2>
+		<p class="modal-message">{{index .Labels "logoutMessage"}}</p>
 		<div class="modal-actions">
 			<button onclick="document.getElementById('logout-modal').classList.remove('active')" class="modal-btn modal-btn-cancel">
-				Cancel
+				{{index .Labels "cancel"}}
 			</button>
 			<a href="/__auth__/api/auth/logout" class="modal-btn modal-btn-confirm" style="text-decoration:none;text-align:center;display:inline-flex;align-items:center;justify-content:center;">
-				Confirm
+				{{index .Labels "confirm"}}
 			</a>
 		</div>
 	</div>
@@ -407,7 +408,9 @@ var selectTmpl = template.Must(
 )
 
 func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hostRules []models.HostRule, portalConfig models.GatewayPortalConfig) {
+	locale := i18n.ResolveRequestLocale(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Language", locale)
 	w.WriteHeader(http.StatusOK)
 
 	userAgent := ""
@@ -417,11 +420,11 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 
 	toolbarHTML := ""
 	if !ShouldSuppressToolbarForUserAgent(userAgent) {
-		toolbarHTML = GenerateToolbarWithHosts(rules, hostRules, "/__select__", "", "", portalConfig)
+		toolbarHTML = GenerateToolbarWithHostsForLocale(locale, rules, hostRules, "/__select__", "", "", portalConfig)
 	}
 
 	data := pageData{
-		Title:         "Select Route",
+		Title:         i18n.T(locale, "gateway.selectTitle"),
 		Year:          time.Now().Year(),
 		Version:       version.Version,
 		BodyClass:     "select-page",
@@ -429,6 +432,8 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 		HostRules:     hostRules,
 		GatewayPortal: models.NormalizeGatewayPortalConfig(portalConfig),
 		ToolbarHTML:   template.HTML(toolbarHTML),
+		HTMLLang:      i18n.T(locale, "gateway.htmlLang"),
+		Labels:        gatewayLabels(locale),
 	}
 
 	_ = selectTmpl.ExecuteTemplate(w, "layout", data)

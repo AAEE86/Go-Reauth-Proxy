@@ -1,6 +1,7 @@
 package iptables
 
 import (
+	stderrors "errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,11 @@ import (
 type debugTestRunner struct{}
 
 func (debugTestRunner) CombinedOutput(command string, args ...string) ([]byte, error) {
+	for _, arg := range args {
+		if arg == "-D" {
+			return []byte("not found"), stderrors.New("not found")
+		}
+	}
 	return []byte("ok"), nil
 }
 
