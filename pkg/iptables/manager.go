@@ -5,6 +5,7 @@ import (
 	"go-reauth-proxy/pkg/errors"
 	"go-reauth-proxy/pkg/logger"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -24,15 +25,40 @@ type commandRunner interface {
 	CombinedOutputWithInput(input string, command string, args ...string) ([]byte, error)
 }
 
-type sudoExecRunner struct{}
+type execRunner struct {
+	useSudo bool
+}
 
-func (sudoExecRunner) CombinedOutput(command string, args ...string) ([]byte, error) {
-	cmd := exec.Command("sudo", append([]string{command}, args...)...)
+func shouldUseSudo() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FN_KNOCK_IPTABLES_USE_SUDO"))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+
+	if os.Geteuid() == 0 {
+		return false
+	}
+
+	_, err := exec.LookPath("sudo")
+	return err == nil
+}
+
+func (r execRunner) buildCommand(command string, args ...string) *exec.Cmd {
+	if r.useSudo {
+		return exec.Command("sudo", append([]string{command}, args...)...)
+	}
+	return exec.Command(command, args...)
+}
+
+func (r execRunner) CombinedOutput(command string, args ...string) ([]byte, error) {
+	cmd := r.buildCommand(command, args...)
 	return cmd.CombinedOutput()
 }
 
-func (sudoExecRunner) CombinedOutputWithInput(input string, command string, args ...string) ([]byte, error) {
-	cmd := exec.Command("sudo", append([]string{command}, args...)...)
+func (r execRunner) CombinedOutputWithInput(input string, command string, args ...string) ([]byte, error) {
+	cmd := r.buildCommand(command, args...)
 	cmd.Stdin = strings.NewReader(input)
 	return cmd.CombinedOutput()
 }
@@ -144,7 +170,7 @@ func NewManager(opts Options) *Manager {
 		ParentChains: parents,
 		ExemptPorts:  opts.ExemptPorts,
 		tables:       tables,
-		runner:       sudoExecRunner{},
+		runner:       execRunner{useSudo: shouldUseSudo()},
 	}
 }
 
@@ -293,6 +319,15 @@ func (m *Manager) Init() error {
 		}
 
 		for _, parent := range m.ParentChains {
+			if !m.parentChainExists(table, parent) {
+				if event := logger.DebugEvent("iptables", "parent_chain_missing"); event != nil {
+					event.Str("table", logger.SanitizeLogString(table)).
+						Str("chain", logger.SanitizeLogString(m.Chain)).
+						Str("parent_chain", logger.SanitizeLogString(parent)).
+						Send()
+				}
+				continue
+			}
 			if err := m.runTable(table, "-C", parent, "-j", m.Chain); err != nil {
 				if err := m.runTable(table, "-I", parent, "1", "-j", m.Chain); err != nil {
 					if event := logger.DebugEvent("iptables", "init_failed"); event != nil {
