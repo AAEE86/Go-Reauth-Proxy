@@ -15,6 +15,7 @@ const (
 	LocaleZhHant = "zh-Hant"
 	LocaleEn     = "en"
 	LocaleKoKR   = "ko-KR"
+	LocaleJaJP   = "ja-JP"
 
 	DefaultLocale    = LocaleZhCN
 	LocaleCookieName = "fn_knock_locale"
@@ -36,6 +37,7 @@ var (
 		language.MustParse(LocaleZhHant),
 		language.MustParse(LocaleEn),
 		language.MustParse(LocaleKoKR),
+		language.MustParse(LocaleJaJP),
 	})
 )
 
@@ -45,7 +47,7 @@ func init() {
 
 func loadMessages() map[string]map[string]string {
 	out := map[string]map[string]string{}
-	for _, locale := range []string{LocaleZhCN, LocaleZhHant, LocaleEn, LocaleKoKR} {
+	for _, locale := range []string{LocaleZhCN, LocaleZhHant, LocaleEn, LocaleKoKR, LocaleJaJP} {
 		data, err := localeFS.ReadFile("locales/" + locale + ".json")
 		if err != nil {
 			continue
@@ -65,7 +67,7 @@ func NormalizeLocale(value string) string {
 		return ""
 	}
 	switch raw {
-	case LocaleZhCN, LocaleZhHant, LocaleEn, LocaleKoKR:
+	case LocaleZhCN, LocaleZhHant, LocaleEn, LocaleKoKR, LocaleJaJP:
 		return raw
 	}
 
@@ -79,12 +81,17 @@ func NormalizeLocale(value string) string {
 		return LocaleEn
 	case "ko", "ko-kr":
 		return LocaleKoKR
+	case "ja", "ja-jp":
+		return LocaleJaJP
 	}
 	if strings.HasPrefix(lower, "en-") {
 		return LocaleEn
 	}
 	if strings.HasPrefix(lower, "ko-") {
 		return LocaleKoKR
+	}
+	if strings.HasPrefix(lower, "ja-") {
+		return LocaleJaJP
 	}
 	if strings.HasPrefix(lower, "zh-hant") {
 		return LocaleZhHant
