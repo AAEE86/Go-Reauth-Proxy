@@ -95,6 +95,11 @@ func (s *Server) Start() error {
 	r.HandleFunc("/api/info", s.handleInfo).Methods("GET")
 	r.HandleFunc("/api/traffic", s.handleTraffic).Methods("GET")
 	r.HandleFunc("/api/traffic/active-ips", s.handleTrafficActiveIPs).Methods("GET")
+	r.HandleFunc("/api/general-blacklist", s.handleListGeneralBlacklist).Methods("GET")
+	r.HandleFunc("/api/general-blacklist/status", s.handleGeneralBlacklistStatus).Methods("POST")
+	r.HandleFunc("/api/general-blacklist", s.handleAddGeneralBlacklist).Methods("POST")
+	r.HandleFunc("/api/general-blacklist", s.handleDeleteGeneralBlacklist).Methods("DELETE")
+	r.HandleFunc("/api/general-blacklist/{ip}", s.handleDeleteGeneralBlacklistIP).Methods("DELETE")
 	r.HandleFunc("/api/config/default-route", s.handleGetDefaultRoute).Methods("GET")
 	r.HandleFunc("/api/config/default-route", s.handleSetDefaultRoute).Methods("POST")
 	r.HandleFunc("/api/config/proxy-protocol", s.handleGetProxyProtocolForce).Methods("GET")
@@ -524,6 +529,91 @@ func (s *Server) handleTrafficActiveIPs(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	response.Success(w, s.ProxyHandler.GetHostActiveIPs(host, time.Now()))
+}
+
+type generalBlacklistRequest struct {
+	IPs     []string `json:"ips"`
+	Source  string   `json:"source,omitempty"`
+	Comment string   `json:"comment,omitempty"`
+}
+
+func (s *Server) handleListGeneralBlacklist(w http.ResponseWriter, r *http.Request) {
+	page := 1
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			response.Error(w, errors.CodeBadRequest, "page must be a positive integer")
+			return
+		}
+		page = value
+	}
+
+	limit := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value <= 0 {
+			response.Error(w, errors.CodeBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = value
+	}
+
+	response.Success(w, s.ProxyHandler.ListGeneralBlacklist(page, limit, r.URL.Query().Get("search")))
+}
+
+func (s *Server) handleGeneralBlacklistStatus(w http.ResponseWriter, r *http.Request) {
+	var req generalBlacklistRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	result, err := s.ProxyHandler.CheckGeneralBlacklist(req.IPs)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, result)
+}
+
+func (s *Server) handleAddGeneralBlacklist(w http.ResponseWriter, r *http.Request) {
+	var req generalBlacklistRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	result, err := s.ProxyHandler.AddGeneralBlacklist(req.IPs, req.Source, req.Comment)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, result)
+}
+
+func (s *Server) handleDeleteGeneralBlacklist(w http.ResponseWriter, r *http.Request) {
+	var req generalBlacklistRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, errors.CodeInvalidJSON, "Invalid JSON object")
+		return
+	}
+
+	result, err := s.ProxyHandler.RemoveGeneralBlacklist(req.IPs)
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, result)
+}
+
+func (s *Server) handleDeleteGeneralBlacklistIP(w http.ResponseWriter, r *http.Request) {
+	ip := mux.Vars(r)["ip"]
+	result, err := s.ProxyHandler.RemoveGeneralBlacklist([]string{ip})
+	if err != nil {
+		response.Error(w, errors.CodeBadRequest, err.Error())
+		return
+	}
+	response.Success(w, result)
 }
 
 // handleGetDefaultRoute gets the default route

@@ -126,6 +126,42 @@ type LoggingConfig struct {
 	MaxDays int  `json:"max_days,omitempty"`
 }
 
+const (
+	GeneralBlacklistSourceManual     = "manual"
+	GeneralBlacklistSourceRequestLog = "request_log"
+	GeneralBlacklistSourceActiveIP   = "active_ip"
+	GeneralBlacklistSourceWAFLog     = "waf_log"
+)
+
+type GeneralBlacklistRecord struct {
+	IP        string `json:"ip"`
+	Source    string `json:"source,omitempty"`
+	Comment   string `json:"comment,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type GeneralBlacklistConfig struct {
+	Items []GeneralBlacklistRecord `json:"items,omitempty"`
+}
+
+type GeneralBlacklistList struct {
+	Total int                      `json:"total"`
+	Items []GeneralBlacklistRecord `json:"items"`
+}
+
+type GeneralBlacklistMutationResult struct {
+	Added   int                      `json:"added"`
+	Updated int                      `json:"updated"`
+	Removed int                      `json:"removed"`
+	Total   int                      `json:"total"`
+	Items   []GeneralBlacklistRecord `json:"items"`
+}
+
+type GeneralBlacklistStatus struct {
+	Records map[string]GeneralBlacklistRecord `json:"records"`
+}
+
 type WAFConfig struct {
 	Enabled                       bool     `json:"enabled,omitempty"`
 	Mode                          string   `json:"mode,omitempty"`

@@ -54,6 +54,7 @@ type Handler struct {
 	PreserveHost          models.PreserveHostConfig
 	GatewayPortal         models.GatewayPortalConfig
 	FnosPortIconHijack    models.FnosPortIconHijackConfig
+	GeneralBlacklist      models.GeneralBlacklistConfig
 	WAFConfig             models.WAFConfig
 	sslBundle             atomic.Value
 	sslOnChange           atomic.Value
@@ -82,6 +83,7 @@ type Handler struct {
 	reverseProxyThrottleExempt *reverseProxyThrottleExemptIPsRuntime
 	commonLocationExemptions   *commonLocationExemptionsRuntime
 	gatewayVisibility          *gatewayVisibility
+	generalBlacklist           *generalBlacklistRuntime
 	forwardedHeaders           *forwardedHeadersConfig
 	preserveHost               *preserveHostConfig
 	wafRuntime                 *proxywaf.Runtime
@@ -740,6 +742,9 @@ func (h *Handler) abortConnection(w http.ResponseWriter) {
 	rc := http.NewResponseController(w)
 	conn, _, err := rc.Hijack()
 	if err == nil && conn != nil {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetLinger(0)
+		}
 		conn.Close()
 		return
 	}
@@ -777,6 +782,7 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		PreserveHost:         normalizedPreserveHost,
 		GatewayPortal:        models.NormalizeGatewayPortalConfig(initialCfg.Portal),
 		FnosPortIconHijack:   initialCfg.FnosPortIconHijack,
+		GeneralBlacklist:     models.GeneralBlacklistConfig{Items: []models.GeneralBlacklistRecord{}},
 		WAFConfig:            wafConfig,
 		configManager:        cfgManager,
 		sslConfig:            copySSLConfig(initialCfg.SSL),
@@ -793,11 +799,13 @@ func NewHandler(adminPort int, proxyPort int, cfgManager *config.Manager, initia
 		proxyTransport:    newProxyTransport(),
 		authCache:         newAuthStateCache(),
 		preflightCache:    newPreflightStateCache(),
+		generalBlacklist:  newGeneralBlacklistRuntime(initialCfg.GeneralBlacklist),
 		forwardedHeaders:  newForwardedHeadersConfig(normalizedForwardedHeaders),
 		preserveHost:      newPreserveHostConfig(normalizedPreserveHost),
 		wafRuntime:        wafRuntime,
 		systemEventClient: systemEventClient,
 	}
+	h.GeneralBlacklist = h.generalBlacklist.getConfig()
 	if event := debugProxyEvent("handler_initialized", ""); event != nil {
 		event.Interface("proxy_port", logger.SanitizePort(proxyPort)).
 			Int("path_rule_count", len(h.Rules)).
@@ -919,6 +927,7 @@ func (h *Handler) saveConfigLocked() {
 		conf.PreserveHost = h.PreserveHost
 		conf.Portal = h.GatewayPortal
 		conf.FnosPortIconHijack = h.FnosPortIconHijack
+		conf.GeneralBlacklist = h.GeneralBlacklist
 		conf.WAF = h.WAFConfig
 		conf.SSL = copySSLConfig(h.sslConfig)
 		conf.SSLCert, conf.SSLKey = legacySSLPEMFromConfig(h.sslConfig)
@@ -2019,6 +2028,95 @@ func (h *Handler) GetGatewayVisibility() models.GatewayVisibilityConfig {
 	}
 }
 
+func (h *Handler) ListGeneralBlacklist(page int, limit int, search string) models.GeneralBlacklistList {
+	h.mu.RLock()
+	runtime := h.generalBlacklist
+	h.mu.RUnlock()
+
+	if runtime == nil {
+		return models.GeneralBlacklistList{Items: []models.GeneralBlacklistRecord{}}
+	}
+	return runtime.list(page, limit, search)
+}
+
+func (h *Handler) CheckGeneralBlacklist(ips []string) (models.GeneralBlacklistStatus, error) {
+	h.mu.RLock()
+	runtime := h.generalBlacklist
+	h.mu.RUnlock()
+
+	if runtime == nil {
+		runtime = newGeneralBlacklistRuntime(models.GeneralBlacklistConfig{})
+	}
+	return runtime.status(ips)
+}
+
+func (h *Handler) GetGeneralBlacklist() models.GeneralBlacklistConfig {
+	h.mu.RLock()
+	runtime := h.generalBlacklist
+	h.mu.RUnlock()
+
+	if runtime == nil {
+		return models.GeneralBlacklistConfig{Items: []models.GeneralBlacklistRecord{}}
+	}
+	return runtime.getConfig()
+}
+
+func (h *Handler) AddGeneralBlacklist(ips []string, source string, comment string) (models.GeneralBlacklistMutationResult, error) {
+	h.mu.Lock()
+	runtime := h.generalBlacklist
+	if runtime == nil {
+		runtime = newGeneralBlacklistRuntime(models.GeneralBlacklistConfig{})
+		h.generalBlacklist = runtime
+	}
+	h.mu.Unlock()
+
+	normalized, result, err := runtime.addMany(ips, source, comment, time.Now())
+	if err != nil {
+		return models.GeneralBlacklistMutationResult{}, err
+	}
+
+	h.mu.Lock()
+	h.GeneralBlacklist = normalized
+	h.saveConfigLocked()
+	h.mu.Unlock()
+
+	if event := debugProxyEvent("general_blacklist_added", ""); event != nil {
+		event.Int("added", result.Added).
+			Int("updated", result.Updated).
+			Int("total", result.Total).
+			Str("source", logger.SanitizeLogString(normalizeGeneralBlacklistSource(source))).
+			Send()
+	}
+	return result, nil
+}
+
+func (h *Handler) RemoveGeneralBlacklist(ips []string) (models.GeneralBlacklistMutationResult, error) {
+	h.mu.Lock()
+	runtime := h.generalBlacklist
+	if runtime == nil {
+		runtime = newGeneralBlacklistRuntime(models.GeneralBlacklistConfig{})
+		h.generalBlacklist = runtime
+	}
+	h.mu.Unlock()
+
+	normalized, result, err := runtime.removeMany(ips)
+	if err != nil {
+		return models.GeneralBlacklistMutationResult{}, err
+	}
+
+	h.mu.Lock()
+	h.GeneralBlacklist = normalized
+	h.saveConfigLocked()
+	h.mu.Unlock()
+
+	if event := debugProxyEvent("general_blacklist_removed", ""); event != nil {
+		event.Int("removed", result.Removed).
+			Int("total", result.Total).
+			Send()
+	}
+	return result, nil
+}
+
 func (h *Handler) GetForwardedHeadersConfig() models.ForwardedHeadersConfig {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -2080,6 +2178,17 @@ func (h *Handler) IsClientIPVisible(clientIP string) bool {
 		return true
 	}
 	return visibility.contains(clientIP)
+}
+
+func (h *Handler) GetGeneralBlacklistRecordForClientIP(clientIP string) (models.GeneralBlacklistRecord, bool) {
+	h.mu.RLock()
+	runtime := h.generalBlacklist
+	h.mu.RUnlock()
+
+	if runtime == nil {
+		return models.GeneralBlacklistRecord{}, false
+	}
+	return runtime.contains(clientIP)
 }
 
 func (h *Handler) SetReverseProxyThrottle(cfg models.ReverseProxyThrottleConfig) {
@@ -2975,6 +3084,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Str("ali_real_client_ip", logger.SanitizeLogString(r.Header.Get("Ali-Real-Client-IP"))).
 			Str("eo_connecting_ip", logger.SanitizeLogString(r.Header.Get("EO-Connecting-IP"))).
 			Send()
+	}
+
+	if blacklistRecord, blocked := h.GetGeneralBlacklistRecordForClientIP(clientIP); blocked {
+		accessEntry.RouteType = "general_blacklist"
+		accessEntry.RouteKey = blacklistRecord.IP
+		accessEntry.AuthDecision = "general_blacklist_blocked"
+		accessEntry.GeneralBlacklistBlocked = true
+		accessEntry.Matched = true
+		loggedStatusCode = 499
+		if event := debugProxyEvent("general_blacklist_blocked", requestID); event != nil {
+			event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+				Str("source", logger.SanitizeLogString(blacklistRecord.Source)).
+				Str("comment", logger.SanitizeLogString(blacklistRecord.Comment)).
+				Send()
+		}
+		h.abortConnection(w)
+		return
 	}
 
 	if !h.IsClientIPVisible(clientIP) {

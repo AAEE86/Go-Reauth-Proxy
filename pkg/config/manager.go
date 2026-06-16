@@ -36,6 +36,7 @@ type AppConfig struct {
 	FnosPortIconHijack   models.FnosPortIconHijackConfig   `json:"fnos_port_icon_hijack,omitempty"`
 	IptablesChainName    string                            `json:"iptables_chain_name,omitempty"`
 	Logging              models.LoggingConfig              `json:"logging,omitempty"`
+	GeneralBlacklist     models.GeneralBlacklistConfig     `json:"general_blacklist,omitempty"`
 	WAF                  models.WAFConfig                  `json:"waf,omitempty"`
 	Locale               models.LocaleConfig               `json:"locale,omitempty"`
 	SSL                  models.SSLConfig                  `json:"ssl,omitempty"`
@@ -116,6 +117,9 @@ func defaultConfig() *AppConfig {
 		Logging: models.LoggingConfig{
 			Enabled: false,
 			MaxDays: gatewaylog.DefaultMaxDays,
+		},
+		GeneralBlacklist: models.GeneralBlacklistConfig{
+			Items: []models.GeneralBlacklistRecord{},
 		},
 		SSL: models.SSLConfig{
 			DeploymentMode: models.SSLDeploymentModeSingleActive,
@@ -276,6 +280,10 @@ func applyDefaults(cfg *AppConfig) bool {
 	}
 	if cfg.Logging.MaxDays <= 0 {
 		cfg.Logging.MaxDays = gatewaylog.DefaultMaxDays
+		changed = true
+	}
+	if cfg.GeneralBlacklist.Items == nil {
+		cfg.GeneralBlacklist.Items = []models.GeneralBlacklistRecord{}
 		changed = true
 	}
 	if cfg.WAF.DisabledHosts == nil {
