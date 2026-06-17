@@ -355,6 +355,7 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 		SuppressToolbar *bool                  `json:"suppress_toolbar"`
 		PreserveHost    *bool                  `json:"preserve_host"`
 		Title           string                 `json:"title"`
+		Favicon         *string                `json:"favicon"`
 		BasicAuth       models.BasicAuthConfig `json:"basic_auth"`
 		Locations       []hostLocationRequest  `json:"locations"`
 	}
@@ -396,8 +397,14 @@ func (s *Server) handleAddHostRule(w http.ResponseWriter, r *http.Request) {
 			SuppressToolbar: req.SuppressToolbar != nil && *req.SuppressToolbar,
 			PreserveHost:    req.PreserveHost == nil || *req.PreserveHost,
 			Title:           req.Title,
-			BasicAuth:       req.BasicAuth,
-			Locations:       locations,
+			Favicon: func() string {
+				if req.Favicon == nil {
+					return ""
+				}
+				return *req.Favicon
+			}(),
+			BasicAuth: req.BasicAuth,
+			Locations: locations,
 		})
 	}
 

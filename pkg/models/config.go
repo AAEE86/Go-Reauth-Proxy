@@ -17,6 +17,7 @@ type HostRule struct {
 	SuppressToolbar bool            `json:"suppress_toolbar,omitempty" example:"false"`
 	PreserveHost    bool            `json:"preserve_host,omitempty" example:"true"`
 	Title           string          `json:"title,omitempty" example:"Redis"`
+	Favicon         string          `json:"favicon,omitempty" example:"data:image/png;base64,..."`
 	BasicAuth       BasicAuthConfig `json:"basic_auth,omitempty"`
 	Locations       []HostLocation  `json:"locations,omitempty"`
 }
@@ -212,13 +213,17 @@ const (
 
 type GatewayPortalConfig struct {
 	DisplayStyle string `json:"display_style,omitempty" example:"domain"`
+	ShowAppIcon  bool   `json:"show_app_icon,omitempty" example:"false"`
 }
 
 func NormalizeGatewayPortalConfig(cfg GatewayPortalConfig) GatewayPortalConfig {
+	normalized := GatewayPortalConfig{ShowAppIcon: cfg.ShowAppIcon}
 	if cfg.DisplayStyle == GatewayPortalDisplayStyleTitle {
-		return GatewayPortalConfig{DisplayStyle: GatewayPortalDisplayStyleTitle}
+		normalized.DisplayStyle = GatewayPortalDisplayStyleTitle
+		return normalized
 	}
-	return GatewayPortalConfig{DisplayStyle: GatewayPortalDisplayStyleDomain}
+	normalized.DisplayStyle = GatewayPortalDisplayStyleDomain
+	return normalized
 }
 
 type FnosPortIconHijackConfig struct {

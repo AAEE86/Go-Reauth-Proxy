@@ -109,6 +109,7 @@ func defaultConfig() *AppConfig {
 		},
 		Portal: models.GatewayPortalConfig{
 			DisplayStyle: models.GatewayPortalDisplayStyleDomain,
+			ShowAppIcon:  false,
 		},
 		FnosPortIconHijack: models.FnosPortIconHijackConfig{
 			Enabled:   false,

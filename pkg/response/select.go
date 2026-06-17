@@ -18,6 +18,7 @@ var htmlFuncMap = template.FuncMap{
 		return path
 	},
 	"hostDisplayLabel": GatewayPortalHostLabel,
+	"hostFavicon":      GatewayPortalHostFavicon,
 }
 
 const selectStyle = `
@@ -137,6 +138,23 @@ const selectStyle = `
     border-color: hsl(0 0% 78%);
     box-shadow: 0 4px 12px 0 rgb(0 0 0 / 0.08);
     transform: translateY(-1px);
+  }
+  .route-main {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 0.875rem;
+  }
+  .route-icon {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+    border-radius: 8px;
+    object-fit: contain;
+    background: var(--muted);
+  }
+  .route-copy {
+    min-width: 0;
   }
   .route-path {
     font-size: 0.9375rem;
@@ -323,9 +341,14 @@ const selectContent = `
 		{{if .HostRules}}
 			{{range .HostRules}}
 			<a href="/" data-host="{{.Host}}" class="route-card host-route-card">
-				<div>
+				<div class="route-main">
+					{{with hostFavicon . $.GatewayPortal}}
+					<img class="route-icon" src="{{.}}" alt="">
+					{{end}}
+					<div class="route-copy">
 					<div class="route-path">{{hostDisplayLabel . $.GatewayPortal}}</div>
 					<div class="route-target">{{.Target}}</div>
+					</div>
 				</div>
 				<svg class="route-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<polyline points="9 18 15 12 9 6"/>

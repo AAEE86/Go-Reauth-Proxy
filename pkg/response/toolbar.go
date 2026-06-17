@@ -134,6 +134,15 @@ const toolbarTemplate = `
             background-color: #f9fafb;
             color: #111827;
         }
+        .menu-item-icon {
+            width: 18px;
+            height: 18px;
+            border-radius: 4px;
+            object-fit: contain;
+            flex-shrink: 0;
+            margin-right: 10px;
+            background: #f3f4f6;
+        }
         .menu-item.active {
             color: #18181b;
             font-weight: 600;
@@ -360,12 +369,25 @@ const toolbarTemplate = `
 	    anchor.appendChild(right);
 	}
 
-	function createMenuLink(label, href, extraClass, active) {
+	function isAppIconSrc(value) {
+	    return /^data:image\//i.test(asString(value).trim());
+	}
+
+	function createMenuLink(label, href, extraClass, active, icon) {
 	    var anchor = document.createElement('a');
 	    anchor.href = href;
 	    anchor.target = '_blank';
 	    anchor.rel = 'noopener noreferrer';
 	    anchor.className = 'menu-item nav-link ' + extraClass + (active ? ' active' : '');
+
+	    if (isAppIconSrc(icon)) {
+	        var image = document.createElement('img');
+	        image.className = 'menu-item-icon';
+	        image.src = asString(icon).trim();
+	        image.alt = '';
+	        image.loading = 'lazy';
+	        anchor.appendChild(image);
+	    }
 
 	    var text = document.createElement('span');
 	    text.className = 'menu-item-path';
@@ -391,7 +413,8 @@ const toolbarTemplate = `
 	        for (var i = 0; i < hostRules.length; i++) {
 	            var host = asString(hostRules[i].host);
 	            var label = asString(hostRules[i].label) || host;
-	            var hostLink = createMenuLink(label, '/', 'host-link', isActiveHost(host, toolbarData.current_host));
+	            var icon = toolbarData.show_app_icon ? asString(hostRules[i].favicon) : '';
+	            var hostLink = createMenuLink(label, '/', 'host-link', isActiveHost(host, toolbarData.current_host), icon);
 	            hostLink.setAttribute('data-host', host);
 	            menuScroll.appendChild(hostLink);
 	        }
@@ -401,7 +424,7 @@ const toolbarTemplate = `
 	    if (rules.length > 0) {
 	        for (var j = 0; j < rules.length; j++) {
 	            var path = asString(rules[j].path);
-	            menuScroll.appendChild(createMenuLink(path, ensureSlash(path), 'rule-link', isActivePath(path, toolbarData.current_path)));
+	            menuScroll.appendChild(createMenuLink(path, ensureSlash(path), 'rule-link', isActivePath(path, toolbarData.current_path), ''));
 	        }
 	        return;
 	    }
@@ -751,8 +774,9 @@ type toolbarRuleData struct {
 }
 
 type toolbarHostRuleData struct {
-	Host  string `json:"host"`
-	Label string `json:"label,omitempty"`
+	Host    string `json:"host"`
+	Label   string `json:"label,omitempty"`
+	Favicon string `json:"favicon,omitempty"`
 }
 
 type toolbarData struct {
@@ -760,6 +784,7 @@ type toolbarData struct {
 	HostRules   []toolbarHostRuleData `json:"host_rules"`
 	CurrentPath string                `json:"current_path"`
 	CurrentHost string                `json:"current_host"`
+	ShowAppIcon bool                  `json:"show_app_icon,omitempty"`
 	Labels      map[string]string     `json:"labels"`
 }
 
@@ -795,6 +820,17 @@ func GatewayPortalHostLabel(rule models.HostRule, portalConfig models.GatewayPor
 	return rule.Host
 }
 
+func GatewayPortalHostFavicon(rule models.HostRule, portalConfig models.GatewayPortalConfig) string {
+	if !models.NormalizeGatewayPortalConfig(portalConfig).ShowAppIcon {
+		return ""
+	}
+	favicon := strings.TrimSpace(rule.Favicon)
+	if !strings.HasPrefix(strings.ToLower(favicon), "data:image/") {
+		return ""
+	}
+	return favicon
+}
+
 func normalizeToolbarHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
@@ -825,12 +861,14 @@ func GenerateToolbarWithHostsForRequest(r *http.Request, rules []models.Rule, ho
 
 func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
+	normalizedPortal := models.NormalizeGatewayPortalConfig(portalConfig)
 
 	data := toolbarData{
 		Rules:       make([]toolbarRuleData, 0, len(rules)),
 		HostRules:   make([]toolbarHostRuleData, 0, len(filteredHostRules)),
 		CurrentPath: currentPath,
 		CurrentHost: currentHost,
+		ShowAppIcon: normalizedPortal.ShowAppIcon,
 		Labels: map[string]string{
 			"logout":             i18n.T(locale, "gateway.logout"),
 			"logoutTitle":        i18n.T(locale, "gateway.logoutConfirmTitle"),
@@ -846,8 +884,9 @@ func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostR
 	}
 	for _, rule := range filteredHostRules {
 		data.HostRules = append(data.HostRules, toolbarHostRuleData{
-			Host:  rule.Host,
-			Label: GatewayPortalHostLabel(rule, portalConfig),
+			Host:    rule.Host,
+			Label:   GatewayPortalHostLabel(rule, normalizedPortal),
+			Favicon: GatewayPortalHostFavicon(rule, normalizedPortal),
 		})
 	}
 

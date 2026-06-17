@@ -151,6 +151,7 @@ func debugHostRuleSummaries(rules []models.HostRule) []map[string]any {
 			"access_mode":        logger.SanitizeLogString(rule.AccessMode),
 			"suppress_toolbar":   rule.SuppressToolbar,
 			"preserve_host":      rule.PreserveHost,
+			"favicon_present":    strings.TrimSpace(rule.Favicon) != "",
 			"basic_auth_enabled": rule.BasicAuth.Enabled,
 			"location_count":     len(rule.Locations),
 		})
@@ -1585,6 +1586,7 @@ func (h *Handler) normalizeHostRule(newRule models.HostRule) (models.HostRule, e
 		newRule.AccessMode = "login_first"
 	}
 	newRule.Title = strings.TrimSpace(newRule.Title)
+	newRule.Favicon = strings.TrimSpace(newRule.Favicon)
 	basicAuth, err := normalizeBasicAuthConfig(newRule.BasicAuth)
 	if err != nil {
 		return models.HostRule{}, err
@@ -2311,7 +2313,9 @@ func (h *Handler) SetGatewayPortalConfig(cfg models.GatewayPortalConfig) models.
 	h.saveConfigLocked()
 	h.mu.Unlock()
 	if event := debugProxyEvent("gateway_portal_config_set", ""); event != nil {
-		event.Str("display_style", logger.SanitizeLogString(normalized.DisplayStyle)).Send()
+		event.Str("display_style", logger.SanitizeLogString(normalized.DisplayStyle)).
+			Bool("show_app_icon", normalized.ShowAppIcon).
+			Send()
 	}
 
 	return normalized
