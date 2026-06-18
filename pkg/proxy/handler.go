@@ -3585,7 +3585,7 @@ func (h *Handler) handleAuthProxyRoute(w http.ResponseWriter, r *http.Request, s
 			http.Redirect(w, r, redirectTarget, http.StatusFound)
 			return true
 		}
-	case "/__auth__/api/auth/logout":
+	case "/__auth__/logout", "/__auth__/api/auth/logout":
 		proxyPath = snapshot.authConfig.LogoutURL
 		if proxyPath == "" {
 			proxyPath = "/api/auth/logout"
