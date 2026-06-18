@@ -118,6 +118,9 @@ definitions:
         description: Enables Tencent EdgeOne client IP/header handling.
         example: false
         type: boolean
+      trust_forwarded_proto:
+        example: false
+        type: boolean
     type: object
   models.BasicAuthConfig:
     properties:
@@ -142,6 +145,45 @@ definitions:
       updated_at:
         type: string
     type: object
+  models.HostLocation:
+    properties:
+      action:
+        example: proxy
+        type: string
+      match:
+        example: prefix
+        type: string
+      path:
+        example: /api
+        type: string
+      response:
+        $ref: '#/definitions/models.HostLocationResponse'
+      rewrite_html:
+        example: true
+        type: boolean
+      strip_path:
+        example: true
+        type: boolean
+      target:
+        example: http://127.0.0.1:8080
+        type: string
+    type: object
+  models.HostLocationResponse:
+    properties:
+      body:
+        example: ok
+        type: string
+      content_type:
+        example: text/plain; charset=utf-8
+        type: string
+      headers:
+        additionalProperties:
+          type: string
+        type: object
+      status:
+        example: 200
+        type: integer
+    type: object
   models.HostRule:
     properties:
       access_mode:
@@ -149,9 +191,16 @@ definitions:
         type: string
       basic_auth:
         $ref: '#/definitions/models.BasicAuthConfig'
+      favicon:
+        example: data:image/png;base64,...
+        type: string
       host:
         example: redis.example.com
         type: string
+      locations:
+        items:
+          $ref: '#/definitions/models.HostLocation'
+        type: array
       preserve_host:
         example: true
         type: boolean
@@ -160,6 +209,9 @@ definitions:
         type: boolean
       target:
         example: http://127.0.0.1:5173
+        type: string
+      title:
+        example: Redis
         type: string
       use_auth:
         example: true

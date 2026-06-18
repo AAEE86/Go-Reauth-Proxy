@@ -2313,7 +2313,8 @@ func (h *Handler) SetGatewayPortalConfig(cfg models.GatewayPortalConfig) models.
 	h.saveConfigLocked()
 	h.mu.Unlock()
 	if event := debugProxyEvent("gateway_portal_config_set", ""); event != nil {
-		event.Str("display_style", logger.SanitizeLogString(normalized.DisplayStyle)).
+		event.Bool("enabled", normalized.Enabled).
+			Str("display_style", logger.SanitizeLogString(normalized.DisplayStyle)).
 			Bool("show_app_icon", normalized.ShowAppIcon).
 			Send()
 	}
@@ -3382,7 +3383,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-		} else if !matchedHostRule.SuppressToolbar && shouldProbeAuthForToolbar(r, snapshot.authConfig) {
+		} else if !matchedHostRule.SuppressToolbar && shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
 			authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
 			accessEntry.AuthDecision = authResult.decision
 		} else {
@@ -3463,7 +3464,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-	} else if shouldProbeAuthForToolbar(r, snapshot.authConfig) {
+	} else if shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
 		authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
 		accessEntry.AuthDecision = authResult.decision
 	} else {
@@ -3820,6 +3821,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 	}
 	omitForwardedHeaders := h.shouldOmitForwardedHeaders(targetURL)
 	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
+	gatewayPortalEnabled := models.NormalizeGatewayPortalConfig(snapshot.gatewayPortal).Enabled
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
@@ -3830,7 +3832,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 			Bool("preserve_host", preserveHost).
 			Bool("strip_path", location.StripPath).
 			Bool("rewrite_html", location.RewriteHTML).
-			Bool("toolbar_candidate", authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Bool("toolbar_candidate", gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
 			Send()
 	}
 
@@ -3875,7 +3877,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 				}
 			}
 
-			if location.RewriteHTML || (authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA) {
+			if location.RewriteHTML || (gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA) {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
@@ -3910,7 +3912,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 		}
 
 		needsRewrite := location.RewriteHTML
-		needsToolbar := authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsToolbar := gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
 			event.Str("route_type", "host_location").
 				Int("status", resp.StatusCode).
@@ -4014,6 +4016,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 	omitForwardedHeaders := h.shouldOmitForwardedHeaders(targetURL)
 	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
+	gatewayPortalEnabled := models.NormalizeGatewayPortalConfig(snapshot.gatewayPortal).Enabled
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
@@ -4022,7 +4025,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			Str("target", logger.SanitizeURL(targetURL.String())).
 			Bool("omit_forwarded_headers", omitForwardedHeaders).
 			Bool("preserve_host", preserveHost).
-			Bool("toolbar_candidate", authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Bool("toolbar_candidate", gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
 			Send()
 	}
 
@@ -4051,7 +4054,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
+			if gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
@@ -4085,7 +4088,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			return err
 		}
 
-		needsToolbar := authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsToolbar := gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
 			event.Str("route_type", "host_rule").
 				Int("status", resp.StatusCode).
@@ -4172,6 +4175,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		transport = newProxyTransport()
 	}
 	preserveHost := !h.shouldOmitPreserveHost(targetURL)
+	gatewayPortalEnabled := models.NormalizeGatewayPortalConfig(snapshot.gatewayPortal).Enabled
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
 		event.Str("route_type", "path_rule").
@@ -4180,7 +4184,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			Bool("preserve_host", preserveHost).
 			Bool("strip_path", matchedRule.StripPath).
 			Bool("rewrite_html", matchedRule.RewriteHTML).
-			Bool("toolbar_candidate", authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Bool("toolbar_candidate", gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA).
 			Send()
 	}
 	proxy := &httputil.ReverseProxy{
@@ -4224,7 +4228,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.RewriteHTML || (authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA) {
+			if matchedRule.RewriteHTML || (gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA) {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
@@ -4255,7 +4259,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		}
 
 		needsRewrite := matchedRule.RewriteHTML && !matchedRule.UseRootMode
-		needsToolbar := authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsToolbar := gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA
 		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
 			event.Str("route_type", "path_rule").
 				Int("status", resp.StatusCode).
@@ -4714,9 +4718,10 @@ func requestHasExplicitAuthIdentity(r *http.Request) bool {
 	return strings.TrimSpace(r.Header.Get("Authorization")) != ""
 }
 
-func shouldProbeAuthForToolbar(r *http.Request, authConfig models.AuthConfig) bool {
+func shouldProbeAuthForToolbar(r *http.Request, authConfig models.AuthConfig, portalConfig models.GatewayPortalConfig) bool {
 	return authConfig.AuthPort > 0 &&
 		authConfig.AuthURL != "" &&
+		models.NormalizeGatewayPortalConfig(portalConfig).Enabled &&
 		requestHasExplicitAuthIdentity(r) &&
 		!response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
 }

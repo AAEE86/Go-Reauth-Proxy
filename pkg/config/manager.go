@@ -108,6 +108,7 @@ func defaultConfig() *AppConfig {
 			UpdatedAt:   "",
 		},
 		Portal: models.GatewayPortalConfig{
+			Enabled:      true,
 			DisplayStyle: models.GatewayPortalDisplayStyleDomain,
 			ShowAppIcon:  false,
 		},

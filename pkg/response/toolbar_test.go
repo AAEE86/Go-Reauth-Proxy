@@ -1,11 +1,22 @@
 package response
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"go-reauth-proxy/pkg/models"
 )
+
+func disabledGatewayPortalConfigForToolbarTest(t *testing.T) models.GatewayPortalConfig {
+	t.Helper()
+
+	var cfg models.GatewayPortalConfig
+	if err := json.Unmarshal([]byte(`{"enabled":false}`), &cfg); err != nil {
+		t.Fatalf("unmarshal disabled gateway portal config: %v", err)
+	}
+	return cfg
+}
 
 func TestGenerateToolbarWithHostsEscapesDynamicRouteData(t *testing.T) {
 	toolbar := GenerateToolbarWithHosts(
@@ -38,6 +49,21 @@ func TestGenerateToolbarWithHostsEscapesDynamicRouteData(t *testing.T) {
 	}
 	if !strings.Contains(toolbar, `\u003c/script\u003e`) {
 		t.Fatalf("toolbar does not contain JSON-escaped dynamic script delimiters: %s", toolbar)
+	}
+}
+
+func TestGenerateToolbarWithHostsReturnsEmptyWhenPortalDisabled(t *testing.T) {
+	toolbar := GenerateToolbarWithHosts(
+		nil,
+		[]models.HostRule{{Host: "app.example.com", Title: "App Portal"}},
+		"",
+		"",
+		"",
+		disabledGatewayPortalConfigForToolbarTest(t),
+	)
+
+	if toolbar != "" {
+		t.Fatalf("toolbar = %q, want empty when portal is disabled", toolbar)
 	}
 }
 

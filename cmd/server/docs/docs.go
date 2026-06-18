@@ -1488,6 +1488,10 @@ const docTemplate = `{
                     "description": "Enables Tencent EdgeOne client IP/header handling.",
                     "type": "boolean",
                     "example": false
+                },
+                "trust_forwarded_proto": {
+                    "type": "boolean",
+                    "example": false
                 }
             }
         },
@@ -1525,6 +1529,61 @@ const docTemplate = `{
                 }
             }
         },
+        "models.HostLocation": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "example": "proxy"
+                },
+                "match": {
+                    "type": "string",
+                    "example": "prefix"
+                },
+                "path": {
+                    "type": "string",
+                    "example": "/api"
+                },
+                "response": {
+                    "$ref": "#/definitions/models.HostLocationResponse"
+                },
+                "rewrite_html": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "strip_path": {
+                    "type": "boolean",
+                    "example": true
+                },
+                "target": {
+                    "type": "string",
+                    "example": "http://127.0.0.1:8080"
+                }
+            }
+        },
+        "models.HostLocationResponse": {
+            "type": "object",
+            "properties": {
+                "body": {
+                    "type": "string",
+                    "example": "ok"
+                },
+                "content_type": {
+                    "type": "string",
+                    "example": "text/plain; charset=utf-8"
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "integer",
+                    "example": 200
+                }
+            }
+        },
         "models.HostRule": {
             "type": "object",
             "properties": {
@@ -1535,9 +1594,19 @@ const docTemplate = `{
                 "basic_auth": {
                     "$ref": "#/definitions/models.BasicAuthConfig"
                 },
+                "favicon": {
+                    "type": "string",
+                    "example": "data:image/png;base64,..."
+                },
                 "host": {
                     "type": "string",
                     "example": "redis.example.com"
+                },
+                "locations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/models.HostLocation"
+                    }
                 },
                 "preserve_host": {
                     "type": "boolean",
@@ -1550,6 +1619,10 @@ const docTemplate = `{
                 "target": {
                     "type": "string",
                     "example": "http://127.0.0.1:5173"
+                },
+                "title": {
+                    "type": "string",
+                    "example": "Redis"
                 },
                 "use_auth": {
                     "type": "boolean",

@@ -1,5 +1,7 @@
 package models
 
+import "encoding/json"
+
 type Rule struct {
 	Path        string `json:"path" example:"/api"`                    // Path prefix to match (e.g., "/api")
 	Target      string `json:"target" example:"http://localhost:8080"` // Target URL (e.g., "http://localhost:7996")
@@ -212,12 +214,44 @@ const (
 )
 
 type GatewayPortalConfig struct {
+	Enabled      bool   `json:"enabled" example:"true"`
 	DisplayStyle string `json:"display_style,omitempty" example:"domain"`
 	ShowAppIcon  bool   `json:"show_app_icon,omitempty" example:"false"`
+	enabledSet   bool
+}
+
+func (cfg *GatewayPortalConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Enabled      *bool  `json:"enabled"`
+		DisplayStyle string `json:"display_style"`
+		ShowAppIcon  bool   `json:"show_app_icon"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	cfg.Enabled = true
+	cfg.enabledSet = false
+	if raw.Enabled != nil {
+		cfg.Enabled = *raw.Enabled
+		cfg.enabledSet = true
+	}
+	cfg.DisplayStyle = raw.DisplayStyle
+	cfg.ShowAppIcon = raw.ShowAppIcon
+	return nil
 }
 
 func NormalizeGatewayPortalConfig(cfg GatewayPortalConfig) GatewayPortalConfig {
-	normalized := GatewayPortalConfig{ShowAppIcon: cfg.ShowAppIcon}
+	enabled := cfg.Enabled
+	if !cfg.enabledSet && !cfg.Enabled {
+		enabled = true
+	}
+
+	normalized := GatewayPortalConfig{
+		Enabled:     enabled,
+		ShowAppIcon: cfg.ShowAppIcon,
+		enabledSet:  true,
+	}
 	if cfg.DisplayStyle == GatewayPortalDisplayStyleTitle {
 		normalized.DisplayStyle = GatewayPortalDisplayStyleTitle
 		return normalized

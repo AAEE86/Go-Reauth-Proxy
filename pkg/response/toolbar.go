@@ -862,6 +862,9 @@ func GenerateToolbarWithHostsForRequest(r *http.Request, rules []models.Rule, ho
 func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
 	normalizedPortal := models.NormalizeGatewayPortalConfig(portalConfig)
+	if !normalizedPortal.Enabled {
+		return ""
+	}
 
 	data := toolbarData{
 		Rules:       make([]toolbarRuleData, 0, len(rules)),

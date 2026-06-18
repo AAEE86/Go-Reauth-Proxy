@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,16 @@ import (
 
 	"go-reauth-proxy/pkg/models"
 )
+
+func disabledGatewayPortalConfigForProxyTest(t *testing.T) models.GatewayPortalConfig {
+	t.Helper()
+
+	var cfg models.GatewayPortalConfig
+	if err := json.Unmarshal([]byte(`{"enabled":false}`), &cfg); err != nil {
+		t.Fatalf("unmarshal disabled gateway portal config: %v", err)
+	}
+	return cfg
+}
 
 func testServerPort(t *testing.T, rawURL string) int {
 	t.Helper()
@@ -98,6 +109,47 @@ func TestPublicHostRuleInjectsToolbarWhenAuthCookieIsAuthenticated(t *testing.T)
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "reauth-proxy-toolbar") {
 		t.Fatalf("response body did not include toolbar: %s", body)
+	}
+}
+
+func TestPublicHostRuleDoesNotProbeOrInjectToolbarWhenPortalDisabled(t *testing.T) {
+	var verifyCalls int32
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && r.URL.Path == "/api/auth/preflight" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/api/auth/verify" {
+			atomic.AddInt32(&verifyCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true}`)
+	}))
+	defer authServer.Close()
+
+	target := newToolbarHTMLTarget(t)
+	defer target.Close()
+
+	handler := newPublicHostToolbarHandler(target.URL, testServerPort(t, authServer.URL))
+	handler.mu.Lock()
+	handler.GatewayPortal = disabledGatewayPortalConfigForProxyTest(t)
+	handler.publishRequestSnapshotLocked()
+	handler.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "http://public.example.com/", nil)
+	req.AddCookie(&http.Cookie{Name: authSessionCookieName, Value: "ok"})
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&verifyCalls); got != 0 {
+		t.Fatalf("verify calls = %d, want 0 when portal is disabled", got)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "reauth-proxy-toolbar") {
+		t.Fatalf("response body included toolbar while portal disabled: %s", body)
 	}
 }
 
