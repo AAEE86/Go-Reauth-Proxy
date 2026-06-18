@@ -1262,7 +1262,7 @@ func (h *Handler) AddRule(newRule models.Rule) error {
 }
 
 func (h *Handler) checkSafeTarget(target string) error {
-	u, err := url.Parse(target)
+	u, _, err := parseReverseProxyTargetURLs(target)
 	if err != nil {
 		return err
 	}
@@ -1279,6 +1279,71 @@ func (h *Handler) checkSafeTarget(target string) error {
 		}
 	}
 	return nil
+}
+
+func parseReverseProxyTargetURLs(target string) (*url.URL, *url.URL, error) {
+	targetURL, err := parseReverseProxyTargetURL(target)
+	if err != nil {
+		return nil, nil, err
+	}
+	return targetURL, reverseProxyTransportURL(targetURL), nil
+}
+
+func parseReverseProxyTargetURL(target string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(target))
+	if err != nil {
+		return nil, err
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	if !isSupportedReverseProxyTargetScheme(u.Scheme) {
+		return nil, fmt.Errorf("unsupported target scheme %q", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("target must include a valid hostname")
+	}
+	return u, nil
+}
+
+func isSupportedReverseProxyTargetScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "http", "https", "ws", "wss":
+		return true
+	default:
+		return false
+	}
+}
+
+func reverseProxyTargetSupportsHTMLFeatures(targetURL *url.URL) bool {
+	if targetURL == nil {
+		return false
+	}
+	switch strings.ToLower(targetURL.Scheme) {
+	case "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+func rawReverseProxyTargetSupportsHTMLFeatures(target string) bool {
+	targetURL, err := parseReverseProxyTargetURL(target)
+	return err == nil && reverseProxyTargetSupportsHTMLFeatures(targetURL)
+}
+
+func reverseProxyTransportURL(targetURL *url.URL) *url.URL {
+	if targetURL == nil {
+		return nil
+	}
+	transportURL := *targetURL
+	switch strings.ToLower(transportURL.Scheme) {
+	case "ws":
+		transportURL.Scheme = "http"
+	case "wss":
+		transportURL.Scheme = "https"
+	case "http", "https":
+		transportURL.Scheme = strings.ToLower(transportURL.Scheme)
+	}
+	return &transportURL
 }
 
 func parseStreamTarget(target string) (string, int, error) {
@@ -3356,14 +3421,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.RouteKey = matchedHostRule.Host
 		accessEntry.Upstream = matchedHostRule.Target
 		authUpstreamTarget := matchedHostRule.Target
+		toolbarProbeTarget := matchedHostRule.Target
 		if matchedHostLocation != nil {
 			accessEntry.RouteType = "host_location"
 			accessEntry.RouteKey = hostLocationRouteKey(matchedHostRule, matchedHostLocation)
 			if matchedHostLocation.Action == models.HostLocationActionProxy {
 				accessEntry.Upstream = matchedHostLocation.Target
 				authUpstreamTarget = matchedHostLocation.Target
+				toolbarProbeTarget = matchedHostLocation.Target
 			} else {
 				accessEntry.Upstream = ""
+				toolbarProbeTarget = ""
 			}
 		}
 		accessEntry.AuthRequired = matchedHostRule.UseAuth && snapshot.authConfig.AuthURL != ""
@@ -3383,7 +3451,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-		} else if !matchedHostRule.SuppressToolbar && shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
+		} else if !matchedHostRule.SuppressToolbar && rawReverseProxyTargetSupportsHTMLFeatures(toolbarProbeTarget) && shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
 			authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
 			accessEntry.AuthDecision = authResult.decision
 		} else {
@@ -3435,7 +3503,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	accessEntry.RouteKey = matchedRule.Path
 	accessEntry.Upstream = matchedRule.Target
 	accessEntry.AuthRequired = matchedRule.UseAuth && snapshot.authConfig.AuthURL != ""
-	if matchedRule.UseRootMode && matchedRule.Path != "/" && strings.HasPrefix(r.URL.Path, matchedRule.Path) {
+	if rawReverseProxyTargetSupportsHTMLFeatures(matchedRule.Target) && matchedRule.UseRootMode && matchedRule.Path != "/" && strings.HasPrefix(r.URL.Path, matchedRule.Path) {
 		accessEntry.AuthDecision = "root_mode_redirect"
 		http.SetCookie(w, &http.Cookie{
 			Name:  proxyPathCookieName,
@@ -3464,7 +3532,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-	} else if shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
+	} else if rawReverseProxyTargetSupportsHTMLFeatures(matchedRule.Target) && shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
 		authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
 		accessEntry.AuthDecision = authResult.decision
 	} else {
@@ -3795,7 +3863,7 @@ func serveHostLocationResponse(w http.ResponseWriter, location models.HostLocati
 }
 
 func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, location models.HostLocation, clientIP string, authResult authCheckResult, requestID string) {
-	targetURL, err := url.Parse(location.Target)
+	targetURL, transportTargetURL, err := parseReverseProxyTargetURLs(location.Target)
 	if err != nil {
 		if event := debugProxyEvent("reverse_proxy_target_invalid", requestID); event != nil {
 			event.Str("route_type", "host_location").
@@ -3808,31 +3876,27 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	switch targetURL.Scheme {
-	case "ws":
-		targetURL.Scheme = "http"
-	case "wss":
-		targetURL.Scheme = "https"
-	}
-
 	transport := h.proxyTransport
 	if transport == nil {
 		transport = newProxyTransport()
 	}
-	omitForwardedHeaders := h.shouldOmitForwardedHeaders(targetURL)
-	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
+	targetSupportsHTMLFeatures := reverseProxyTargetSupportsHTMLFeatures(targetURL)
+	omitForwardedHeaders := h.shouldOmitForwardedHeaders(transportTargetURL)
+	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(transportTargetURL)
 	gatewayPortalEnabled := models.NormalizeGatewayPortalConfig(snapshot.gatewayPortal).Enabled
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+	toolbarCandidate := targetSupportsHTMLFeatures && gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
 		event.Str("route_type", "host_location").
 			Str("route_key", logger.SanitizeLogString(hostLocationRouteKey(&matchedRule, &location))).
 			Str("target", logger.SanitizeURL(targetURL.String())).
+			Str("transport_target", logger.SanitizeURL(transportTargetURL.String())).
 			Bool("omit_forwarded_headers", omitForwardedHeaders).
 			Bool("preserve_host", preserveHost).
 			Bool("strip_path", location.StripPath).
-			Bool("rewrite_html", location.RewriteHTML).
-			Bool("toolbar_candidate", gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Bool("rewrite_html", targetSupportsHTMLFeatures && location.RewriteHTML).
+			Bool("toolbar_candidate", toolbarCandidate).
 			Send()
 	}
 
@@ -3841,10 +3905,10 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, omitForwardedHeaders)
 			copyUserAgentHeader(pr.Out, pr.In)
-			pr.SetURL(targetURL)
+			pr.SetURL(transportTargetURL)
 			applyBasicAuthInjection(pr.Out, matchedRule.BasicAuth)
-			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
-			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
+			applyUpstreamPrivateIPv4HintHeader(pr.Out, transportTargetURL)
+			applyPreserveHostPolicy(pr.Out, pr.In, transportTargetURL, preserveHost)
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
 
 			if location.StripPath {
@@ -3857,13 +3921,13 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 
 			if !preserveHost {
 				if origin := pr.In.Header.Get("Origin"); origin != "" {
-					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+					pr.Out.Header.Set("Origin", transportTargetURL.Scheme+"://"+transportTargetURL.Host)
 				}
 				if referer := pr.In.Header.Get("Referer"); referer != "" {
 					ref, err := url.Parse(referer)
 					if err == nil {
-						ref.Scheme = targetURL.Scheme
-						ref.Host = targetURL.Host
+						ref.Scheme = transportTargetURL.Scheme
+						ref.Host = transportTargetURL.Host
 						ref.Path = path.Clean(ref.Path)
 						if location.StripPath {
 							ref.Path = strings.TrimPrefix(ref.Path, location.Path)
@@ -3877,7 +3941,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 				}
 			}
 
-			if location.RewriteHTML || (gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA) {
+			if (targetSupportsHTMLFeatures && location.RewriteHTML) || toolbarCandidate {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
@@ -3911,8 +3975,8 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 			return err
 		}
 
-		needsRewrite := location.RewriteHTML
-		needsToolbar := gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsRewrite := targetSupportsHTMLFeatures && location.RewriteHTML
+		needsToolbar := toolbarCandidate
 		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
 			event.Str("route_type", "host_location").
 				Int("status", resp.StatusCode).
@@ -3973,7 +4037,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 	}
 
 	if h.maybeProxyFnosPortIconHijackWebSocket(w, r, fnosPortIconHijackWebSocketOptions{
-		targetURL:            targetURL,
+		targetURL:            transportTargetURL,
 		hostRules:            snapshot.hostRules,
 		clientIP:             clientIP,
 		omitForwardedHeaders: omitForwardedHeaders,
@@ -3990,7 +4054,7 @@ func (h *Handler) proxyToHostLocationTarget(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.HostRule, clientIP string, authResult authCheckResult, requestID string) {
-	targetURL, err := url.Parse(matchedRule.Target)
+	targetURL, transportTargetURL, err := parseReverseProxyTargetURLs(matchedRule.Target)
 	if err != nil {
 		if event := debugProxyEvent("reverse_proxy_target_invalid", requestID); event != nil {
 			event.Str("route_type", "host_rule").
@@ -4003,29 +4067,25 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		return
 	}
 
-	switch targetURL.Scheme {
-	case "ws":
-		targetURL.Scheme = "http"
-	case "wss":
-		targetURL.Scheme = "https"
-	}
-
 	transport := h.proxyTransport
 	if transport == nil {
 		transport = newProxyTransport()
 	}
-	omitForwardedHeaders := h.shouldOmitForwardedHeaders(targetURL)
-	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(targetURL)
+	targetSupportsHTMLFeatures := reverseProxyTargetSupportsHTMLFeatures(targetURL)
+	omitForwardedHeaders := h.shouldOmitForwardedHeaders(transportTargetURL)
+	preserveHost := matchedRule.PreserveHost && !h.shouldOmitPreserveHost(transportTargetURL)
 	gatewayPortalEnabled := models.NormalizeGatewayPortalConfig(snapshot.gatewayPortal).Enabled
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+	toolbarCandidate := targetSupportsHTMLFeatures && gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
 	isAuthHostProxy := snapshot.authConfig.AuthHost != "" && normalizeRequestHost(matchedRule.Host) == snapshot.authConfig.AuthHost
 	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
 		event.Str("route_type", "host_rule").
 			Str("route_key", logger.SanitizeLogString(matchedRule.Host)).
 			Str("target", logger.SanitizeURL(targetURL.String())).
+			Str("transport_target", logger.SanitizeURL(transportTargetURL.String())).
 			Bool("omit_forwarded_headers", omitForwardedHeaders).
 			Bool("preserve_host", preserveHost).
-			Bool("toolbar_candidate", gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Bool("toolbar_candidate", toolbarCandidate).
 			Send()
 	}
 
@@ -4034,27 +4094,27 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, omitForwardedHeaders)
 			copyUserAgentHeader(pr.Out, pr.In)
-			pr.SetURL(targetURL)
+			pr.SetURL(transportTargetURL)
 			applyBasicAuthInjection(pr.Out, matchedRule.BasicAuth)
-			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
-			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
+			applyUpstreamPrivateIPv4HintHeader(pr.Out, transportTargetURL)
+			applyPreserveHostPolicy(pr.Out, pr.In, transportTargetURL, preserveHost)
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
 
 			if !preserveHost {
 				if origin := pr.In.Header.Get("Origin"); origin != "" {
-					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+					pr.Out.Header.Set("Origin", transportTargetURL.Scheme+"://"+transportTargetURL.Host)
 				}
 				if referer := pr.In.Header.Get("Referer"); referer != "" {
 					ref, err := url.Parse(referer)
 					if err == nil {
-						ref.Scheme = targetURL.Scheme
-						ref.Host = targetURL.Host
+						ref.Scheme = transportTargetURL.Scheme
+						ref.Host = transportTargetURL.Host
 						pr.Out.Header.Set("Referer", ref.String())
 					}
 				}
 			}
 
-			if gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA {
+			if toolbarCandidate {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			if event := debugProxyEvent("reverse_proxy_rewrite", requestID); event != nil {
@@ -4088,7 +4148,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 			return err
 		}
 
-		needsToolbar := gatewayPortalEnabled && authResult.authenticated && !matchedRule.SuppressToolbar && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsToolbar := toolbarCandidate
 		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
 			event.Str("route_type", "host_rule").
 				Int("status", resp.StatusCode).
@@ -4133,7 +4193,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 
 	if h.maybeProxyFnosPortIconHijackWebSocket(w, r, fnosPortIconHijackWebSocketOptions{
-		targetURL:            targetURL,
+		targetURL:            transportTargetURL,
 		hostRules:            snapshot.hostRules,
 		clientIP:             clientIP,
 		omitForwardedHeaders: omitForwardedHeaders,
@@ -4150,7 +4210,7 @@ func (h *Handler) proxyToHostTarget(w http.ResponseWriter, r *http.Request, snap
 }
 
 func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, matchedRule models.Rule, clientIP string, authResult authCheckResult, requestID string) {
-	targetURL, err := url.Parse(matchedRule.Target)
+	targetURL, transportTargetURL, err := parseReverseProxyTargetURLs(matchedRule.Target)
 	if err != nil {
 		if event := debugProxyEvent("reverse_proxy_target_invalid", requestID); event != nil {
 			event.Str("route_type", "path_rule").
@@ -4163,28 +4223,24 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		return
 	}
 
-	switch targetURL.Scheme {
-	case "ws":
-		targetURL.Scheme = "http"
-	case "wss":
-		targetURL.Scheme = "https"
-	}
-
 	transport := h.proxyTransport
 	if transport == nil {
 		transport = newProxyTransport()
 	}
-	preserveHost := !h.shouldOmitPreserveHost(targetURL)
+	targetSupportsHTMLFeatures := reverseProxyTargetSupportsHTMLFeatures(targetURL)
+	preserveHost := !h.shouldOmitPreserveHost(transportTargetURL)
 	gatewayPortalEnabled := models.NormalizeGatewayPortalConfig(snapshot.gatewayPortal).Enabled
 	suppressToolbarForUA := response.ShouldSuppressToolbarForUserAgent(r.UserAgent())
+	toolbarCandidate := targetSupportsHTMLFeatures && gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA
 	if event := debugProxyEvent("reverse_proxy_start", requestID); event != nil {
 		event.Str("route_type", "path_rule").
 			Str("route_key", logger.SanitizeLogString(matchedRule.Path)).
 			Str("target", logger.SanitizeURL(targetURL.String())).
+			Str("transport_target", logger.SanitizeURL(transportTargetURL.String())).
 			Bool("preserve_host", preserveHost).
 			Bool("strip_path", matchedRule.StripPath).
-			Bool("rewrite_html", matchedRule.RewriteHTML).
-			Bool("toolbar_candidate", gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA).
+			Bool("rewrite_html", targetSupportsHTMLFeatures && matchedRule.RewriteHTML).
+			Bool("toolbar_candidate", toolbarCandidate).
 			Send()
 	}
 	proxy := &httputil.ReverseProxy{
@@ -4192,9 +4248,9 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			applyForwardedHeaderPolicy(pr.Out, pr.In, clientIP, false)
 			copyUserAgentHeader(pr.Out, pr.In)
-			pr.SetURL(targetURL)
-			applyUpstreamPrivateIPv4HintHeader(pr.Out, targetURL)
-			applyPreserveHostPolicy(pr.Out, pr.In, targetURL, preserveHost)
+			pr.SetURL(transportTargetURL)
+			applyUpstreamPrivateIPv4HintHeader(pr.Out, transportTargetURL)
+			applyPreserveHostPolicy(pr.Out, pr.In, transportTargetURL, preserveHost)
 
 			if matchedRule.StripPath {
 				pr.Out.URL.Path = strings.TrimPrefix(pr.Out.URL.Path, matchedRule.Path)
@@ -4206,13 +4262,13 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 
 			if !preserveHost {
 				if origin := pr.In.Header.Get("Origin"); origin != "" {
-					pr.Out.Header.Set("Origin", targetURL.Scheme+"://"+targetURL.Host)
+					pr.Out.Header.Set("Origin", transportTargetURL.Scheme+"://"+transportTargetURL.Host)
 				}
 				if referer := pr.In.Header.Get("Referer"); referer != "" {
 					ref, err := url.Parse(referer)
 					if err == nil {
-						ref.Scheme = targetURL.Scheme
-						ref.Host = targetURL.Host
+						ref.Scheme = transportTargetURL.Scheme
+						ref.Host = transportTargetURL.Host
 						ref.Path = path.Clean(ref.Path)
 
 						if matchedRule.StripPath {
@@ -4228,7 +4284,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 				}
 			}
 
-			if matchedRule.RewriteHTML || (gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA) {
+			if (targetSupportsHTMLFeatures && matchedRule.RewriteHTML) || toolbarCandidate {
 				pr.Out.Header.Del("Accept-Encoding")
 			}
 			h.maybePrepareFnosPortIconHijackHTTPProxyRequest(pr.Out)
@@ -4258,8 +4314,8 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 			return err
 		}
 
-		needsRewrite := matchedRule.RewriteHTML && !matchedRule.UseRootMode
-		needsToolbar := gatewayPortalEnabled && authResult.authenticated && !authResult.suppressToolbar && !suppressToolbarForUA
+		needsRewrite := targetSupportsHTMLFeatures && matchedRule.RewriteHTML && !matchedRule.UseRootMode
+		needsToolbar := toolbarCandidate
 		if event := debugProxyEvent("reverse_proxy_response", requestID); event != nil {
 			event.Str("route_type", "path_rule").
 				Int("status", resp.StatusCode).
@@ -4312,7 +4368,7 @@ func (h *Handler) proxyToRuleTarget(w http.ResponseWriter, r *http.Request, snap
 	}
 
 	if h.maybeProxyFnosPortIconHijackWebSocket(w, r, fnosPortIconHijackWebSocketOptions{
-		targetURL:            targetURL,
+		targetURL:            transportTargetURL,
 		hostRules:            snapshot.hostRules,
 		clientIP:             clientIP,
 		omitForwardedHeaders: false,

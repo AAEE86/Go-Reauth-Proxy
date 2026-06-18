@@ -435,6 +435,8 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Language", locale)
 	w.WriteHeader(http.StatusOK)
+	filteredRules := filterToolbarRules(rules)
+	filteredHostRules := filterToolbarHostRules(hostRules, "")
 
 	userAgent := ""
 	if r != nil {
@@ -443,7 +445,7 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 
 	toolbarHTML := ""
 	if !ShouldSuppressToolbarForUserAgent(userAgent) {
-		toolbarHTML = GenerateToolbarWithHostsForLocale(locale, rules, hostRules, "/__select__", "", "", portalConfig)
+		toolbarHTML = GenerateToolbarWithHostsForLocale(locale, filteredRules, filteredHostRules, "/__select__", "", "", portalConfig)
 	}
 
 	data := pageData{
@@ -451,8 +453,8 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 		Year:          time.Now().Year(),
 		Version:       version.Version,
 		BodyClass:     "select-page",
-		Rules:         rules,
-		HostRules:     hostRules,
+		Rules:         filteredRules,
+		HostRules:     filteredHostRules,
 		GatewayPortal: models.NormalizeGatewayPortalConfig(portalConfig),
 		ToolbarHTML:   template.HTML(toolbarHTML),
 		HTMLLang:      i18n.T(locale, "gateway.htmlLang"),

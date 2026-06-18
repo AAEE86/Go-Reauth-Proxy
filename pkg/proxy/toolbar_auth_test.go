@@ -112,6 +112,43 @@ func TestPublicHostRuleInjectsToolbarWhenAuthCookieIsAuthenticated(t *testing.T)
 	}
 }
 
+func TestPublicHostRuleDoesNotProbeOrInjectToolbarForWebSocketTarget(t *testing.T) {
+	var verifyCalls int32
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/auth/verify" {
+			atomic.AddInt32(&verifyCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true}`)
+	}))
+	defer authServer.Close()
+
+	target := newToolbarHTMLTarget(t)
+	defer target.Close()
+
+	webSocketTargetURL := strings.Replace(target.URL, "http://", "ws://", 1)
+	handler := newPublicHostToolbarHandler(webSocketTargetURL, testServerPort(t, authServer.URL))
+	req := httptest.NewRequest(http.MethodGet, "http://public.example.com/", nil)
+	req.AddCookie(&http.Cookie{Name: authSessionCookieName, Value: "ok"})
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&verifyCalls); got != 0 {
+		t.Fatalf("verify calls = %d, want 0 for WebSocket target toolbar probe", got)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "public app") {
+		t.Fatalf("response body did not include upstream HTML: %s", body)
+	}
+	if strings.Contains(body, "reauth-proxy-toolbar") {
+		t.Fatalf("response body included toolbar for WebSocket target: %s", body)
+	}
+}
+
 func TestPublicHostRuleDoesNotProbeOrInjectToolbarWhenPortalDisabled(t *testing.T) {
 	var verifyCalls int32
 	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

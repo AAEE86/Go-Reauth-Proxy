@@ -3,12 +3,12 @@ package models
 import "encoding/json"
 
 type Rule struct {
-	Path        string `json:"path" example:"/api"`                    // Path prefix to match (e.g., "/api")
-	Target      string `json:"target" example:"http://localhost:8080"` // Target URL (e.g., "http://localhost:7996")
-	UseAuth     bool   `json:"use_auth" example:"false"`               // If true, invokes global authentication check before proxying.
-	StripPath   bool   `json:"strip_path" example:"true"`              // If true, strips the Path prefix from the request before forwarding.
-	RewriteHTML bool   `json:"rewrite_html" example:"true"`            // If true, rewrites absolute paths in HTML response to include Path prefix.
-	UseRootMode bool   `json:"use_root_mode" example:"false"`          // If true, sets cookie and redirects matched path to /.
+	Path        string `json:"path" example:"/api"`                  // Path prefix to match (e.g., "/api")
+	Target      string `json:"target" example:"ws://localhost:8080"` // Target URL (e.g., "http://localhost:7996" or "ws://localhost:7996")
+	UseAuth     bool   `json:"use_auth" example:"false"`             // If true, invokes global authentication check before proxying.
+	StripPath   bool   `json:"strip_path" example:"true"`            // If true, strips the Path prefix from the request before forwarding.
+	RewriteHTML bool   `json:"rewrite_html" example:"true"`          // If true, rewrites absolute paths in HTML response to include Path prefix.
+	UseRootMode bool   `json:"use_root_mode" example:"false"`        // If true, sets cookie and redirects matched path to /.
 }
 
 type HostRule struct {
@@ -36,7 +36,7 @@ type HostLocation struct {
 	Path        string               `json:"path" example:"/api"`
 	Match       string               `json:"match,omitempty" example:"prefix"`
 	Action      string               `json:"action,omitempty" example:"proxy"`
-	Target      string               `json:"target,omitempty" example:"http://127.0.0.1:8080"`
+	Target      string               `json:"target,omitempty" example:"wss://127.0.0.1:8080"`
 	StripPath   bool                 `json:"strip_path" example:"true"`
 	RewriteHTML bool                 `json:"rewrite_html" example:"true"`
 	Response    HostLocationResponse `json:"response,omitempty"`

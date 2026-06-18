@@ -43,3 +43,51 @@ func TestSelectPageRemainsAvailableWhenPortalToolbarDisabled(t *testing.T) {
 		t.Fatalf("select page included toolbar while portal disabled: %s", body)
 	}
 }
+
+func TestSelectPageFiltersWebSocketHostRules(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example.com/__select__", nil)
+	rec := httptest.NewRecorder()
+
+	SelectPage(
+		rec,
+		req,
+		nil,
+		[]models.HostRule{
+			{Host: "app.example.com", Target: "https://127.0.0.1:3000"},
+			{Host: "socket.example.com", Target: "wss://127.0.0.1:3001"},
+		},
+		models.GatewayPortalConfig{},
+	)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "app.example.com") {
+		t.Fatalf("select page did not include HTTP(S) host rule: %s", body)
+	}
+	if strings.Contains(body, "socket.example.com") || strings.Contains(body, "wss://127.0.0.1:3001") {
+		t.Fatalf("select page included WebSocket host rule: %s", body)
+	}
+}
+
+func TestSelectPageFiltersWebSocketPathRules(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example.com/__select__", nil)
+	rec := httptest.NewRecorder()
+
+	SelectPage(
+		rec,
+		req,
+		[]models.Rule{
+			{Path: "/app", Target: "http://127.0.0.1:3000"},
+			{Path: "/socket", Target: "ws://127.0.0.1:3001"},
+		},
+		nil,
+		models.GatewayPortalConfig{},
+	)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "/app") {
+		t.Fatalf("select page did not include HTTP(S) path rule: %s", body)
+	}
+	if strings.Contains(body, "/socket") || strings.Contains(body, "ws://127.0.0.1:3001") {
+		t.Fatalf("select page included WebSocket path rule: %s", body)
+	}
+}

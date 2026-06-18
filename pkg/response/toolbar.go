@@ -5,6 +5,7 @@ import (
 	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/models"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -835,15 +836,44 @@ func normalizeToolbarHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
-func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []models.HostRule {
-	normalizedExcludedHost := normalizeToolbarHost(excludedHost)
-	if normalizedExcludedHost == "" {
-		return hostRules
+func isToolbarNavigableTarget(rawTarget string) bool {
+	target := strings.TrimSpace(rawTarget)
+	if target == "" {
+		return true
 	}
 
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+func filterToolbarRules(rules []models.Rule) []models.Rule {
+	filtered := make([]models.Rule, 0, len(rules))
+	for _, rule := range rules {
+		if !isToolbarNavigableTarget(rule.Target) {
+			continue
+		}
+		filtered = append(filtered, rule)
+	}
+	return filtered
+}
+
+func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []models.HostRule {
+	normalizedExcludedHost := normalizeToolbarHost(excludedHost)
 	filtered := make([]models.HostRule, 0, len(hostRules))
 	for _, rule := range hostRules {
-		if normalizeToolbarHost(rule.Host) == normalizedExcludedHost {
+		if normalizedExcludedHost != "" && normalizeToolbarHost(rule.Host) == normalizedExcludedHost {
+			continue
+		}
+		if !isToolbarNavigableTarget(rule.Target) {
 			continue
 		}
 		filtered = append(filtered, rule)
@@ -860,6 +890,7 @@ func GenerateToolbarWithHostsForRequest(r *http.Request, rules []models.Rule, ho
 }
 
 func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
+	filteredRules := filterToolbarRules(rules)
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
 	normalizedPortal := models.NormalizeGatewayPortalConfig(portalConfig)
 	if !normalizedPortal.Enabled {
@@ -867,7 +898,7 @@ func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostR
 	}
 
 	data := toolbarData{
-		Rules:       make([]toolbarRuleData, 0, len(rules)),
+		Rules:       make([]toolbarRuleData, 0, len(filteredRules)),
 		HostRules:   make([]toolbarHostRuleData, 0, len(filteredHostRules)),
 		CurrentPath: currentPath,
 		CurrentHost: currentHost,
@@ -882,7 +913,7 @@ func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostR
 			"noRoutesConfigured": i18n.T(locale, "gateway.noRoutesConfigured"),
 		},
 	}
-	for _, rule := range rules {
+	for _, rule := range filteredRules {
 		data.Rules = append(data.Rules, toolbarRuleData{Path: rule.Path})
 	}
 	for _, rule := range filteredHostRules {

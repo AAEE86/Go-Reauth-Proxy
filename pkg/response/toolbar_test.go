@@ -67,6 +67,34 @@ func TestGenerateToolbarWithHostsReturnsEmptyWhenPortalDisabled(t *testing.T) {
 	}
 }
 
+func TestGenerateToolbarWithHostsFiltersWebSocketTargets(t *testing.T) {
+	toolbar := GenerateToolbarWithHosts(
+		[]models.Rule{
+			{Path: "/app", Target: "http://127.0.0.1:3000"},
+			{Path: "/socket", Target: "ws://127.0.0.1:3001"},
+		},
+		[]models.HostRule{
+			{Host: "app.example.com", Target: "https://127.0.0.1:3000"},
+			{Host: "socket.example.com", Target: "wss://127.0.0.1:3001"},
+		},
+		"",
+		"",
+		"",
+		models.GatewayPortalConfig{DisplayStyle: models.GatewayPortalDisplayStyleTitle},
+	)
+
+	for _, want := range []string{`"path":"/app"`, `"host":"app.example.com"`} {
+		if !strings.Contains(toolbar, want) {
+			t.Fatalf("toolbar missing HTTP(S) route %q: %s", want, toolbar)
+		}
+	}
+	for _, forbidden := range []string{`/socket`, `socket.example.com`} {
+		if strings.Contains(toolbar, forbidden) {
+			t.Fatalf("toolbar included WebSocket route %q: %s", forbidden, toolbar)
+		}
+	}
+}
+
 func TestGenerateToolbarWithHostsIncludesFaviconOnlyWhenEnabled(t *testing.T) {
 	icon := "data:image/png;base64,AAAA"
 	hostRules := []models.HostRule{{Host: "app.example.com", Title: "App Portal", Favicon: icon}}
