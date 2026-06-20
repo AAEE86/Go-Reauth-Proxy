@@ -21,11 +21,12 @@ import (
 )
 
 const (
-	DefaultMaxDays  = 7
-	dateLayout      = "2006-01-02"
-	fileExtension   = ".log"
-	maxScanToken    = 8 * 1024 * 1024
-	cursorChunkSize = 64 * 1024
+	DefaultMaxDays                = 7
+	dateLayout                    = "2006-01-02"
+	fileExtension                 = ".log"
+	maxScanToken                  = 8 * 1024 * 1024
+	cursorChunkSize               = 64 * 1024
+	pageQueryTailWindowMaxEntries = 10000
 )
 
 var errStopScan = errors.New("stop scan")
@@ -103,6 +104,7 @@ type QueryResult struct {
 
 type queryFilter struct {
 	search        string
+	searchASCII   bool
 	exactStatuses map[int]struct{}
 	statusClasses map[int]struct{}
 	loggedIn      *bool
@@ -558,6 +560,7 @@ func newQueryFilter(search string, status string, loggedIn string) (queryFilter,
 	filter := queryFilter{
 		search: strings.ToLower(strings.TrimSpace(search)),
 	}
+	filter.searchASCII = isASCIIString(filter.search)
 
 	rawStatus := strings.TrimSpace(status)
 	if rawStatus != "" && !strings.EqualFold(rawStatus, "all") {
@@ -600,7 +603,100 @@ func (f queryFilter) matchLine(line string) bool {
 	if f.search == "" {
 		return true
 	}
+	if f.searchASCII {
+		return containsFoldASCIIString(line, f.search)
+	}
 	return strings.Contains(strings.ToLower(line), f.search)
+}
+
+func (f queryFilter) matchLineBytes(line []byte) bool {
+	if f.search == "" {
+		return true
+	}
+	if f.searchASCII {
+		return containsFoldASCIIBytes(line, f.search)
+	}
+	return f.matchLine(string(line))
+}
+
+func isASCIIString(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func containsFoldASCIIString(value string, search string) bool {
+	if search == "" {
+		return true
+	}
+	if len(search) > len(value) {
+		return false
+	}
+	first := search[0]
+	last := len(value) - len(search)
+	for i := 0; i <= last; i++ {
+		if lowerASCIIByte(value[i]) != first {
+			continue
+		}
+		if hasFoldASCIIPrefixString(value[i:], search) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFoldASCIIPrefixString(value string, search string) bool {
+	if len(search) > len(value) {
+		return false
+	}
+	for i := 1; i < len(search); i++ {
+		if lowerASCIIByte(value[i]) != search[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsFoldASCIIBytes(value []byte, search string) bool {
+	if search == "" {
+		return true
+	}
+	if len(search) > len(value) {
+		return false
+	}
+	first := search[0]
+	last := len(value) - len(search)
+	for i := 0; i <= last; i++ {
+		if lowerASCIIByte(value[i]) != first {
+			continue
+		}
+		if hasFoldASCIIPrefixBytes(value[i:], search) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFoldASCIIPrefixBytes(value []byte, search string) bool {
+	if len(search) > len(value) {
+		return false
+	}
+	for i := 1; i < len(search); i++ {
+		if lowerASCIIByte(value[i]) != search[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCIIByte(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
 }
 
 func (f queryFilter) matchStatus(status int) bool {
@@ -619,6 +715,130 @@ func (f queryFilter) matchLoggedIn(loggedIn bool) bool {
 		return true
 	}
 	return *f.loggedIn == loggedIn
+}
+
+var (
+	jsonStatusFieldName   = []byte("status")
+	jsonLoggedInFieldName = []byte("logged_in")
+)
+
+func (f queryFilter) matchRawEntryFields(line []byte) bool {
+	if len(f.exactStatuses) > 0 || len(f.statusClasses) > 0 {
+		status, _ := rawJSONIntField(line, jsonStatusFieldName)
+		if !f.matchStatus(status) {
+			return false
+		}
+	}
+	if f.loggedIn != nil {
+		loggedIn, _ := rawJSONBoolField(line, jsonLoggedInFieldName)
+		if !f.matchLoggedIn(loggedIn) {
+			return false
+		}
+	}
+	return true
+}
+
+func rawJSONIntField(line []byte, field []byte) (int, bool) {
+	value, ok := rawJSONFieldValue(line, field)
+	if !ok {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < '0' || c > '9' {
+			return n, i > 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, len(value) > 0
+}
+
+func rawJSONBoolField(line []byte, field []byte) (bool, bool) {
+	value, ok := rawJSONFieldValue(line, field)
+	if !ok {
+		return false, false
+	}
+	if len(value) >= len("true") &&
+		value[0] == 't' && value[1] == 'r' && value[2] == 'u' && value[3] == 'e' {
+		return true, true
+	}
+	if len(value) >= len("false") &&
+		value[0] == 'f' && value[1] == 'a' && value[2] == 'l' && value[3] == 's' && value[4] == 'e' {
+		return false, true
+	}
+	return false, false
+}
+
+func rawJSONFieldValue(line []byte, field []byte) ([]byte, bool) {
+	depth := 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '"':
+			if depth == 1 {
+				if value, ok := rawJSONTopLevelFieldValueAt(line, field, i); ok {
+					return value, true
+				}
+			}
+			end, ok := skipJSONString(line, i)
+			if !ok {
+				return nil, false
+			}
+			i = end
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth == 0 {
+				return nil, false
+			}
+			depth--
+		}
+	}
+	return nil, false
+}
+
+func rawJSONTopLevelFieldValueAt(line []byte, field []byte, quote int) ([]byte, bool) {
+	nameStart := quote + 1
+	nameEnd := nameStart + len(field)
+	if nameEnd >= len(line) || line[nameEnd] != '"' || !bytes.Equal(line[nameStart:nameEnd], field) {
+		return nil, false
+	}
+	j := nameEnd + 1
+	for j < len(line) && isJSONSpace(line[j]) {
+		j++
+	}
+	if j >= len(line) || line[j] != ':' {
+		return nil, false
+	}
+	j++
+	for j < len(line) && isJSONSpace(line[j]) {
+		j++
+	}
+	if j >= len(line) {
+		return nil, false
+	}
+	return line[j:], true
+}
+
+func skipJSONString(line []byte, quote int) (int, bool) {
+	for i := quote + 1; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			i++
+		case '"':
+			return i, true
+		}
+	}
+	return len(line), false
+}
+
+func isJSONSpace(c byte) bool {
+	switch c {
+	case ' ', '\n', '\r', '\t':
+		return true
+	default:
+		return false
+	}
 }
 
 func parseLoggedInFilter(raw string) (*bool, error) {
@@ -642,6 +862,49 @@ func queryEntries(logPath string, filter queryFilter, page int, limit int) ([]En
 }
 
 func queryEntriesStreaming(logPath string, filter queryFilter, page int, limit int) ([]Entry, int, bool, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if page > (int(^uint(0)>>1))/limit {
+		return queryEntriesStreamingTwoPass(logPath, filter, page, limit)
+	}
+
+	windowSize := page * limit
+	if windowSize > pageQueryTailWindowMaxEntries {
+		return queryEntriesStreamingTwoPass(logPath, filter, page, limit)
+	}
+
+	return queryEntriesStreamingRawTail(logPath, filter, page, limit, windowSize)
+}
+
+func queryEntriesStreamingRawTail(logPath string, filter queryFilter, page int, limit int, windowSize int) ([]Entry, int, bool, error) {
+	tail := newRawLineTailWindow(windowSize)
+	total, err := scanMatchingRawLinesToTail(logPath, filter, tail)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	forwardStart, forwardEnd := resolveForwardWindow(total, page, limit)
+	if forwardStart == forwardEnd {
+		return []Entry{}, total, false, nil
+	}
+
+	tailStart := total - tail.Len()
+	if forwardStart < tailStart {
+		return queryEntriesStreamingTwoPass(logPath, filter, page, limit)
+	}
+
+	items, ok := tail.DecodeEntriesDescending(forwardStart-tailStart, forwardEnd-tailStart)
+	if !ok {
+		return queryEntriesStreamingTwoPass(logPath, filter, page, limit)
+	}
+	return items, total, forwardStart > 0, nil
+}
+
+func queryEntriesStreamingTwoPass(logPath string, filter queryFilter, page int, limit int) ([]Entry, int, bool, error) {
 	total, err := scanMatchingEntries(logPath, filter, nil)
 	if err != nil {
 		return nil, 0, false, err
@@ -662,6 +925,55 @@ func queryEntriesStreaming(logPath string, filter queryFilter, page int, limit i
 
 	reverseEntries(items)
 	return items, total, forwardStart > 0, nil
+}
+
+type rawLineTailWindow struct {
+	lines [][]byte
+	start int
+	count int
+}
+
+func newRawLineTailWindow(capacity int) *rawLineTailWindow {
+	if capacity <= 0 {
+		return &rawLineTailWindow{}
+	}
+	return &rawLineTailWindow{lines: make([][]byte, capacity)}
+}
+
+func (w *rawLineTailWindow) Add(line []byte) {
+	if w == nil || len(w.lines) == 0 {
+		return
+	}
+	index := (w.start + w.count) % len(w.lines)
+	if w.count == len(w.lines) {
+		index = w.start
+		w.start = (w.start + 1) % len(w.lines)
+	} else {
+		w.count++
+	}
+	w.lines[index] = append(w.lines[index][:0], line...)
+}
+
+func (w *rawLineTailWindow) Len() int {
+	if w == nil {
+		return 0
+	}
+	return w.count
+}
+
+func (w *rawLineTailWindow) DecodeEntriesDescending(start int, end int) ([]Entry, bool) {
+	if w == nil || len(w.lines) == 0 || start < 0 || end < start || end > w.count {
+		return []Entry{}, true
+	}
+	items := make([]Entry, end-start)
+	for i := start; i < end; i++ {
+		var entry Entry
+		if err := json.Unmarshal(w.lines[(w.start+i)%len(w.lines)], &entry); err != nil {
+			return nil, false
+		}
+		items[end-i-1] = entry
+	}
+	return items, true
 }
 
 func queryEntriesByCursor(logPath string, filter queryFilter, cursor string, limit int) ([]Entry, string, bool, string, error) {
@@ -692,7 +1004,10 @@ func queryEntriesByCursor(logPath string, filter queryFilter, cursor string, lim
 	hasMore := false
 
 	err = scanLinesBackward(file, endOffset, func(line []byte, lineStart int64) (bool, error) {
-		if !filter.matchLine(string(line)) {
+		if !filter.matchLineBytes(line) {
+			return true, nil
+		}
+		if !jsonLogLineLooksLikeEntryObject(line) || !filter.matchRawEntryFields(line) {
 			return true, nil
 		}
 
@@ -739,6 +1054,47 @@ func resolveForwardWindow(total int, page int, limit int) (int, int) {
 	return total - endDesc, total - startDesc
 }
 
+func scanMatchingRawLinesToTail(logPath string, filter queryFilter, tail *rawLineTailWindow) (int, error) {
+	file, err := os.Open(logPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxScanToken)
+
+	total := 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if !filter.matchLineBytes(line) {
+			continue
+		}
+		if !jsonLogLineLooksLikeEntryObject(line) || !filter.matchRawEntryFields(line) {
+			continue
+		}
+		if !json.Valid(line) {
+			continue
+		}
+
+		tail.Add(line)
+		total++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func jsonLogLineLooksLikeEntryObject(line []byte) bool {
+	line = bytes.TrimLeft(line, " \t\r\n")
+	return len(line) > 0 && line[0] == '{'
+}
+
 func scanMatchingEntries(logPath string, filter queryFilter, onMatch func(entry Entry, matchIndex int) error) (int, error) {
 	file, err := os.Open(logPath)
 	if err != nil {
@@ -754,13 +1110,16 @@ func scanMatchingEntries(logPath string, filter queryFilter, onMatch func(entry 
 
 	total := 0
 	for scanner.Scan() {
-		line := scanner.Text()
-		if !filter.matchLine(line) {
+		line := scanner.Bytes()
+		if !filter.matchLineBytes(line) {
+			continue
+		}
+		if !jsonLogLineLooksLikeEntryObject(line) || !filter.matchRawEntryFields(line) {
 			continue
 		}
 
 		var entry Entry
-		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		if err := json.Unmarshal(line, &entry); err != nil {
 			continue
 		}
 		if !filter.matchStatus(entry.Status) {
@@ -820,6 +1179,12 @@ func resolveCursorOffset(fileSize int64, cursor string) (int64, string, error) {
 func scanLinesBackward(file *os.File, endOffset int64, onLine func(line []byte, lineStart int64) (bool, error)) error {
 	position := endOffset
 	var remainder []byte
+	readBufferSize := cursorChunkSize
+	if endOffset > 0 && endOffset < int64(readBufferSize) {
+		readBufferSize = int(endOffset)
+	}
+	readBuffer := make([]byte, readBufferSize)
+	var combinedBuffer []byte
 	firstPass := true
 
 	for position > 0 {
@@ -829,14 +1194,23 @@ func scanLinesBackward(file *os.File, endOffset int64, onLine func(line []byte, 
 		}
 
 		start := position - readSize
-		buffer := make([]byte, readSize)
+		buffer := readBuffer[:readSize]
 		n, err := file.ReadAt(buffer, start)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 		buffer = buffer[:n]
 
-		combined := append(append([]byte{}, buffer...), remainder...)
+		combined := buffer
+		if len(remainder) > 0 {
+			needed := len(buffer) + len(remainder)
+			if cap(combinedBuffer) < needed {
+				combinedBuffer = make([]byte, needed)
+			}
+			combined = combinedBuffer[:needed]
+			copy(combined, buffer)
+			copy(combined[len(buffer):], remainder)
+		}
 		scanEnd := len(combined)
 		if firstPass {
 			scanEnd = len(bytes.TrimRight(combined[:scanEnd], "\r\n"))

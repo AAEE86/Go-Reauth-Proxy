@@ -6,9 +6,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+var benchmarkPortSink string
 
 func requestWithLocalPort(req *http.Request, port int) *http.Request {
 	return req.WithContext(context.WithValue(
@@ -71,6 +75,52 @@ func TestBuildHTTPSRedirectURLKeepsExplicitPublicPorts(t *testing.T) {
 	}
 }
 
+func TestSplitRequestHostPortMatchesLegacyBehavior(t *testing.T) {
+	cases := []string{
+		"",
+		" auth.fnknock.cn ",
+		"auth.fnknock.cn:8443",
+		"auth.fnknock.cn:",
+		":8443",
+		"auth.fnknock.cn:abc",
+		"auth.fnknock.cn:8443:extra",
+		"2001:db8::1",
+		"[2001:db8::1]",
+		"[2001:db8::1]:8443",
+		"[2001:db8::1]:abc",
+		"[2001:db8::1]trailing",
+		"http://auth.fnknock.cn",
+		"auth.fnknock.cn/path",
+	}
+
+	for _, tc := range cases {
+		gotHost, gotPort := splitRequestHostPort(tc)
+		wantHost, wantPort := legacySplitRequestHostPort(tc)
+		if gotHost != wantHost || gotPort != wantPort {
+			t.Fatalf("splitRequestHostPort(%q) = (%q, %q), want legacy (%q, %q)", tc, gotHost, gotPort, wantHost, wantPort)
+		}
+	}
+}
+
+func legacySplitRequestHostPort(host string) (string, string) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", ""
+	}
+
+	parsed, err := url.Parse("//" + host)
+	if err != nil {
+		return host, ""
+	}
+
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return host, ""
+	}
+
+	return hostname, parsed.Port()
+}
+
 func TestIsPublicHTTPSRequestUsesForwardedScheme(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -112,6 +162,175 @@ func TestIsPublicHTTPSRequestUsesForwardedScheme(t *testing.T) {
 	}
 }
 
+func TestCloudflareVisitorScheme(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "exact", value: `{"scheme":"https"}`, want: "https"},
+		{name: "spaces", value: `{ "scheme" : "https" }`, want: "https"},
+		{name: "uppercase", value: `{"scheme":"HTTPS"}`, want: "https"},
+		{name: "other field first", value: `{"foo":"scheme","scheme":"http"}`, want: "http"},
+		{name: "escaped fallback", value: `{"scheme":"http\u0073"}`, want: "https"},
+		{name: "unsupported", value: `{"scheme":"ftp"}`, want: ""},
+		{name: "invalid json", value: `{"scheme":`, want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cloudflareVisitorScheme(tt.value); got != tt.want {
+				t.Fatalf("cloudflareVisitorScheme(%q) = %q, want %q", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsValidPortMatchesLegacyBehavior(t *testing.T) {
+	cases := []string{
+		"",
+		"0",
+		"1",
+		"80",
+		"443",
+		"65535",
+		"65536",
+		"99999",
+		"100000",
+		" 8443 ",
+		"08",
+		"+80",
+		"+65535",
+		"+65536",
+		"-80",
+		"80/tcp",
+		"abc",
+	}
+
+	for _, tc := range cases {
+		if got, want := isValidPort(tc), legacyIsValidPort(tc); got != want {
+			t.Fatalf("isValidPort(%q) = %v, want legacy %v", tc, got, want)
+		}
+	}
+}
+
+func legacyIsValidPort(value string) bool {
+	port, err := strconv.Atoi(strings.TrimSpace(value))
+	return err == nil && port > 0 && port <= 65535
+}
+
+func TestPublicPortFromAuthBaseURLMatchesLegacyBehavior(t *testing.T) {
+	tests := []struct {
+		name       string
+		rawBaseURL string
+		scheme     string
+	}{
+		{
+			name:       "empty",
+			rawBaseURL: "",
+			scheme:     "https",
+		},
+		{
+			name:       "explicit port",
+			rawBaseURL: " https://auth.fnknock.cn:8443/path ",
+			scheme:     "https",
+		},
+		{
+			name:       "uppercase scheme",
+			rawBaseURL: "HTTPS://auth.fnknock.cn:8443/path",
+			scheme:     "https",
+		},
+		{
+			name:       "trimmed requested scheme",
+			rawBaseURL: "https://auth.fnknock.cn:8443/path",
+			scheme:     " HTTPS ",
+		},
+		{
+			name:       "scheme mismatch",
+			rawBaseURL: "http://auth.fnknock.cn:8080/path",
+			scheme:     "https",
+		},
+		{
+			name:       "no port",
+			rawBaseURL: "https://auth.fnknock.cn/path",
+			scheme:     "https",
+		},
+		{
+			name:       "empty port",
+			rawBaseURL: "https://auth.fnknock.cn:/path",
+			scheme:     "https",
+		},
+		{
+			name:       "invalid port",
+			rawBaseURL: "https://auth.fnknock.cn:abc/path",
+			scheme:     "https",
+		},
+		{
+			name:       "out of range port",
+			rawBaseURL: "https://auth.fnknock.cn:70000/path",
+			scheme:     "https",
+		},
+		{
+			name:       "userinfo",
+			rawBaseURL: "https://user:pass@auth.fnknock.cn:8443/path?x=1",
+			scheme:     "https",
+		},
+		{
+			name:       "ipv6 explicit port",
+			rawBaseURL: "https://[2001:db8::1]:8443/path",
+			scheme:     "https",
+		},
+		{
+			name:       "ipv6 no port",
+			rawBaseURL: "https://[2001:db8::1]/path",
+			scheme:     "https",
+		},
+		{
+			name:       "unbracketed ipv6 legacy port",
+			rawBaseURL: "https://2001:db8::1",
+			scheme:     "https",
+		},
+		{
+			name:       "plus port rejected by url parser",
+			rawBaseURL: "https://auth.fnknock.cn:+80/path",
+			scheme:     "https",
+		},
+		{
+			name:       "leading zero port preserved",
+			rawBaseURL: "https://auth.fnknock.cn:080/path",
+			scheme:     "https",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := publicPortFromAuthBaseURL(tt.rawBaseURL, tt.scheme)
+			want := legacyPublicPortFromAuthBaseURL(tt.rawBaseURL, tt.scheme)
+			if got != want {
+				t.Fatalf("publicPortFromAuthBaseURL(%q, %q) = %q, want legacy %q", tt.rawBaseURL, tt.scheme, got, want)
+			}
+		})
+	}
+}
+
+func legacyPublicPortFromAuthBaseURL(rawBaseURL string, scheme string) string {
+	baseURL, err := url.Parse(strings.TrimSpace(rawBaseURL))
+	if err != nil || baseURL == nil {
+		return ""
+	}
+
+	if !strings.EqualFold(baseURL.Scheme, strings.TrimSpace(scheme)) {
+		return ""
+	}
+
+	port := strings.TrimSpace(baseURL.Port())
+	if !isValidPort(port) {
+		return ""
+	}
+
+	return port
+}
+
 func TestShouldRedirectHTTPToHTTPSRequiresTrustedForwardedProto(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://auth.fnknock.cn/", nil)
 	req.Header.Set("X-Forwarded-Proto", "https")
@@ -121,6 +340,98 @@ func TestShouldRedirectHTTPToHTTPSRequiresTrustedForwardedProto(t *testing.T) {
 	}
 	if ShouldRedirectHTTPToHTTPS(req, models.AuthConfig{TrustForwardedProto: true}) {
 		t.Fatal("ShouldRedirectHTTPToHTTPS() = true with trusted forwarded https, want false")
+	}
+}
+
+func BenchmarkPublicRequestSchemeNoForwardedHeaders(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://auth.fnknock.cn/", nil)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkHostSink = publicRequestScheme(req)
+	}
+}
+
+func BenchmarkPublicRequestSchemeForwardedHeader(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://auth.fnknock.cn/", nil)
+	req.Header.Set("Forwarded", `for=192.0.2.1; proto="https"; host=auth.fnknock.cn`)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkHostSink = publicRequestScheme(req)
+	}
+}
+
+func BenchmarkPublicRequestSchemeCloudflareVisitor(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://auth.fnknock.cn/", nil)
+	req.Header.Set("CF-Visitor", `{"scheme":"https"}`)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkHostSink = publicRequestScheme(req)
+	}
+}
+
+func BenchmarkSplitRequestHostPortNoPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkHostSink, benchmarkPortSink = splitRequestHostPort("auth.fnknock.cn")
+	}
+}
+
+func BenchmarkSplitRequestHostPortWithPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkHostSink, benchmarkPortSink = splitRequestHostPort("auth.fnknock.cn:8443")
+	}
+}
+
+func BenchmarkSplitRequestHostPortIPv6WithPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkHostSink, benchmarkPortSink = splitRequestHostPort("[2001:db8::1]:8443")
+	}
+}
+
+func BenchmarkIsValidPortValid(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkBoolSink = isValidPort("8443")
+	}
+}
+
+func BenchmarkIsValidPortValidOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkBoolSink = legacyIsValidPort("8443")
+	}
+}
+
+func BenchmarkIsValidPortInvalid(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkBoolSink = isValidPort("8443/tcp")
+	}
+}
+
+func BenchmarkIsValidPortInvalidOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkBoolSink = legacyIsValidPort("8443/tcp")
+	}
+}
+
+func BenchmarkPublicPortFromAuthBaseURL(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkPortSink = publicPortFromAuthBaseURL("https://auth.fnknock.cn:8443/path", "https")
+	}
+}
+
+func BenchmarkPublicPortFromAuthBaseURLOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkPortSink = legacyPublicPortFromAuthBaseURL("https://auth.fnknock.cn:8443/path", "https")
 	}
 }
 

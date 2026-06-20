@@ -63,7 +63,7 @@ func (c *Client) Publish(
 	}
 
 	port := resolveSystemEventPort(targetPort)
-	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, internalSystemEventsPath)
+	url := localSystemEventsURL(port)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create system event request: %w", err)
@@ -115,4 +115,15 @@ func resolveSystemEventPort(targetPort int) int {
 	}
 
 	return defaultSystemEventsPort
+}
+
+const localSystemEventsURLPrefix = "http://127.0.0.1:"
+
+func localSystemEventsURL(port int) string {
+	var stack [len(localSystemEventsURLPrefix) + 20 + len(internalSystemEventsPath)]byte
+	buf := stack[:0]
+	buf = append(buf, localSystemEventsURLPrefix...)
+	buf = strconv.AppendInt(buf, int64(port), 10)
+	buf = append(buf, internalSystemEventsPath...)
+	return string(buf)
 }

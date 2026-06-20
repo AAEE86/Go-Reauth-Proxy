@@ -1,7 +1,9 @@
 package waf
 
 import (
+	"fmt"
 	"io"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -13,6 +15,11 @@ import (
 	"time"
 
 	"go-reauth-proxy/pkg/models"
+)
+
+var (
+	benchmarkWAFBoolSink   bool
+	benchmarkWAFStringSink string
 )
 
 func writeTestRule(t *testing.T, rulesDir string, customRule string) {
@@ -50,6 +57,58 @@ func testConfig(rulesDir string, mode string) models.WAFConfig {
 		Mode:              mode,
 		RulesDir:          rulesDir,
 		RequestBodyAccess: true,
+	}
+}
+
+func TestRuntimeExclusionConfigMatchesDisabledHostAndPath(t *testing.T) {
+	rt := NewRuntime(models.WAFConfig{
+		Enabled:              true,
+		Mode:                 ModeBlocking,
+		DisabledHosts:        []string{"App.Example.TEST:443"},
+		DisabledPathPrefixes: []string{"admin", "/internal/"},
+	}, t.TempDir())
+
+	hostReq := httptest.NewRequest("GET", "https://app.example.test/dashboard", nil)
+	if !rt.isExcluded(hostReq) {
+		t.Fatalf("expected disabled host to be excluded")
+	}
+
+	pathReq := httptest.NewRequest("GET", "https://other.example.test/admin/users", nil)
+	if !rt.isExcluded(pathReq) {
+		t.Fatalf("expected disabled path prefix to be excluded")
+	}
+
+	nestedPathReq := httptest.NewRequest("GET", "https://other.example.test/internal/status", nil)
+	if !rt.isExcluded(nestedPathReq) {
+		t.Fatalf("expected disabled slash-suffixed path prefix to be excluded")
+	}
+
+	allowedReq := httptest.NewRequest("GET", "https://other.example.test/public", nil)
+	if rt.isExcluded(allowedReq) {
+		t.Fatalf("expected unrelated request not to be excluded")
+	}
+}
+
+func TestNormalizeHostMatchesLegacyBehavior(t *testing.T) {
+	cases := []string{
+		"",
+		" App.Example.TEST ",
+		"App.Example.TEST:443",
+		"app.example.test:",
+		":8080",
+		"app.example.test:abc",
+		"2001:db8::1",
+		"[2001:db8::1]:443",
+		"[2001:db8::1]",
+		"[2001:db8::1]trailing",
+		"[2001:db8::1",
+		"app.example.test:443:extra",
+	}
+
+	for _, tc := range cases {
+		if got, want := normalizeHost(tc), legacyNormalizeHost(tc); got != want {
+			t.Fatalf("normalizeHost(%q) = %q, want legacy %q", tc, got, want)
+		}
 	}
 }
 
@@ -366,5 +425,113 @@ func TestNewTraceIDUsesUUIDFormat(t *testing.T) {
 	pattern := regexp.MustCompile(`^waf_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	if !pattern.MatchString(traceID) {
 		t.Fatalf("expected waf UUID trace id, got %q", traceID)
+	}
+}
+
+func formatTraceIDLegacyForBenchmark(uuid [16]byte) string {
+	return fmt.Sprintf("waf_%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:16])
+}
+
+func legacyNormalizeHost(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "[") {
+		if idx := strings.LastIndex(host, "]"); idx >= 0 {
+			return host[:idx+1]
+		}
+	}
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		return strings.TrimSpace(strings.ToLower(parsedHost))
+	}
+	return host
+}
+
+func BenchmarkNormalizeHostNoPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFStringSink = normalizeHost("app.example.test")
+	}
+}
+
+func BenchmarkNormalizeHostWithPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFStringSink = normalizeHost("App.Example.TEST:443")
+	}
+}
+
+func BenchmarkNormalizeHostLowercaseWithPort(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFStringSink = normalizeHost("app.example.test:443")
+	}
+}
+
+func BenchmarkFormatTraceID(b *testing.B) {
+	uuid := [16]byte{0x7a, 0xfe, 0x10, 0x02, 0xc0, 0xff, 0x4e, 0xee, 0xaa, 0xbb, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFStringSink = formatTraceID(uuid)
+	}
+}
+
+func BenchmarkFormatTraceIDOld(b *testing.B) {
+	uuid := [16]byte{0x7a, 0xfe, 0x10, 0x02, 0xc0, 0xff, 0x4e, 0xee, 0xaa, 0xbb, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFStringSink = formatTraceIDLegacyForBenchmark(uuid)
+	}
+}
+
+func BenchmarkRuntimeIsExcludedHost(b *testing.B) {
+	rt := NewRuntime(models.WAFConfig{
+		Enabled:       true,
+		Mode:          ModeBlocking,
+		DisabledHosts: []string{"app.example.test"},
+	}, b.TempDir())
+	req := httptest.NewRequest("GET", "https://app.example.test/dashboard", nil)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFBoolSink = rt.isExcluded(req)
+	}
+}
+
+func BenchmarkRuntimeIsExcludedPath(b *testing.B) {
+	rt := NewRuntime(models.WAFConfig{
+		Enabled:              true,
+		Mode:                 ModeBlocking,
+		DisabledPathPrefixes: []string{"/admin"},
+	}, b.TempDir())
+	req := httptest.NewRequest("GET", "https://app.example.test/admin/dashboard", nil)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFBoolSink = rt.isExcluded(req)
+	}
+}
+
+func BenchmarkRuntimeIsExcludedNoExclusions(b *testing.B) {
+	rt := NewRuntime(models.WAFConfig{
+		Enabled: true,
+		Mode:    ModeBlocking,
+	}, b.TempDir())
+	req := httptest.NewRequest("GET", "https://app.example.test/dashboard", nil)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFBoolSink = rt.isExcluded(req)
+	}
+}
+
+func BenchmarkRuntimeEvaluateDisabled(b *testing.B) {
+	rt := NewRuntime(models.WAFConfig{Enabled: false, Mode: ModeOff}, b.TempDir())
+	req := httptest.NewRequest("GET", "https://app.example.test/dashboard", nil)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkWAFBoolSink = rt.Evaluate(req, EvaluateContext{}).Allowed
 	}
 }

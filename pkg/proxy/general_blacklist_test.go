@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -77,7 +78,7 @@ func TestGeneralBlacklistRuntimeNormalizesAddsListsAndRemoves(t *testing.T) {
 		t.Fatalf("invalid-only status = %#v, err = %v; want empty success", emptyStatus, err)
 	}
 
-	list = runtime.list(1, 20, "manual review")
+	list = runtime.list(1, 20, "MANUAL REVIEW")
 	if list.Total != 2 {
 		t.Fatalf("search total = %d, want 2", list.Total)
 	}
@@ -91,6 +92,23 @@ func TestGeneralBlacklistRuntimeNormalizesAddsListsAndRemoves(t *testing.T) {
 	}
 	if _, ok := runtime.contains("192.168.1.20"); ok {
 		t.Fatal("expected removed IP to stop matching")
+	}
+}
+
+func TestGeneralBlacklistSearchMatchesNonASCIICase(t *testing.T) {
+	runtime := newGeneralBlacklistRuntime(models.GeneralBlacklistConfig{
+		Items: []models.GeneralBlacklistRecord{
+			{IP: "198.51.100.20", Source: models.GeneralBlacklistSourceManual, Comment: "Resume required"},
+			{IP: "198.51.100.21", Source: models.GeneralBlacklistSourceManual, Comment: "Résumé required"},
+		},
+	})
+
+	list := runtime.list(1, 20, "résumé")
+	if list.Total != 1 {
+		t.Fatalf("search total = %d, want 1", list.Total)
+	}
+	if got := list.Items[0].IP; got != "198.51.100.21" {
+		t.Fatalf("matched IP = %q, want 198.51.100.21", got)
 	}
 }
 
@@ -168,6 +186,34 @@ func TestGeneralBlacklistBlockedRequestIsLogged(t *testing.T) {
 	}
 	if !entry.GeneralBlacklistBlocked {
 		t.Fatal("general_blacklist_blocked flag was not logged")
+	}
+}
+
+func BenchmarkGeneralBlacklistRecordMatches(b *testing.B) {
+	record := models.GeneralBlacklistRecord{
+		IP:      "192.168.1.20",
+		Source:  models.GeneralBlacklistSourceWAFLog,
+		Comment: "Manual Review Required",
+	}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkBoolSink = generalBlacklistRecordMatches(record, "review")
+	}
+}
+
+func BenchmarkGeneralBlacklistRecordMatchesOld(b *testing.B) {
+	record := models.GeneralBlacklistRecord{
+		IP:      "192.168.1.20",
+		Source:  models.GeneralBlacklistSourceWAFLog,
+		Comment: "Manual Review Required",
+	}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkBoolSink = strings.Contains(strings.ToLower(record.IP), "review") ||
+			strings.Contains(strings.ToLower(record.Source), "review") ||
+			strings.Contains(strings.ToLower(record.Comment), "review")
 	}
 }
 

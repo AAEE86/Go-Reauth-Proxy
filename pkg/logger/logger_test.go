@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+var (
+	loggerBenchmarkSink     string
+	loggerBenchmarkBoolSink bool
+)
+
 func TestBoolEnv(t *testing.T) {
 	for _, value := range []string{"1", "true", "TRUE", "t", "yes", "y", "on", " On "} {
 		t.Setenv("GO_REPROXY_TEST_BOOL", value)
@@ -99,6 +104,15 @@ func TestDebugRedaction(t *testing.T) {
 	if !strings.Contains(url, "[admin-port]") || !strings.Contains(url, "token=%5Bredacted%5D") {
 		t.Fatalf("expected URL to include redaction markers, got %q", url)
 	}
+	if got := SanitizeURL("http://LOCALHOST:7996/path"); strings.Contains(got, "7996") || !strings.Contains(got, "[admin-port]") {
+		t.Fatalf("expected uppercase localhost URL to redact admin port, got %q", got)
+	}
+	if got := SanitizeLogString("LOCALHOST:7996"); strings.Contains(got, "7996") || !strings.Contains(got, "[admin-port]") {
+		t.Fatalf("expected uppercase localhost hostport to redact admin port, got %q", got)
+	}
+	if got := SanitizeLogString("peer id 179960"); got != "peer id 179960" {
+		t.Fatalf("expected embedded admin port digits to remain unchanged, got %q", got)
+	}
 
 	msg := SanitizeLogString("cannot target local admin port 7996")
 	if strings.Contains(msg, "7996") || !strings.Contains(msg, "[admin-port]") {
@@ -116,5 +130,93 @@ func TestDebugRedaction(t *testing.T) {
 	}
 	if got := headers["User-Agent"]; len(got.([]string)) != 1 || got.([]string)[0] != "curl" {
 		t.Fatalf("expected user agent to be preserved, got %#v", got)
+	}
+}
+
+func TestIsSensitiveNameCaseInsensitive(t *testing.T) {
+	tests := []string{
+		"Authorization",
+		"SET-Cookie",
+		"X-Api-Key",
+		"X-Access-Token",
+		"Private-Key",
+		"Session-ID",
+	}
+	for _, name := range tests {
+		if !IsSensitiveName(name) {
+			t.Fatalf("IsSensitiveName(%q) = false, want true", name)
+		}
+	}
+	if IsSensitiveName("User-Agent") {
+		t.Fatal("IsSensitiveName(\"User-Agent\") = true, want false")
+	}
+}
+
+func BenchmarkSanitizeLogStringPlain(b *testing.B) {
+	SetDebugAdminPortForRedaction(0)
+	b.Cleanup(func() {
+		SetDebugAdminPortForRedaction(0)
+	})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		loggerBenchmarkSink = SanitizeLogString("ordinary stream reconcile message")
+	}
+}
+
+func BenchmarkSanitizeLogStringSensitiveHeader(b *testing.B) {
+	SetDebugAdminPortForRedaction(0)
+	b.Cleanup(func() {
+		SetDebugAdminPortForRedaction(0)
+	})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		loggerBenchmarkSink = SanitizeLogString("Authorization: Bearer secret")
+	}
+}
+
+func BenchmarkIsSensitiveNameAuthorization(b *testing.B) {
+	var sink bool
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sink = IsSensitiveName("Authorization")
+	}
+	loggerBenchmarkBoolSink = sink
+}
+
+func BenchmarkSanitizeLogStringAdminPort(b *testing.B) {
+	SetDebugAdminPortForRedaction(7996)
+	b.Cleanup(func() {
+		SetDebugAdminPortForRedaction(0)
+	})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		loggerBenchmarkSink = SanitizeLogString("cannot target local admin port 7996")
+	}
+}
+
+func BenchmarkSanitizeLogStringAdminHostPort(b *testing.B) {
+	SetDebugAdminPortForRedaction(7996)
+	b.Cleanup(func() {
+		SetDebugAdminPortForRedaction(0)
+	})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		loggerBenchmarkSink = SanitizeLogString("LOCALHOST:7996")
+	}
+}
+
+func BenchmarkSanitizeLogStringAdminPortEmbeddedDigits(b *testing.B) {
+	SetDebugAdminPortForRedaction(7996)
+	b.Cleanup(func() {
+		SetDebugAdminPortForRedaction(0)
+	})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		loggerBenchmarkSink = SanitizeLogString("peer id 179960")
 	}
 }

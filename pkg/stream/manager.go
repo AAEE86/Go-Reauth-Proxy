@@ -1224,7 +1224,7 @@ func (m *Manager) verify(rule models.StreamRule, clientIP string) (bool, int, st
 	if authPath == "/" {
 		authPath = "/api/auth/verify"
 	}
-	verifyURL := fmt.Sprintf("http://127.0.0.1:%d%s", authConfig.AuthPort, authPath)
+	verifyURL := localServiceURL(authConfig.AuthPort, authPath)
 	start := time.Now()
 	if event := logger.DebugEvent("stream", "auth_verify_start"); event != nil {
 		event.Str("url", logger.SanitizeURL(verifyURL)).
@@ -1430,10 +1430,10 @@ func normalizeRelayError(err error) error {
 		return nil
 	}
 
-	errText := strings.ToLower(err.Error())
-	if strings.Contains(errText, "use of closed network connection") ||
-		strings.Contains(errText, "connection reset by peer") ||
-		strings.Contains(errText, "broken pipe") {
+	errText := err.Error()
+	if containsFoldASCIIString(errText, "use of closed network connection") ||
+		containsFoldASCIIString(errText, "connection reset by peer") ||
+		containsFoldASCIIString(errText, "broken pipe") {
 		return nil
 	}
 
@@ -1469,6 +1469,18 @@ func ensureLeadingSlash(path string) string {
 	return "/" + path
 }
 
+const localServiceURLPrefix = "http://127.0.0.1:"
+
+func localServiceURL(port int, urlPath string) string {
+	urlPath = ensureLeadingSlash(urlPath)
+	var stack [len(localServiceURLPrefix) + 20 + 128]byte
+	buf := stack[:0]
+	buf = append(buf, localServiceURLPrefix...)
+	buf = strconv.AppendInt(buf, int64(port), 10)
+	buf = append(buf, urlPath...)
+	return string(buf)
+}
+
 func isClosedConnErr(err error) bool {
 	if err == nil {
 		return false
@@ -1476,7 +1488,7 @@ func isClosedConnErr(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "use of closed network connection")
+	return containsFoldASCIIString(err.Error(), "use of closed network connection")
 }
 
 func isTimeoutErr(err error) bool {
@@ -1669,5 +1681,5 @@ func isAddrInUseErr(err error) bool {
 	if errors.Is(err, syscall.EADDRINUSE) {
 		return true
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "address already in use")
+	return containsFoldASCIIString(err.Error(), "address already in use")
 }

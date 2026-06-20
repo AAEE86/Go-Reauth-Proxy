@@ -36,9 +36,14 @@ var (
 	debugWriter           io.Writer = io.Discard
 	debugLogger           zerolog.Logger
 	debugWarnedWrite      atomic.Bool
-	debugAdminPort        atomic.Int64
+	debugAdminPort        atomic.Pointer[debugAdminPortRedaction]
 	debugRequestIDCounter atomic.Uint64
 )
+
+type debugAdminPortRedaction struct {
+	port int
+	text string
+}
 
 func Setup() {
 	zerolog.TimeFieldFormat = time.RFC3339Nano
@@ -185,10 +190,13 @@ func DebugEvent(component string, event string) *zerolog.Event {
 
 func SetDebugAdminPortForRedaction(port int) {
 	if port > 0 && port <= 65535 {
-		debugAdminPort.Store(int64(port))
+		debugAdminPort.Store(&debugAdminPortRedaction{
+			port: port,
+			text: strconv.Itoa(port),
+		})
 		return
 	}
-	debugAdminPort.Store(0)
+	debugAdminPort.Store(nil)
 }
 
 func NextDebugRequestID() string {
@@ -201,24 +209,37 @@ func SanitizeLogString(value string) string {
 		return ""
 	}
 
-	adminPort := int(debugAdminPort.Load())
-	if adminPort <= 0 {
+	adminPort := debugAdminPort.Load()
+	if adminPort == nil {
 		return redactSensitiveString(value)
 	}
 
-	if port, ok := parsePort(value); ok && port == adminPort {
+	if port, ok := parsePort(value); ok && port == adminPort.port {
 		return "[admin-port]"
 	}
 
-	value = redactAdminPortInURLs(value, adminPort)
-	value = redactAdminPortInHostPorts(value, adminPort)
-	value = strings.ReplaceAll(value, ":"+strconv.Itoa(adminPort), ":[admin-port]")
-	value = redactStandaloneAdminPort(value, adminPort)
+	portText := adminPort.text
+	if strings.Contains(value, "://") {
+		value = redactAdminPortInURLs(value, portText)
+	}
+	if strings.Contains(value, ":") && !strings.ContainsAny(value, " \t\r\n") {
+		value = redactAdminPortInHostPorts(value, portText)
+	}
+	if strings.Contains(value, ":") {
+		colonPort := ":" + portText
+		if strings.Contains(value, colonPort) {
+			value = strings.ReplaceAll(value, colonPort, ":[admin-port]")
+		}
+	}
+	if strings.Contains(value, portText) {
+		value = redactStandaloneAdminPort(value, portText)
+	}
 	return redactSensitiveString(value)
 }
 
 func SanitizePort(port int) any {
-	if port > 0 && port == int(debugAdminPort.Load()) {
+	adminPort := debugAdminPort.Load()
+	if adminPort != nil && port > 0 && port == adminPort.port {
 		return "[admin-port]"
 	}
 	return port
@@ -284,84 +305,190 @@ func SanitizedHeaderNames(header http.Header) []string {
 }
 
 func IsSensitiveName(name string) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
+	name = strings.TrimSpace(name)
 	if name == "" {
 		return false
 	}
-	switch name {
-	case "cookie", "set-cookie", "authorization", "proxy-authorization":
-		return true
+	switch len(name) {
+	case len("cookie"):
+		if equalFoldASCIIString(name, "cookie") {
+			return true
+		}
+	case len("set-cookie"):
+		if equalFoldASCIIString(name, "set-cookie") {
+			return true
+		}
+	case len("authorization"):
+		if equalFoldASCIIString(name, "authorization") {
+			return true
+		}
+	case len("proxy-authorization"):
+		if equalFoldASCIIString(name, "proxy-authorization") {
+			return true
+		}
 	}
-	return strings.Contains(name, "token") ||
-		strings.Contains(name, "password") ||
-		strings.Contains(name, "passwd") ||
-		strings.Contains(name, "secret") ||
-		strings.Contains(name, "api-key") ||
-		strings.Contains(name, "apikey") ||
-		strings.Contains(name, "access-key") ||
-		strings.Contains(name, "private-key") ||
-		strings.Contains(name, "session")
+	return containsFoldASCIIString(name, "token") ||
+		containsFoldASCIIString(name, "password") ||
+		containsFoldASCIIString(name, "passwd") ||
+		containsFoldASCIIString(name, "secret") ||
+		containsFoldASCIIString(name, "api-key") ||
+		containsFoldASCIIString(name, "apikey") ||
+		containsFoldASCIIString(name, "access-key") ||
+		containsFoldASCIIString(name, "private-key") ||
+		containsFoldASCIIString(name, "session")
 }
 
 func redactSensitiveString(value string) string {
-	if strings.Contains(strings.ToLower(value), "authorization:") ||
-		strings.Contains(strings.ToLower(value), "cookie:") ||
-		strings.Contains(strings.ToLower(value), "set-cookie:") {
+	if containsSensitiveHeaderMarker(value) {
 		return "[redacted]"
 	}
 	return value
 }
 
-func redactAdminPortInURLs(value string, adminPort int) string {
+func containsSensitiveHeaderMarker(value string) bool {
+	for i := 0; i < len(value); i++ {
+		switch lowerASCIIByte(value[i]) {
+		case 'a':
+			if hasFoldASCIIPrefix(value[i:], "authorization:") {
+				return true
+			}
+		case 'c':
+			if hasFoldASCIIPrefix(value[i:], "cookie:") {
+				return true
+			}
+		case 's':
+			if hasFoldASCIIPrefix(value[i:], "set-cookie:") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func equalFoldASCIIString(a string, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if lowerASCIIByte(a[i]) != lowerASCIIByte(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func containsFoldASCIIString(value string, search string) bool {
+	if search == "" {
+		return true
+	}
+	if len(search) > len(value) {
+		return false
+	}
+	first := lowerASCIIByte(search[0])
+	last := len(value) - len(search)
+	for i := 0; i <= last; i++ {
+		if lowerASCIIByte(value[i]) != first {
+			continue
+		}
+		if hasFoldASCIIPrefix(value[i:], search) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFoldASCIIPrefix(value string, prefix string) bool {
+	if len(prefix) > len(value) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if lowerASCIIByte(value[i]) != lowerASCIIByte(prefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCIIByte(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
+}
+
+func redactAdminPortInURLs(value string, portText string) string {
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" {
 		return value
 	}
-	if isLocalHost(parsed.Hostname()) && parsed.Port() == strconv.Itoa(adminPort) {
-		return strings.Replace(value, ":"+strconv.Itoa(adminPort), ":[admin-port]", 1)
+	if isLocalHost(parsed.Hostname()) && parsed.Port() == portText {
+		return strings.Replace(value, ":"+portText, ":[admin-port]", 1)
 	}
 	return parsed.String()
 }
 
-func redactAdminPortInHostPorts(value string, adminPort int) string {
+func redactAdminPortInHostPorts(value string, portText string) string {
 	host, port, err := net.SplitHostPort(value)
-	if err != nil || port != strconv.Itoa(adminPort) || !isLocalHost(host) {
+	if err != nil || port != portText || !isLocalHost(host) {
 		return value
 	}
 	return net.JoinHostPort(host, "[admin-port]")
 }
 
 func parsePort(value string) (int, bool) {
-	port, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || port <= 0 || port > 65535 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	port := 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		port = port*10 + int(c-'0')
+		if port > 65535 {
+			return 0, false
+		}
+	}
+	if port == 0 {
 		return 0, false
 	}
 	return port, true
 }
 
-func redactStandaloneAdminPort(value string, adminPort int) string {
-	portText := strconv.Itoa(adminPort)
-	if !strings.Contains(value, portText) {
+func redactStandaloneAdminPort(value string, portText string) string {
+	if portText == "" {
 		return value
 	}
 
 	var builder strings.Builder
+	replaced := false
 	start := 0
 	for {
 		idx := strings.Index(value[start:], portText)
 		if idx == -1 {
+			if !replaced {
+				return value
+			}
 			builder.WriteString(value[start:])
 			break
 		}
 		idx += start
 		end := idx + len(portText)
 		if isDigitBoundary(value, idx-1) && isDigitBoundary(value, end) {
+			if !replaced {
+				builder.Grow(len(value) + len("[admin-port]") - len(portText))
+				replaced = true
+			}
 			builder.WriteString(value[start:idx])
 			builder.WriteString("[admin-port]")
 			start = end
 			continue
 		}
-		builder.WriteString(value[start:end])
+		if replaced {
+			builder.WriteString(value[start:end])
+		}
 		start = end
 	}
 	return builder.String()
@@ -375,8 +502,8 @@ func isDigitBoundary(value string, index int) bool {
 }
 
 func isLocalHost(host string) bool {
-	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
-	if host == "localhost" {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if equalFoldASCIIString(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)

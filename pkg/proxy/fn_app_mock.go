@@ -145,15 +145,15 @@ func isFNAppRequest(r *http.Request) bool {
 		return false
 	}
 
-	userAgent := strings.ToLower(strings.TrimSpace(r.UserAgent()))
-	if strings.Contains(userAgent, "com.trim.app") ||
-		strings.Contains(userAgent, "com.trim.media") ||
-		strings.Contains(userAgent, "dart:io") ||
-		strings.Contains(userAgent, "flutter/") {
+	userAgent := strings.TrimSpace(r.UserAgent())
+	if containsFoldASCIIString(userAgent, "com.trim.app") ||
+		containsFoldASCIIString(userAgent, "com.trim.media") ||
+		containsFoldASCIIString(userAgent, "dart:io") ||
+		containsFoldASCIIString(userAgent, "flutter/") {
 		return true
 	}
 
-	return strings.Contains(strings.ToLower(r.Header.Get("Cookie")), strings.ToLower(fnAppRelayCookieValue))
+	return containsFoldASCIIString(r.Header.Get("Cookie"), fnAppRelayCookieValue)
 }
 
 func isFNAppWebSocketRequest(r *http.Request) bool {
@@ -161,7 +161,7 @@ func isFNAppWebSocketRequest(r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+		containsFoldASCIIString(r.Header.Get("Connection"), "upgrade")
 }
 
 func (s *fnAppMockService) handleUnauthorizedRequest(w http.ResponseWriter, r *http.Request, upstreamTarget string) (bool, error) {

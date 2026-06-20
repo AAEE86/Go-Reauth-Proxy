@@ -1,6 +1,7 @@
 package response
 
 import (
+	"bytes"
 	"encoding/json"
 	"go-reauth-proxy/pkg/i18n"
 	"net/http"
@@ -9,9 +10,11 @@ import (
 	"testing"
 )
 
+var wafBenchmarkBoolSink bool
+
 func TestWAFBlockedJSONResponse(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://example.test/search", nil)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "Application/JSON")
 	rec := httptest.NewRecorder()
 
 	WAFBlocked(rec, req, WAFBlockPageOptions{
@@ -46,6 +49,90 @@ func TestWAFBlockedJSONResponse(t *testing.T) {
 	if rec.Header().Get("Content-Language") != "zh-CN" {
 		t.Fatalf("unexpected content language: %q", rec.Header().Get("Content-Language"))
 	}
+}
+
+func TestAppendWAFBlockedJSONMatchesEncodingJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		traceID string
+	}{
+		{name: "plain", message: "Request blocked", traceID: "waf_trace"},
+		{name: "html escaped", message: "<blocked>&denied", traceID: "waf_<trace>&"},
+		{name: "controls", message: "line\nnext\t\u0001", traceID: "trace\rid"},
+		{name: "unicode separators", message: "line\u2028para\u2029", traceID: "trace\u2028id"},
+		{name: "invalid utf8", message: string([]byte{'b', 'a', 'd', 0xff}), traceID: string([]byte{'i', 'd', 0xff})},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := appendWAFBlockedJSON(nil, tt.message, tt.traceID)
+			want := legacyWAFBlockedJSONForBenchmark(tt.message, tt.traceID)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("JSON mismatch\ngot:  %s\nwant: %s", got, want)
+			}
+		})
+	}
+}
+
+func TestWantsJSONPrefersHTML(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/search", nil)
+	req.Header.Set("Accept", "text/html, application/json")
+
+	if wantsJSON(req) {
+		t.Fatal("wantsJSON() = true, want false when text/html is accepted")
+	}
+}
+
+func BenchmarkWantsJSON(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/search", nil)
+	req.Header.Set("Accept", "Application/JSON")
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		wafBenchmarkBoolSink = wantsJSON(req)
+	}
+}
+
+func BenchmarkWantsJSONToLower(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/search", nil)
+	req.Header.Set("Accept", "Application/JSON")
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		accept := strings.ToLower(req.Header.Get("Accept"))
+		wafBenchmarkBoolSink = strings.Contains(accept, "application/json") && !strings.Contains(accept, "text/html")
+	}
+}
+
+func BenchmarkAppendWAFBlockedJSON(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		responseBenchmarkBytesSink = appendWAFBlockedJSON(nil, "Request blocked by WAF", "waf_test_trace")
+	}
+}
+
+func BenchmarkAppendWAFBlockedJSONOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		responseBenchmarkBytesSink = legacyWAFBlockedJSONForBenchmark("Request blocked by WAF", "waf_test_trace")
+	}
+}
+
+func legacyWAFBlockedJSONForBenchmark(message string, traceID string) []byte {
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		TraceID string `json:"trace_id"`
+	}{
+		Success: false,
+		Code:    "WAF_BLOCKED",
+		Message: message,
+		TraceID: traceID,
+	})
+	return buf.Bytes()
 }
 
 func TestWAFBlockedHTMLResponse(t *testing.T) {

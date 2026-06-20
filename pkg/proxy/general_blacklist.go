@@ -76,7 +76,7 @@ func (r *generalBlacklistRuntime) list(page int, limit int, search string) model
 		limit = 200
 	}
 
-	needle := strings.ToLower(strings.TrimSpace(search))
+	needle := strings.TrimSpace(search)
 	r.mu.RLock()
 	items := make([]models.GeneralBlacklistRecord, 0, len(r.config.Items))
 	for _, item := range r.config.Items {
@@ -351,7 +351,7 @@ func parseGeneralBlacklistTime(value string) time.Time {
 }
 
 func generalBlacklistRecordMatches(record models.GeneralBlacklistRecord, needle string) bool {
-	return strings.Contains(strings.ToLower(record.IP), needle) ||
-		strings.Contains(strings.ToLower(record.Source), needle) ||
-		strings.Contains(strings.ToLower(record.Comment), needle)
+	return containsFoldString(record.IP, needle) ||
+		containsFoldString(record.Source, needle) ||
+		containsFoldString(record.Comment, needle)
 }

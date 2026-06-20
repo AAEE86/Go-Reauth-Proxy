@@ -431,12 +431,20 @@ var selectTmpl = template.Must(
 )
 
 func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hostRules []models.HostRule, portalConfig models.GatewayPortalConfig) {
+	filteredRules := filterToolbarRules(rules)
+	filteredHostRules := filterToolbarHostRules(hostRules, "")
+	selectPageWithFilteredRoutes(w, r, filteredRules, filteredHostRules, portalConfig)
+}
+
+func SelectPageWithPrefilteredRoutes(w http.ResponseWriter, r *http.Request, filteredRules []models.Rule, filteredHostRules []models.HostRule, portalConfig models.GatewayPortalConfig) {
+	selectPageWithFilteredRoutes(w, r, filteredRules, filteredHostRules, portalConfig)
+}
+
+func selectPageWithFilteredRoutes(w http.ResponseWriter, r *http.Request, filteredRules []models.Rule, filteredHostRules []models.HostRule, portalConfig models.GatewayPortalConfig) {
 	locale := i18n.ResolveRequestLocale(r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Language", locale)
 	w.WriteHeader(http.StatusOK)
-	filteredRules := filterToolbarRules(rules)
-	filteredHostRules := filterToolbarHostRules(hostRules, "")
 
 	userAgent := ""
 	if r != nil {
@@ -445,7 +453,7 @@ func SelectPage(w http.ResponseWriter, r *http.Request, rules []models.Rule, hos
 
 	toolbarHTML := ""
 	if !ShouldSuppressToolbarForUserAgent(userAgent) {
-		toolbarHTML = GenerateToolbarWithHostsForLocale(locale, filteredRules, filteredHostRules, "/__select__", "", "", portalConfig)
+		toolbarHTML = GenerateToolbarWithPrefilteredHostsForLocale(locale, filteredRules, filteredHostRules, "/__select__", "", "", portalConfig)
 	}
 
 	data := pageData{

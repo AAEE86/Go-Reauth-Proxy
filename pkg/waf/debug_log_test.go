@@ -1,6 +1,7 @@
 package waf
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,11 +39,71 @@ func TestDebugLogRecordsWAFReloadWithAdminPortRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read debug log: %v", err)
 	}
-	got := string(data)
-	if !strings.Contains(got, `"component":"waf"`) || !strings.Contains(got, `"event":"reload_end"`) {
-		t.Fatalf("expected WAF reload debug events, got %q", got)
+	events := parseWAFDebugLogEvents(t, string(data))
+	sawComponent := false
+	sawReloadEnd := false
+	sawRedactedPort := false
+	for _, event := range events {
+		if event["component"] == "waf" {
+			sawComponent = true
+		}
+		if event["event"] == "reload_end" {
+			sawReloadEnd = true
+		}
+		if wafDebugValueContains(event, "[admin-port]") {
+			sawRedactedPort = true
+		}
+		for key, value := range event {
+			if key == "time" {
+				continue
+			}
+			if wafDebugValueContains(value, "7996") {
+				t.Fatalf("expected admin port fields to be redacted, got %q", string(data))
+			}
+		}
 	}
-	if !strings.Contains(got, `[admin-port]`) || strings.Contains(got, "7996") {
-		t.Fatalf("expected admin port to be redacted, got %q", got)
+	if !sawComponent || !sawReloadEnd {
+		t.Fatalf("expected WAF reload debug events, got %q", string(data))
 	}
+	if !sawRedactedPort {
+		t.Fatalf("expected admin port redaction marker, got %q", string(data))
+	}
+}
+
+func parseWAFDebugLogEvents(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	events := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("failed to parse debug log line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func wafDebugValueContains(value any, needle string) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.Contains(typed, needle)
+	case []any:
+		for _, item := range typed {
+			if wafDebugValueContains(item, needle) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, item := range typed {
+			if wafDebugValueContains(item, needle) {
+				return true
+			}
+		}
+	}
+	return false
 }

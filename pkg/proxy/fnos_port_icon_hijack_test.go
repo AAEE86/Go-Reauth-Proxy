@@ -7,10 +7,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gorilla/websocket"
+)
+
+var (
+	benchmarkFnosPortSink    int
+	benchmarkFnosTargetsSink map[int]string
 )
 
 func TestRewriteFnosPortIconHijackMessageRewritesEmptyHostPort(t *testing.T) {
@@ -103,6 +109,43 @@ func TestBuildFnosPortIconHijackTargetsUsesHostRuleTargetPorts(t *testing.T) {
 	}
 	if got := targets[8920]; got != "jellyfin.example.com" {
 		t.Fatalf("target 8920 = %q, want jellyfin.example.com", got)
+	}
+}
+
+func TestHostRuleTargetPortMatchesLegacyBehavior(t *testing.T) {
+	tests := []string{
+		"",
+		"   ",
+		"http://127.0.0.1:8096",
+		" http://127.0.0.1:8096/path ",
+		"https://192.168.1.10:8920",
+		"http://example.com",
+		"https://example.com",
+		"ws://example.com/socket",
+		"wss://example.com/socket",
+		"ftp://example.com",
+		"ftp://example.com:21",
+		"http://:80",
+		"http://host:",
+		"http://host:abc",
+		"http://host:70000",
+		"http://[::1]:8080/path",
+		"http://[::1]/path",
+		"http://::1",
+		"http://user:pass@example.com:8080/path",
+		"http://user@:80",
+		"http://[::1",
+		"http://[::1]extra",
+	}
+
+	for _, rawTarget := range tests {
+		t.Run(rawTarget, func(t *testing.T) {
+			gotPort, gotOK := hostRuleTargetPort(rawTarget)
+			wantPort, wantOK := legacyHostRuleTargetPortForBenchmark(rawTarget)
+			if gotPort != wantPort || gotOK != wantOK {
+				t.Fatalf("hostRuleTargetPort(%q) = %d, %v; want legacy %d, %v", rawTarget, gotPort, gotOK, wantPort, wantOK)
+			}
+		})
 	}
 }
 
@@ -310,5 +353,106 @@ func TestFnosPortIconHijackWebSocketRewritesUpstreamMessages(t *testing.T) {
 	}
 	if got := decoded.Data.List[0].URI.Path; got != "" {
 		t.Fatalf("path = %q, want empty string", got)
+	}
+}
+
+func legacyHostRuleTargetPortForBenchmark(rawTarget string) (int, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(rawTarget))
+	if err != nil || parsed.Host == "" {
+		return 0, false
+	}
+	if port := parsed.Port(); port != "" {
+		parsedPort, err := strconv.Atoi(port)
+		if err == nil && parsedPort > 0 && parsedPort <= 65535 {
+			return parsedPort, true
+		}
+		return 0, false
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "ws":
+		return 80, true
+	case "https", "wss":
+		return 443, true
+	default:
+		return 0, false
+	}
+}
+
+func buildFnosPortIconHijackTargetsLegacyForBenchmark(hostRules []models.HostRule) map[int]string {
+	targets := make(map[int]string)
+	for _, rule := range hostRules {
+		host := normalizeRequestHost(rule.Host)
+		if host == "" {
+			continue
+		}
+
+		port, ok := legacyHostRuleTargetPortForBenchmark(rule.Target)
+		if !ok {
+			continue
+		}
+		if _, exists := targets[port]; exists {
+			continue
+		}
+		targets[port] = host
+	}
+	return targets
+}
+
+func BenchmarkHostRuleTargetPortExplicit(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkFnosPortSink, benchmarkBoolSink = hostRuleTargetPort("http://127.0.0.1:8096/path")
+	}
+}
+
+func BenchmarkHostRuleTargetPortExplicitOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkFnosPortSink, benchmarkBoolSink = legacyHostRuleTargetPortForBenchmark("http://127.0.0.1:8096/path")
+	}
+}
+
+func BenchmarkHostRuleTargetPortDefaultHTTPS(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkFnosPortSink, benchmarkBoolSink = hostRuleTargetPort("https://emby.example.com/web")
+	}
+}
+
+func BenchmarkHostRuleTargetPortDefaultHTTPSOld(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkFnosPortSink, benchmarkBoolSink = legacyHostRuleTargetPortForBenchmark("https://emby.example.com/web")
+	}
+}
+
+func BenchmarkBuildFnosPortIconHijackTargets(b *testing.B) {
+	hostRules := []models.HostRule{
+		{Host: "Emby.Example.COM", Target: "http://127.0.0.1:8096/web/index.html"},
+		{Host: "jellyfin.example.com", Target: "https://192.168.1.10:8920"},
+		{Host: "calibre.example.com", Target: "http://[::1]:8083"},
+		{Host: "ignored.example.com", Target: "ftp://192.168.1.10"},
+		{Host: "files.example.com", Target: "http://192.168.1.10"},
+		{Host: "socket.example.com", Target: "wss://192.168.1.11/socket"},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkFnosTargetsSink = buildFnosPortIconHijackTargets(hostRules)
+	}
+}
+
+func BenchmarkBuildFnosPortIconHijackTargetsOld(b *testing.B) {
+	hostRules := []models.HostRule{
+		{Host: "Emby.Example.COM", Target: "http://127.0.0.1:8096/web/index.html"},
+		{Host: "jellyfin.example.com", Target: "https://192.168.1.10:8920"},
+		{Host: "calibre.example.com", Target: "http://[::1]:8083"},
+		{Host: "ignored.example.com", Target: "ftp://192.168.1.10"},
+		{Host: "files.example.com", Target: "http://192.168.1.10"},
+		{Host: "socket.example.com", Target: "wss://192.168.1.11/socket"},
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchmarkFnosTargetsSink = buildFnosPortIconHijackTargetsLegacyForBenchmark(hostRules)
 	}
 }

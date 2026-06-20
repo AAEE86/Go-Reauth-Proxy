@@ -35,7 +35,7 @@ func (c *preserveHostConfig) shouldOmit(target *url.URL) bool {
 		return false
 	}
 
-	_, key, ok := normalizeForwardedHeadersTargetURL(target)
+	key, ok := forwardedHeadersTargetKeyForURL(target)
 	if !ok {
 		return false
 	}

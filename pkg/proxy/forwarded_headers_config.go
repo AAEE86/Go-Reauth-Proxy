@@ -36,7 +36,7 @@ func (c *forwardedHeadersConfig) shouldOmit(target *url.URL) bool {
 		return false
 	}
 
-	_, key, ok := normalizeForwardedHeadersTargetURL(target)
+	key, ok := forwardedHeadersTargetKeyForURL(target)
 	if !ok {
 		return false
 	}
@@ -108,33 +108,93 @@ func normalizeForwardedHeadersTarget(rawTarget string) (string, bool) {
 }
 
 func normalizeForwardedHeadersTargetURL(target *url.URL) (*url.URL, string, bool) {
-	if target == nil {
+	scheme, targetPath, key, ok := normalizedForwardedHeadersTargetParts(target)
+	if !ok {
 		return nil, "", false
 	}
 
 	normalized := *target
-	normalized.Scheme = strings.ToLower(strings.TrimSpace(normalized.Scheme))
-	switch normalized.Scheme {
-	case "ws":
-		normalized.Scheme = "http"
-	case "wss":
-		normalized.Scheme = "https"
-	case "http", "https":
-	default:
-		return nil, "", false
-	}
-
-	if strings.TrimSpace(normalized.Host) == "" {
-		return nil, "", false
-	}
-
+	normalized.Scheme = scheme
 	normalized.User = nil
 	normalized.RawQuery = ""
 	normalized.Fragment = ""
 	normalized.RawPath = ""
-	normalized.Path = canonicalForwardedHeadersBasePath(normalized.Path)
+	normalized.Path = targetPath
 
-	return &normalized, normalized.String(), true
+	return &normalized, key, true
+}
+
+func forwardedHeadersTargetKeyForURL(target *url.URL) (string, bool) {
+	_, _, key, ok := normalizedForwardedHeadersTargetParts(target)
+	return key, ok
+}
+
+func normalizedForwardedHeadersTargetParts(target *url.URL) (string, string, string, bool) {
+	if target == nil {
+		return "", "", "", false
+	}
+
+	scheme := normalizeForwardedHeadersTargetScheme(target.Scheme)
+	switch scheme {
+	case "ws":
+		scheme = "http"
+	case "wss":
+		scheme = "https"
+	case "http", "https":
+	default:
+		return "", "", "", false
+	}
+
+	if strings.TrimSpace(target.Host) == "" {
+		return "", "", "", false
+	}
+
+	targetPath := canonicalForwardedHeadersBasePath(target.Path)
+	return scheme, targetPath, forwardedHeadersTargetKeyParts(scheme, target.Host, targetPath), true
+}
+
+func normalizeForwardedHeadersTargetScheme(scheme string) string {
+	scheme = strings.TrimSpace(scheme)
+	switch len(scheme) {
+	case len("ws"):
+		if equalFoldASCIIString(scheme, "ws") {
+			return "ws"
+		}
+	case len("wss"):
+		if equalFoldASCIIString(scheme, "wss") {
+			return "wss"
+		}
+	case len("http"):
+		if equalFoldASCIIString(scheme, "http") {
+			return "http"
+		}
+	case len("https"):
+		if equalFoldASCIIString(scheme, "https") {
+			return "https"
+		}
+	}
+	return lowerASCIIString(scheme)
+}
+
+func forwardedHeadersTargetKey(target *url.URL) string {
+	if target == nil {
+		return ""
+	}
+	return forwardedHeadersTargetKeyParts(target.Scheme, target.Host, target.EscapedPath())
+}
+
+func forwardedHeadersTargetKeyParts(scheme string, host string, targetPath string) string {
+	var stack [128]byte
+	buf := stack[:0]
+	buf = append(buf, scheme...)
+	buf = append(buf, "://"...)
+	buf = append(buf, host...)
+	if targetPath != "" {
+		targetURL := url.URL{Path: targetPath}
+		targetPath = targetURL.EscapedPath()
+		buf = append(buf, targetPath...)
+	}
+	return string(buf)
 }
 
 func canonicalForwardedHeadersBasePath(rawPath string) string {

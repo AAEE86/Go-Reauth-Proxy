@@ -366,26 +366,85 @@ func buildFnosPortIconHijackTargets(hostRules []models.HostRule) map[int]string 
 }
 
 func hostRuleTargetPort(rawTarget string) (int, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(rawTarget))
-	if err != nil || parsed.Host == "" {
-		return 0, false
-	}
-	if port := parsed.Port(); port != "" {
-		parsedPort, err := strconv.Atoi(port)
-		if err == nil && parsedPort > 0 && parsedPort <= 65535 {
-			return parsedPort, true
-		}
+	target := strings.TrimSpace(rawTarget)
+	scheme, rest, ok := strings.Cut(target, "://")
+	if !ok || scheme == "" {
 		return 0, false
 	}
 
-	switch strings.ToLower(parsed.Scheme) {
-	case "http", "ws":
-		return 80, true
-	case "https", "wss":
-		return 443, true
-	default:
+	authority := rest
+	if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+		authority = authority[:end]
+	}
+	if authority == "" {
 		return 0, false
 	}
+	if userinfoEnd := strings.LastIndexByte(authority, '@'); userinfoEnd >= 0 {
+		authority = authority[userinfoEnd+1:]
+		if authority == "" {
+			return 0, false
+		}
+	}
+
+	if port, ok, invalid := hostRuleAuthorityPort(authority); ok {
+		return port, true
+	} else if invalid {
+		return 0, false
+	}
+
+	if equalFoldASCIIString(scheme, "http") || equalFoldASCIIString(scheme, "ws") {
+		return 80, true
+	}
+	if equalFoldASCIIString(scheme, "https") || equalFoldASCIIString(scheme, "wss") {
+		return 443, true
+	}
+	return 0, false
+}
+
+func hostRuleAuthorityPort(authority string) (int, bool, bool) {
+	if authority == "" {
+		return 0, false, false
+	}
+	if authority[0] == '[' {
+		closeBracket := strings.IndexByte(authority, ']')
+		if closeBracket < 0 {
+			return 0, false, true
+		}
+		if len(authority) == closeBracket+1 {
+			return 0, false, false
+		}
+		if authority[closeBracket+1] != ':' {
+			return 0, false, true
+		}
+		return parseHostRulePort(authority[closeBracket+2:])
+	}
+
+	colon := strings.LastIndexByte(authority, ':')
+	if colon < 0 {
+		return 0, false, false
+	}
+	return parseHostRulePort(authority[colon+1:])
+}
+
+func parseHostRulePort(port string) (int, bool, bool) {
+	if port == "" {
+		return 0, false, false
+	}
+	value := 0
+	for i := 0; i < len(port); i++ {
+		c := port[i]
+		if c < '0' || c > '9' {
+			return 0, false, true
+		}
+		value = value*10 + int(c-'0')
+		if value > 65535 {
+			return 0, false, true
+		}
+	}
+	if value == 0 {
+		return 0, false, true
+	}
+	return value, true, false
 }
 
 func rewriteFnosPortIconHijackMessage(payload []byte, hostByPort map[int]string, endpoint fnosPortIconHijackPublicEndpoint) ([]byte, bool, error) {

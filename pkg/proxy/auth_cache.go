@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +20,10 @@ const (
 	authSessionCookieName      = "x-go-reauth-proxy-session-id"
 	authShareSessionCookieName = "fn-knock-fnos-share-session"
 	authCacheCleanupInterval   = 30 * time.Second
+	authCacheHashBufferSize    = 512
+	identitySourceCookiePrefix = "cookie:"
+	identitySourceAuthPrefix   = "auth:"
+	identitySourceIPPrefix     = "ip:"
 )
 
 type authStateCache struct {
@@ -66,6 +70,18 @@ type preflightCacheEntry struct {
 type preflightCacheExecution struct {
 	entry    *preflightCacheEntry
 	decision preflightDecision
+}
+
+type authSetCookieMutation struct {
+	name   string
+	value  string
+	maxAge int
+}
+
+type authSetCookieMutations struct {
+	inline [2]authSetCookieMutation
+	extra  []authSetCookieMutation
+	count  int
 }
 
 func newAuthStateCache() authStateCache {
@@ -126,88 +142,198 @@ func preflightCacheTTL(authConfig models.AuthConfig) time.Duration {
 
 func requestIdentitySource(r *http.Request, clientIP string) string {
 	if cookieID := canonicalCookieIdentity(r); cookieID != "" {
-		return "cookie:" + cookieID
+		return identitySourceCookiePrefix + cookieID
 	}
 	if auth := strings.TrimSpace(r.Header.Get("Authorization")); auth != "" {
-		return "auth:" + auth
+		return identitySourceAuthPrefix + auth
 	}
 	clientIP = strings.TrimSpace(clientIP)
 	if clientIP != "" {
-		return "ip:" + clientIP
+		return identitySourceIPPrefix + clientIP
 	}
 	return ""
 }
 
 func requestIdentityKey(r *http.Request, clientIP string) string {
-	return activeIdentityKeyFromSource(requestIdentitySource(r, clientIP))
+	identityKey, _, ok := requestIdentityForCache(r, clientIP)
+	if !ok {
+		return ""
+	}
+	return identityKey
 }
 
 func authCacheClientIPDimension(identitySource string, clientIP string) string {
 	identitySource = strings.TrimSpace(identitySource)
-	if !(strings.HasPrefix(identitySource, "cookie:") || strings.HasPrefix(identitySource, "auth:")) {
+	if !(strings.HasPrefix(identitySource, identitySourceCookiePrefix) || strings.HasPrefix(identitySource, identitySourceAuthPrefix)) {
 		return ""
 	}
 	return strings.TrimSpace(clientIP)
 }
 
+func requestIdentityForCache(r *http.Request, clientIP string) (identityKey string, clientIPDimension string, ok bool) {
+	if cookieKey, ok := canonicalCookieIdentityKey(r); ok {
+		return cookieKey, strings.TrimSpace(clientIP), true
+	}
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); auth != "" {
+		return activeIdentityKeyFromParts(identitySourceAuthPrefix, auth), strings.TrimSpace(clientIP), true
+	}
+	if clientIP = strings.TrimSpace(clientIP); clientIP != "" {
+		return activeIdentityKeyFromParts(identitySourceIPPrefix, clientIP), "", true
+	}
+	return "", "", false
+}
+
 func buildAuthCacheLookup(r *http.Request, clientIP string, accessMode string) (authCacheLookup, bool) {
-	identitySource := requestIdentitySource(r, clientIP)
-	identityKey := activeIdentityKeyFromSource(identitySource)
-	if identityKey == "" {
+	identityKey, clientIPDimension, ok := requestIdentityForCache(r, clientIP)
+	if !ok {
 		return authCacheLookup{}, false
 	}
-	clientIPDimension := authCacheClientIPDimension(identitySource, clientIP)
 
 	host := normalizeRequestHost(r.Host)
 	if host == "" {
 		host = normalizeRequestHost(r.Header.Get("X-Forwarded-Host"))
 	}
 
-	raw := strings.Join([]string{
+	cacheKey := authCacheLookupKey(
 		identityKey,
 		clientIPDimension,
 		strings.TrimSpace(strings.ToLower(accessMode)),
 		strings.TrimSpace(strings.ToLower(requestScheme(r))),
 		strings.TrimSpace(strings.ToUpper(r.Method)),
 		host,
-		r.URL.RequestURI(),
-	}, "\n")
-	sum := sha256.Sum256([]byte(raw))
+		r.URL,
+	)
 
 	return authCacheLookup{
-		cacheKey:    hex.EncodeToString(sum[:]),
+		cacheKey:    cacheKey,
 		identityKey: identityKey,
 	}, true
 }
 
 func buildPreflightCacheLookup(r *http.Request, clientIP string, accessMode string, isMatch bool) (preflightCacheLookup, bool) {
-	identitySource := requestIdentitySource(r, clientIP)
-	identityKey := activeIdentityKeyFromSource(identitySource)
-	if identityKey == "" {
+	identityKey, clientIPDimension, ok := requestIdentityForCache(r, clientIP)
+	if !ok {
 		return preflightCacheLookup{}, false
 	}
-	clientIPDimension := authCacheClientIPDimension(identitySource, clientIP)
 
 	host := normalizeRequestHost(r.Host)
 	if host == "" {
 		host = normalizeRequestHost(r.Header.Get("X-Forwarded-Host"))
 	}
 
-	raw := strings.Join([]string{
+	cacheKey := preflightCacheLookupKey(
 		identityKey,
 		clientIPDimension,
 		strings.TrimSpace(strings.ToLower(accessMode)),
 		strings.TrimSpace(strings.ToLower(requestScheme(r))),
 		host,
-		strconv.FormatBool(isMatch),
-		r.URL.RequestURI(),
-	}, "\n")
-	sum := sha256.Sum256([]byte(raw))
+		boolCacheField(isMatch),
+		r.URL,
+	)
 
 	return preflightCacheLookup{
-		cacheKey:    hex.EncodeToString(sum[:]),
+		cacheKey:    cacheKey,
 		identityKey: identityKey,
 	}, true
+}
+
+func authCacheLookupKey(identityKey, clientIPDimension, accessMode, scheme, method, host string, requestURL *url.URL) string {
+	var stack [authCacheHashBufferSize]byte
+	buf := stack[:0]
+	buf = appendCacheKeyField(buf, identityKey)
+	buf = appendCacheKeyField(buf, clientIPDimension)
+	buf = appendCacheKeyField(buf, accessMode)
+	buf = appendCacheKeyField(buf, scheme)
+	buf = appendCacheKeyField(buf, method)
+	buf = appendCacheKeyField(buf, host)
+	buf = appendCacheKeyRequestURIField(buf, requestURL)
+	return sha256HexBytes(buf)
+}
+
+func preflightCacheLookupKey(identityKey, clientIPDimension, accessMode, scheme, host, isMatch string, requestURL *url.URL) string {
+	var stack [authCacheHashBufferSize]byte
+	buf := stack[:0]
+	buf = appendCacheKeyField(buf, identityKey)
+	buf = appendCacheKeyField(buf, clientIPDimension)
+	buf = appendCacheKeyField(buf, accessMode)
+	buf = appendCacheKeyField(buf, scheme)
+	buf = appendCacheKeyField(buf, host)
+	buf = appendCacheKeyField(buf, isMatch)
+	buf = appendCacheKeyRequestURIField(buf, requestURL)
+	return sha256HexBytes(buf)
+}
+
+func appendCacheKeyField(buf []byte, field string) []byte {
+	if len(buf) > 0 {
+		buf = append(buf, '\n')
+	}
+	return append(buf, field...)
+}
+
+func appendCacheKeyRequestURIField(buf []byte, requestURL *url.URL) []byte {
+	if len(buf) > 0 {
+		buf = append(buf, '\n')
+	}
+	return appendURLRequestURI(buf, requestURL)
+}
+
+func appendURLRequestURI(buf []byte, requestURL *url.URL) []byte {
+	result := requestURL.Opaque
+	if result == "" {
+		result = requestURL.EscapedPath()
+		if result == "" {
+			result = "/"
+		}
+	} else if strings.HasPrefix(result, "//") {
+		buf = append(buf, requestURL.Scheme...)
+		buf = append(buf, ':')
+	}
+	buf = append(buf, result...)
+	if requestURL.ForceQuery || requestURL.RawQuery != "" {
+		buf = append(buf, '?')
+		buf = append(buf, requestURL.RawQuery...)
+	}
+	return buf
+}
+
+func boolCacheField(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+func activeIdentityKeyFromParts(prefix string, value string) string {
+	totalLen := len(prefix) + len(value)
+	if totalLen <= authCacheHashBufferSize {
+		var stack [authCacheHashBufferSize]byte
+		buf := stack[:0]
+		buf = append(buf, prefix...)
+		buf = append(buf, value...)
+		return sha256HexBytes(buf)
+	}
+
+	buf := make([]byte, 0, totalLen)
+	buf = append(buf, prefix...)
+	buf = append(buf, value...)
+	return sha256HexBytes(buf)
+}
+
+func sha256HexString(value string) string {
+	if len(value) <= authCacheHashBufferSize {
+		var stack [authCacheHashBufferSize]byte
+		buf := stack[:0]
+		buf = append(buf, value...)
+		return sha256HexBytes(buf)
+	}
+	return sha256HexBytes([]byte(value))
+}
+
+func sha256HexBytes(value []byte) string {
+	sum := sha256.Sum256(value)
+	var encoded [sha256.Size * 2]byte
+	hex.Encode(encoded[:], sum[:])
+	return string(encoded[:])
 }
 
 func copySetCookieHeaders(values []string) []string {
@@ -392,21 +518,18 @@ func (c *preflightStateCache) cleanupExpiredLocked(now time.Time) {
 }
 
 func requestCookieMap(r *http.Request) map[string]string {
-	cookies := r.Cookies()
-	if len(cookies) == 0 {
+	if r == nil {
 		return nil
 	}
 
-	values := make(map[string]string, len(cookies))
-	for _, cookie := range cookies {
-		if cookie == nil || cookie.Name == "" || cookie.Name == proxyPathCookieName {
-			continue
-		}
-		if cookie.Value == "" {
-			delete(values, cookie.Name)
-			continue
-		}
-		values[cookie.Name] = cookie.Value
+	headers := r.Header.Values("Cookie")
+	if len(headers) == 0 || !cookieHeaderValuesWithinDefaultLimit(headers) {
+		return nil
+	}
+
+	var values map[string]string
+	for _, header := range headers {
+		values = appendRequestCookieMapHeader(values, header)
 	}
 	if len(values) == 0 {
 		return nil
@@ -414,12 +537,34 @@ func requestCookieMap(r *http.Request) map[string]string {
 	return values
 }
 
+func appendRequestCookieMapHeader(values map[string]string, header string) map[string]string {
+	for {
+		part, rest, more := strings.Cut(header, ";")
+		name, value, ok := parseCanonicalCookiePart(strings.TrimSpace(part))
+		if ok && name != proxyPathCookieName {
+			if value == "" {
+				delete(values, name)
+			} else {
+				if values == nil {
+					values = make(map[string]string, strings.Count(header, ";")+1)
+				}
+				values[name] = value
+			}
+		}
+		if !more {
+			return values
+		}
+		header = rest
+	}
+}
+
 func canonicalCookieIdentityFromMap(values map[string]string) string {
 	if len(values) == 0 {
 		return ""
 	}
 
-	names := make([]string, 0, len(values))
+	var stackNames [canonicalCookieIdentityStackPairs]string
+	names := stackNames[:0]
 	for name, value := range values {
 		if name == "" || value == "" || name == proxyPathCookieName {
 			continue
@@ -432,6 +577,7 @@ func canonicalCookieIdentityFromMap(values map[string]string) string {
 
 	sort.Strings(names)
 	var b strings.Builder
+	b.Grow(canonicalCookieMapIdentitySize(values, names))
 	for i, name := range names {
 		if i > 0 {
 			b.WriteByte(';')
@@ -441,6 +587,17 @@ func canonicalCookieIdentityFromMap(values map[string]string) string {
 		b.WriteString(values[name])
 	}
 	return b.String()
+}
+
+func canonicalCookieMapIdentitySize(values map[string]string, names []string) int {
+	if len(names) == 0 {
+		return 0
+	}
+	size := len(names) - 1
+	for _, name := range names {
+		size += len(name) + 1 + len(values[name])
+	}
+	return size
 }
 
 func identityKeyFromState(cookieValues map[string]string, authHeader string, clientIP string) string {
@@ -456,53 +613,152 @@ func identityKeyFromState(cookieValues map[string]string, authHeader string, cli
 	return ""
 }
 
-func parseRelevantAuthSetCookies(setCookieHeaders []string) []*http.Cookie {
+func parseRelevantAuthSetCookies(setCookieHeaders []string) authSetCookieMutations {
+	var mutations authSetCookieMutations
 	if len(setCookieHeaders) == 0 {
-		return nil
+		return mutations
 	}
 
-	header := http.Header{}
 	for _, value := range setCookieHeaders {
-		header.Add("Set-Cookie", value)
-	}
-	resp := &http.Response{Header: header}
-	all := resp.Cookies()
-	if len(all) == 0 {
-		return nil
-	}
-
-	relevant := make([]*http.Cookie, 0, len(all))
-	for _, cookie := range all {
-		if cookie == nil {
-			continue
-		}
-		switch cookie.Name {
-		case authSessionCookieName, authShareSessionCookieName:
-			relevant = append(relevant, cookie)
+		if mutation, ok := parseRelevantAuthSetCookie(value); ok {
+			mutations.Append(mutation)
 		}
 	}
-	return relevant
+	return mutations
 }
 
-func applySetCookieMutations(base map[string]string, cookies []*http.Cookie) map[string]string {
-	if len(cookies) == 0 {
+func (m *authSetCookieMutations) Append(mutation authSetCookieMutation) {
+	if m.count < len(m.inline) {
+		m.inline[m.count] = mutation
+	} else {
+		m.extra = append(m.extra, mutation)
+	}
+	m.count++
+}
+
+func (m authSetCookieMutations) Len() int {
+	return m.count
+}
+
+func (m authSetCookieMutations) At(index int) authSetCookieMutation {
+	if index < len(m.inline) {
+		return m.inline[index]
+	}
+	return m.extra[index-len(m.inline)]
+}
+
+func parseRelevantAuthSetCookie(header string) (authSetCookieMutation, bool) {
+	part, attrs, _ := strings.Cut(strings.Trim(header, " \t"), ";")
+	part = strings.Trim(part, " \t")
+	name, rawValue, ok := strings.Cut(part, "=")
+	if !ok {
+		return authSetCookieMutation{}, false
+	}
+	name = strings.Trim(name, " \t")
+	switch name {
+	case authSessionCookieName, authShareSessionCookieName:
+	default:
+		return authSetCookieMutation{}, false
+	}
+	value, ok := parseCanonicalCookieValue(rawValue)
+	if !ok {
+		return authSetCookieMutation{}, false
+	}
+
+	mutation := authSetCookieMutation{name: name, value: value}
+	for attrs != "" {
+		attrPart := attrs
+		if before, after, more := strings.Cut(attrs, ";"); more {
+			attrPart = before
+			attrs = after
+		} else {
+			attrs = ""
+		}
+		attrPart = strings.Trim(attrPart, " \t")
+		if attrPart == "" {
+			continue
+		}
+		attr, rawAttrValue, _ := strings.Cut(attrPart, "=")
+		if !equalFoldASCIIString(attr, "max-age") {
+			continue
+		}
+		attrValue, ok := parseSetCookieAttributeValue(rawAttrValue)
+		if !ok {
+			continue
+		}
+		mutation.maxAge = parseSetCookieMaxAge(attrValue)
+	}
+	return mutation, true
+}
+
+func parseSetCookieAttributeValue(raw string) (string, bool) {
+	for i := 0; i < len(raw); i++ {
+		if !validCanonicalCookieValueByte(raw[i]) {
+			return "", false
+		}
+	}
+	return raw, true
+}
+
+func parseSetCookieMaxAge(value string) int {
+	if value == "" {
+		return 0
+	}
+	i := 0
+	negative := false
+	switch value[0] {
+	case '+':
+		i = 1
+	case '-':
+		i = 1
+		negative = true
+	}
+	if i == len(value) {
+		return 0
+	}
+	leadingZeroInvalid := value[0] == '0'
+	maxInt := int(^uint(0) >> 1)
+	seconds := 0
+	for ; i < len(value); i++ {
+		c := value[i]
+		if c < '0' || c > '9' {
+			return 0
+		}
+		digit := int(c - '0')
+		if seconds > (maxInt-digit)/10 {
+			return 0
+		}
+		seconds = seconds*10 + digit
+	}
+	if leadingZeroInvalid && seconds != 0 {
+		return 0
+	}
+	if negative || seconds <= 0 {
+		return -1
+	}
+	return seconds
+}
+
+func applySetCookieMutations(base map[string]string, cookies authSetCookieMutations) map[string]string {
+	if cookies.Len() == 0 {
 		return base
 	}
 
-	updated := make(map[string]string, len(base)+len(cookies))
+	updated := make(map[string]string, len(base)+cookies.Len())
 	for name, value := range base {
 		updated[name] = value
 	}
 
-	for _, cookie := range cookies {
-		if cookie == nil || cookie.Name == "" {
+	for i := 0; i < cookies.Len(); i++ {
+		cookie := cookies.At(i)
+		if cookie.name == "" {
 			continue
 		}
-		if cookie.Value == "" || cookie.MaxAge < 0 || cookie.MaxAge == 0 {
-			delete(updated, cookie.Name)
+		if cookie.value == "" || cookie.maxAge < 0 || cookie.maxAge == 0 {
+			delete(updated, cookie.name)
 			continue
 		}
-		updated[cookie.Name] = cookie.Value
+		updated[cookie.name] = cookie.value
 	}
 	if len(updated) == 0 {
 		return nil
@@ -512,7 +768,7 @@ func applySetCookieMutations(base map[string]string, cookies []*http.Cookie) map
 
 func (h *Handler) authCacheInvalidateForSetCookieMutation(r *http.Request, clientIP string, setCookieHeaders []string) {
 	relevantCookies := parseRelevantAuthSetCookies(setCookieHeaders)
-	if len(relevantCookies) == 0 {
+	if relevantCookies.Len() == 0 {
 		return
 	}
 

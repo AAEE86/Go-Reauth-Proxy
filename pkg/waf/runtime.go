@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -25,9 +26,15 @@ var traceFallbackCounter atomic.Uint64
 type Runtime struct {
 	current         atomic.Value
 	config          atomic.Value
+	exclusions      atomic.Value
 	lastError       atomic.Value
 	events          *EventStore
 	defaultRulesDir string
+}
+
+type exclusionConfig struct {
+	disabledHosts        map[string]struct{}
+	disabledPathPrefixes []string
 }
 
 func NewRuntime(cfg models.WAFConfig, runtimeDir string) *Runtime {
@@ -36,7 +43,7 @@ func NewRuntime(cfg models.WAFConfig, runtimeDir string) *Runtime {
 		events:          NewEventStore(DefaultMaxEvents, DefaultEventTTL),
 		defaultRulesDir: defaultRulesDir,
 	}
-	rt.config.Store(NormalizeConfig(cfg, defaultRulesDir))
+	rt.storeConfig(NormalizeConfig(cfg, defaultRulesDir))
 	rt.lastError.Store("")
 	return rt
 }
@@ -47,6 +54,28 @@ func (rt *Runtime) Config() models.WAFConfig {
 	}
 	cfg, _ := rt.config.Load().(models.WAFConfig)
 	return cfg
+}
+
+func (rt *Runtime) storeConfig(cfg models.WAFConfig) {
+	if rt == nil {
+		return
+	}
+	rt.config.Store(cfg)
+	rt.exclusions.Store(buildExclusionConfig(cfg))
+}
+
+func buildExclusionConfig(cfg models.WAFConfig) exclusionConfig {
+	exclusions := exclusionConfig{
+		disabledHosts:        make(map[string]struct{}, len(cfg.DisabledHosts)),
+		disabledPathPrefixes: append([]string(nil), cfg.DisabledPathPrefixes...),
+	}
+	for _, disabledHost := range cfg.DisabledHosts {
+		host := normalizeHost(disabledHost)
+		if host != "" {
+			exclusions.disabledHosts[host] = struct{}{}
+		}
+	}
+	return exclusions
 }
 
 func (rt *Runtime) Status() Status {
@@ -87,7 +116,7 @@ func (rt *Runtime) SetConfig(cfg models.WAFConfig) (models.WAFConfig, error) {
 	}
 	if !IsActive(cfg) {
 		rt.current.Store((*CompiledRuntime)(nil))
-		rt.config.Store(cfg)
+		rt.storeConfig(cfg)
 		rt.lastError.Store("")
 		if event := logger.DebugEvent("waf", "config_set_end"); event != nil {
 			event.Bool("active", false).Send()
@@ -108,7 +137,7 @@ func (rt *Runtime) SetConfig(cfg models.WAFConfig) (models.WAFConfig, error) {
 		}
 		rt.current.Store(compiled)
 	}
-	rt.config.Store(cfg)
+	rt.storeConfig(cfg)
 	rt.lastError.Store("")
 	if event := logger.DebugEvent("waf", "config_set_end"); event != nil {
 		event.Bool("active", IsActive(cfg)).
@@ -180,7 +209,7 @@ func (rt *Runtime) Reload(cfg models.WAFConfig, bundleID string, bundlePath stri
 	}
 	if !IsActive(cfg) {
 		rt.current.Store((*CompiledRuntime)(nil))
-		rt.config.Store(cfg)
+		rt.storeConfig(cfg)
 		rt.lastError.Store("")
 		if event := logger.DebugEvent("waf", "reload_end"); event != nil {
 			status := rt.Status()
@@ -204,7 +233,7 @@ func (rt *Runtime) Reload(cfg models.WAFConfig, bundleID string, bundlePath stri
 		return rt.Status(), err
 	}
 	rt.current.Store(compiled)
-	rt.config.Store(compiled.Config)
+	rt.storeConfig(compiled.Config)
 	rt.lastError.Store("")
 	if event := logger.DebugEvent("waf", "reload_end"); event != nil {
 		status := rt.Status()
@@ -403,18 +432,32 @@ func (rt *Runtime) compiled() *CompiledRuntime {
 }
 
 func (rt *Runtime) isExcluded(r *http.Request) bool {
-	cfg := rt.Config()
-	host := normalizeHost(r.Host)
-	for _, disabledHost := range cfg.DisabledHosts {
-		if normalizeHost(disabledHost) == host {
+	exclusions := exclusionConfig{}
+	if value := rt.exclusions.Load(); value != nil {
+		exclusions, _ = value.(exclusionConfig)
+	}
+
+	hasDisabledHosts := len(exclusions.disabledHosts) > 0
+	hasDisabledPathPrefixes := len(exclusions.disabledPathPrefixes) > 0
+	if !hasDisabledHosts && !hasDisabledPathPrefixes {
+		return false
+	}
+
+	if hasDisabledHosts {
+		host := normalizeHost(r.Host)
+		if _, ok := exclusions.disabledHosts[host]; ok {
 			return true
 		}
+	}
+
+	if !hasDisabledPathPrefixes {
+		return false
 	}
 	requestPath := filepath.ToSlash(filepath.Clean(r.URL.Path))
 	if !strings.HasPrefix(requestPath, "/") {
 		requestPath = "/" + requestPath
 	}
-	for _, prefix := range cfg.DisabledPathPrefixes {
+	for _, prefix := range exclusions.disabledPathPrefixes {
 		if prefix == "/" || requestPath == prefix || strings.HasPrefix(requestPath, strings.TrimRight(prefix, "/")+"/") {
 			return true
 		}
@@ -632,19 +675,19 @@ func splitAddress(clientIP string, remoteAddr string) (string, int) {
 }
 
 func normalizeHost(host string) string {
-	host = strings.TrimSpace(strings.ToLower(host))
+	host = strings.TrimSpace(host)
 	if host == "" {
 		return ""
 	}
 	if strings.HasPrefix(host, "[") {
 		if idx := strings.LastIndex(host, "]"); idx >= 0 {
-			return host[:idx+1]
+			return lowerASCIIString(host[:idx+1])
 		}
 	}
-	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-		return strings.TrimSpace(strings.ToLower(parsedHost))
+	if idx := strings.LastIndexByte(host, ':'); idx != -1 && strings.IndexByte(host[:idx], ':') == -1 {
+		return lowerASCIIString(strings.TrimSpace(host[:idx]))
 	}
-	return host
+	return lowerASCIIString(host)
 }
 
 func normalizeStatus(status int) int {
@@ -662,7 +705,22 @@ func newTraceID() string {
 	}
 	uuid[6] = (uuid[6] & 0x0f) | 0x40
 	uuid[8] = (uuid[8] & 0x3f) | 0x80
-	return fmt.Sprintf("waf_%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:16])
+	return formatTraceID(uuid)
+}
+
+func formatTraceID(uuid [16]byte) string {
+	var buf [40]byte
+	copy(buf[:], "waf_")
+	hex.Encode(buf[4:12], uuid[0:4])
+	buf[12] = '-'
+	hex.Encode(buf[13:17], uuid[4:6])
+	buf[17] = '-'
+	hex.Encode(buf[18:22], uuid[6:8])
+	buf[22] = '-'
+	hex.Encode(buf[23:27], uuid[8:10])
+	buf[27] = '-'
+	hex.Encode(buf[28:40], uuid[10:16])
+	return string(buf[:])
 }
 
 func truncate(value string, limit int) string {

@@ -1,6 +1,7 @@
 package iptables
 
 import (
+	"encoding/json"
 	stderrors "errors"
 	"os"
 	"path/filepath"
@@ -55,11 +56,78 @@ func TestDebugLogRecordsIptablesOperationWithAdminPortRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read debug log: %v", err)
 	}
-	got := string(data)
-	if !strings.Contains(got, `"component":"iptables"`) || !strings.Contains(got, `"event":"tcp_redirect_ensure_end"`) {
-		t.Fatalf("expected iptables debug events, got %q", got)
+	events := parseDebugLogEvents(t, string(data))
+	sawComponent := false
+	sawEndEvent := false
+	sawRedactedPort := false
+	for _, event := range events {
+		if event["component"] == "iptables" {
+			sawComponent = true
+		}
+		if event["event"] == "tcp_redirect_ensure_end" {
+			sawEndEvent = true
+		}
+		if debugEventValueContains(event, "[admin-port]") {
+			sawRedactedPort = true
+		}
+		if debugEventValueContainsAdminPort(event) {
+			t.Fatalf("expected admin port fields to be redacted, got %q", string(data))
+		}
 	}
-	if !strings.Contains(got, `[admin-port]`) || strings.Contains(got, "7996") {
-		t.Fatalf("expected admin port to be redacted, got %q", got)
+	if !sawComponent || !sawEndEvent {
+		t.Fatalf("expected iptables debug events, got %q", string(data))
 	}
+	if !sawRedactedPort {
+		t.Fatalf("expected admin port redaction marker, got %q", string(data))
+	}
+}
+
+func parseDebugLogEvents(t *testing.T, raw string) []map[string]any {
+	t.Helper()
+
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	events := make([]map[string]any, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("failed to parse debug log line %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func debugEventValueContainsAdminPort(event map[string]any) bool {
+	for key, value := range event {
+		if key == "time" {
+			continue
+		}
+		if debugEventValueContains(value, "7996") {
+			return true
+		}
+	}
+	return false
+}
+
+func debugEventValueContains(value any, needle string) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.Contains(typed, needle)
+	case []any:
+		for _, item := range typed {
+			if debugEventValueContains(item, needle) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, item := range typed {
+			if debugEventValueContains(item, needle) {
+				return true
+			}
+		}
+	}
+	return false
 }

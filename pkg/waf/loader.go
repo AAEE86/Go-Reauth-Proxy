@@ -10,9 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -39,9 +37,9 @@ var (
 		"REQUEST-941-APPLICATION-ATTACK-XSS.conf":  {},
 		"REQUEST-942-APPLICATION-ATTACK-SQLI.conf": {},
 	}
-	ruleIDActionRe            = regexp.MustCompile(`(?i)\bid\s*:\s*(\d+)\b`)
-	secRuleUpdateTargetByIDRe = regexp.MustCompile(`(?i)^SecRuleUpdateTargetById\s+(\d+)\b`)
 )
+
+const secRuleUpdateTargetByIDDirective = "SecRuleUpdateTargetById"
 
 type CompiledRuntime struct {
 	Config     models.WAFConfig
@@ -292,17 +290,25 @@ func collectDefinedRuleIDs(targets []loadTarget) (map[int]struct{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
+		for start := 0; start < len(raw); {
+			end := bytes.IndexByte(raw[start:], '\n')
+			lineEnd := len(raw)
+			if end >= 0 {
+				lineEnd = start + end
+			}
+			line := bytes.TrimSpace(raw[start:lineEnd])
+			if len(line) == 0 || line[0] == '#' {
+				if end < 0 {
+					break
+				}
+				start = lineEnd + 1
 				continue
 			}
-			for _, match := range ruleIDActionRe.FindAllStringSubmatch(line, -1) {
-				id, err := strconv.Atoi(match[1])
-				if err == nil {
-					ids[id] = struct{}{}
-				}
+			collectRuleIDActionIDs(line, ids)
+			if end < 0 {
+				break
 			}
+			start = lineEnd + 1
 		}
 	}
 	return ids, nil
@@ -350,33 +356,175 @@ func (f updateTargetFilteringFS) Open(name string) (fs.File, error) {
 }
 
 func filterMissingUpdateTargetDirectives(raw []byte, definedRuleIDs map[int]struct{}) ([]byte, bool) {
-	var out strings.Builder
 	changed := false
-	for _, line := range strings.SplitAfter(string(raw), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			out.WriteString(line)
+	copyStart := 0
+	var out []byte
+	for start := 0; start < len(raw); {
+		end := bytes.IndexByte(raw[start:], '\n')
+		next := len(raw)
+		if end >= 0 {
+			next = start + end + 1
+		}
+		line := raw[start:next]
+		missingID, skip := missingUpdateTargetRuleID(line, definedRuleIDs)
+		if skip {
+			if !changed {
+				changed = true
+				out = make([]byte, 0, len(raw))
+				out = append(out, raw[:start]...)
+			} else {
+				out = append(out, raw[copyStart:start]...)
+			}
+			out = append(out, "# fn-knock skipped SecRuleUpdateTargetById "...)
+			out = append(out, missingID...)
+			out = append(out, " because the target rule is not enabled"...)
+			if len(line) > 0 && line[len(line)-1] == '\n' {
+				out = append(out, '\n')
+			}
+			copyStart = next
+		}
+		start = next
+	}
+	if !changed {
+		return raw, false
+	}
+	out = append(out, raw[copyStart:]...)
+	return out, true
+}
+
+func missingUpdateTargetRuleID(line []byte, definedRuleIDs map[int]struct{}) ([]byte, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || trimmed[0] == '#' {
+		return nil, false
+	}
+	digits, ok := parseSecRuleUpdateTargetByID(trimmed)
+	if !ok {
+		return nil, false
+	}
+	id, ok := parseRuleIDDigits(digits)
+	if !ok {
+		return nil, false
+	}
+	_, defined := definedRuleIDs[id]
+	return digits, !defined
+}
+
+func collectRuleIDActionIDs(line []byte, ids map[int]struct{}) {
+	for i := 0; i+1 < len(line); i++ {
+		if lowerASCII(line[i]) != 'i' || lowerASCII(line[i+1]) != 'd' {
 			continue
 		}
-		match := secRuleUpdateTargetByIDRe.FindStringSubmatch(trimmed)
-		if len(match) == 2 {
-			id, err := strconv.Atoi(match[1])
-			if err == nil {
-				if _, ok := definedRuleIDs[id]; !ok {
-					changed = true
-					out.WriteString("# fn-knock skipped SecRuleUpdateTargetById ")
-					out.WriteString(match[1])
-					out.WriteString(" because the target rule is not enabled")
-					if strings.HasSuffix(line, "\n") {
-						out.WriteString("\n")
-					}
-					continue
-				}
-			}
+		if i > 0 && isRegexpWordByte(line[i-1]) {
+			continue
 		}
-		out.WriteString(line)
+		j := i + 2
+		for j < len(line) && isRegexpSpace(line[j]) {
+			j++
+		}
+		if j >= len(line) || line[j] != ':' {
+			continue
+		}
+		j++
+		for j < len(line) && isRegexpSpace(line[j]) {
+			j++
+		}
+		start := j
+		for j < len(line) && isASCIIDigit(line[j]) {
+			j++
+		}
+		if start == j {
+			continue
+		}
+		if j < len(line) && isRegexpWordByte(line[j]) {
+			continue
+		}
+		if id, ok := parseRuleIDDigits(line[start:j]); ok {
+			ids[id] = struct{}{}
+		}
+		i = j
 	}
-	return []byte(out.String()), changed
+}
+
+func parseSecRuleUpdateTargetByID(line []byte) ([]byte, bool) {
+	if !equalFoldASCIIPrefixBytes(line, secRuleUpdateTargetByIDDirective) {
+		return nil, false
+	}
+	i := len(secRuleUpdateTargetByIDDirective)
+	if i >= len(line) || !isRegexpSpace(line[i]) {
+		return nil, false
+	}
+	for i < len(line) && isRegexpSpace(line[i]) {
+		i++
+	}
+	start := i
+	for i < len(line) && isASCIIDigit(line[i]) {
+		i++
+	}
+	if start == i {
+		return nil, false
+	}
+	if i < len(line) && isRegexpWordByte(line[i]) {
+		return nil, false
+	}
+	return line[start:i], true
+}
+
+func parseRuleIDDigits(raw []byte) (int, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	maxInt := int(^uint(0) >> 1)
+	id := 0
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		digit := int(c - '0')
+		if id > (maxInt-digit)/10 {
+			return 0, false
+		}
+		id = id*10 + digit
+	}
+	return id, true
+}
+
+func equalFoldASCIIPrefixBytes(value []byte, prefix string) bool {
+	if len(value) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if lowerASCII(value[i]) != lowerASCII(prefix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+func isASCIIDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func isRegexpSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\f', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+func isRegexpWordByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '_'
 }
 
 type filteredRuleFile struct {

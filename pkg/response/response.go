@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 type Response struct {
@@ -23,13 +24,19 @@ type Response struct {
 func JSON(w http.ResponseWriter, success bool, code int, message string, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	timestamp := time.Now().UnixMilli()
+	if data == nil {
+		var stack [512]byte
+		_, _ = w.Write(appendJSONResponseNoData(stack[:0], success, code, message, timestamp))
+		return
+	}
 
 	resp := Response{
 		Success:   success,
 		Code:      code,
 		Message:   message,
 		Data:      data,
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: timestamp,
 	}
 
 	_ = json.NewEncoder(w).Encode(resp)
@@ -41,6 +48,81 @@ func Success(w http.ResponseWriter, data interface{}) {
 
 func Error(w http.ResponseWriter, code int, message string) {
 	JSON(w, false, code, message, nil)
+}
+
+func appendJSONResponseNoData(buf []byte, success bool, code int, message string, timestamp int64) []byte {
+	if cap(buf) == 0 {
+		buf = make([]byte, 0, len(message)+96)
+	}
+	buf = append(buf, `{"success":`...)
+	if success {
+		buf = append(buf, "true"...)
+	} else {
+		buf = append(buf, "false"...)
+	}
+	buf = append(buf, `,"code":`...)
+	buf = strconv.AppendInt(buf, int64(code), 10)
+	buf = append(buf, `,"message":`...)
+	buf = appendJSONString(buf, message)
+	buf = append(buf, `,"data":null,"timestamp":`...)
+	buf = strconv.AppendInt(buf, timestamp, 10)
+	buf = append(buf, "}\n"...)
+	return buf
+}
+
+func appendJSONString(buf []byte, value string) []byte {
+	const hex = "0123456789abcdef"
+	buf = append(buf, '"')
+	start := 0
+	for i := 0; i < len(value); {
+		c := value[i]
+		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != '\\' && c != '"' && c != '<' && c != '>' && c != '&' {
+				i++
+				continue
+			}
+			buf = append(buf, value[start:i]...)
+			switch c {
+			case '\\', '"':
+				buf = append(buf, '\\', c)
+			case '\b':
+				buf = append(buf, '\\', 'b')
+			case '\f':
+				buf = append(buf, '\\', 'f')
+			case '\n':
+				buf = append(buf, '\\', 'n')
+			case '\r':
+				buf = append(buf, '\\', 'r')
+			case '\t':
+				buf = append(buf, '\\', 't')
+			default:
+				buf = append(buf, '\\', 'u', '0', '0', hex[c>>4], hex[c&0xf])
+			}
+			i++
+			start = i
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			buf = append(buf, value[start:i]...)
+			buf = append(buf, `\ufffd`...)
+			i += size
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			buf = append(buf, value[start:i]...)
+			buf = append(buf, '\\', 'u', '2', '0', '2', byte('8'+r-'\u2028'))
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	buf = append(buf, value[start:]...)
+	buf = append(buf, '"')
+	return buf
 }
 
 type pageData struct {

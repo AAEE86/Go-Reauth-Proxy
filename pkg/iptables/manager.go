@@ -483,23 +483,19 @@ func (m *Manager) deleteParentJumpsToChain(table string, parent string, chain st
 
 	output, err := m.runTableOutput(table, "-S", parent)
 	if err == nil {
-		for _, line := range strings.Split(output, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 4 || fields[0] != "-A" || fields[1] != parent {
-				continue
+		for start := 0; start < len(output); {
+			end := strings.IndexByte(output[start:], '\n')
+			lineEnd := len(output)
+			if end >= 0 {
+				lineEnd = start + end
 			}
-			hasJump := false
-			for index := 2; index+1 < len(fields); index++ {
-				if fields[index] == "-j" && fields[index+1] == chain {
-					hasJump = true
-					break
-				}
+			if args, ok := parentJumpDeleteArgs(output[start:lineEnd], parent, chain); ok {
+				_ = m.runTable(table, args...)
 			}
-			if !hasJump {
-				continue
+			if end < 0 {
+				break
 			}
-			args := append([]string{"-D", parent}, fields[2:]...)
-			_ = m.runTable(table, args...)
+			start = lineEnd + 1
 		}
 	}
 
@@ -1269,54 +1265,66 @@ func (m *Manager) ParseRules() ([]Rule, error) {
 			return nil, errors.New(errors.CodeIptablesParseError, fmt.Sprintf("Failed to list rules (%s): %v", table, err))
 		}
 
-		lines := strings.Split(output, "\n")
-		for _, line := range lines {
+		for start := 0; start < len(output); {
+			end := strings.IndexByte(output[start:], '\n')
+			lineEnd := len(output)
+			if end >= 0 {
+				lineEnd = start + end
+			}
+			line := output[start:lineEnd]
 			rule, ok := parseRuleLine(line)
-			if !ok {
-				continue
+			if ok && rule.IP != "0.0.0.0/0" && rule.IP != "::/0" {
+				rules = append(rules, rule)
 			}
-
-			if rule.IP == "0.0.0.0/0" || rule.IP == "::/0" {
-				continue
+			if end < 0 {
+				break
 			}
-			rules = append(rules, rule)
+			start = lineEnd + 1
 		}
 	}
 	return rules, nil
 }
 
 func parseRuleLine(line string) (Rule, bool) {
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return Rule{}, false
-	}
-
 	var ip string
 	var action string
 	var protocol string
 	var port int
 
-	for index := 0; index < len(fields); index++ {
-		field := fields[index]
-		if index+1 >= len(fields) {
-			continue
+	pendingField := ""
+	for rest := line; ; {
+		field, nextRest, ok := nextRuleField(rest)
+		if !ok {
+			break
 		}
-
+		if pendingField != "" {
+			switch pendingField {
+			case "-s":
+				ip = field
+				ip = strings.TrimSuffix(ip, "/32")
+				ip = strings.TrimSuffix(ip, "/128")
+			case "-p":
+				protocol = lowerASCIIString(field)
+			case "--dport":
+				if parsed, ok := parsePortDigits(field); ok {
+					port = parsed
+				}
+			case "-j":
+				action = field
+			}
+			pendingField = ""
+		}
 		switch field {
 		case "-s":
-			ip = fields[index+1]
-			ip = strings.TrimSuffix(ip, "/32")
-			ip = strings.TrimSuffix(ip, "/128")
+			pendingField = "-s"
 		case "-p":
-			protocol = strings.ToLower(fields[index+1])
+			pendingField = "-p"
 		case "--dport":
-			parsed, err := strconv.Atoi(fields[index+1])
-			if err == nil {
-				port = parsed
-			}
+			pendingField = "--dport"
 		case "-j":
-			action = fields[index+1]
+			pendingField = "-j"
 		}
+		rest = nextRest
 	}
 
 	if ip == "" || (action != "ACCEPT" && action != "DROP") {
@@ -1329,4 +1337,103 @@ func parseRuleLine(line string) (Rule, bool) {
 		Protocol: protocol,
 		Port:     port,
 	}, true
+}
+
+func parentJumpDeleteArgs(line string, parent string, chain string) ([]string, bool) {
+	first, rest, ok := nextRuleField(line)
+	if !ok || first != "-A" {
+		return nil, false
+	}
+	second, rest, ok := nextRuleField(rest)
+	if !ok || second != parent {
+		return nil, false
+	}
+	var stackFields [16]string
+	var extraFields []string
+	fieldCount := 0
+	previous := ""
+	hasJump := false
+	for {
+		field, nextRest, ok := nextRuleField(rest)
+		if !ok {
+			break
+		}
+		if previous == "-j" && field == chain {
+			hasJump = true
+		}
+		if fieldCount < len(stackFields) {
+			stackFields[fieldCount] = field
+		} else {
+			extraFields = append(extraFields, field)
+		}
+		fieldCount++
+		previous = field
+		rest = nextRest
+	}
+	if !hasJump {
+		return nil, false
+	}
+	args := make([]string, 0, 2+fieldCount)
+	args = append(args, "-D", parent)
+	if fieldCount <= len(stackFields) {
+		args = append(args, stackFields[:fieldCount]...)
+	} else {
+		args = append(args, stackFields[:]...)
+		args = append(args, extraFields...)
+	}
+	return args, true
+}
+
+func nextRuleField(line string) (field string, rest string, ok bool) {
+	i := 0
+	for i < len(line) && isASCIISpace(line[i]) {
+		i++
+	}
+	if i >= len(line) {
+		return "", "", false
+	}
+	start := i
+	for i < len(line) && !isASCIISpace(line[i]) {
+		i++
+	}
+	return line[start:i], line[i:], true
+}
+
+func lowerASCIIString(value string) string {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c >= 0x80 || (c >= 'A' && c <= 'Z') {
+			return strings.ToLower(value)
+		}
+	}
+	return value
+}
+
+func parsePortDigits(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	maxInt := int(^uint(0) >> 1)
+	port := 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		digit := int(c - '0')
+		if port > (maxInt-digit)/10 {
+			return 0, false
+		}
+		port = port*10 + digit
+	}
+	return port, true
+}
+
+func isASCIISpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	default:
+		return false
+	}
 }

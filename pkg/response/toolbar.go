@@ -1,12 +1,11 @@
 package response
 
 import (
-	"encoding/json"
 	"go-reauth-proxy/pkg/i18n"
 	"go-reauth-proxy/pkg/models"
 	"net/http"
-	"net/url"
 	"strings"
+	"unicode/utf8"
 )
 
 const toolbarTemplate = `
@@ -770,34 +769,34 @@ const toolbarTemplate = `
 
 const toolbarDataMarker = "__REAUTH_TOOLBAR_DATA__"
 
-type toolbarRuleData struct {
-	Path string `json:"path"`
+var (
+	toolbarTemplatePrefix string
+	toolbarTemplateSuffix string
+)
+
+func init() {
+	toolbarTemplatePrefix, toolbarTemplateSuffix, _ = strings.Cut(toolbarTemplate, toolbarDataMarker)
 }
 
-type toolbarHostRuleData struct {
-	Host    string `json:"host"`
-	Label   string `json:"label,omitempty"`
-	Favicon string `json:"favicon,omitempty"`
-}
-
-type toolbarData struct {
-	Rules       []toolbarRuleData     `json:"rules"`
-	HostRules   []toolbarHostRuleData `json:"host_rules"`
-	CurrentPath string                `json:"current_path"`
-	CurrentHost string                `json:"current_host"`
-	ShowAppIcon bool                  `json:"show_app_icon,omitempty"`
-	Labels      map[string]string     `json:"labels"`
+type toolbarLabels struct {
+	Logout             string `json:"logout"`
+	LogoutTitle        string `json:"logoutTitle"`
+	LogoutMessage      string `json:"logoutMessage"`
+	Cancel             string `json:"cancel"`
+	Confirm            string `json:"confirm"`
+	Go                 string `json:"go"`
+	NoRoutesConfigured string `json:"noRoutesConfigured"`
 }
 
 func ShouldSuppressToolbarForUserAgent(userAgent string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(userAgent))
+	normalized := strings.TrimSpace(userAgent)
 	if normalized == "" {
 		return false
 	}
 
-	return strings.Contains(normalized, "com.trim.app") ||
-		strings.Contains(normalized, "com.trim.media") ||
-		strings.Contains(normalized, "fnos")
+	return containsFoldASCIIString(normalized, "com.trim.app") ||
+		containsFoldASCIIString(normalized, "com.trim.media") ||
+		containsFoldASCIIString(normalized, "fnos")
 }
 
 func GenerateToolbar(rules []models.Rule, currentPath string) string {
@@ -813,7 +812,11 @@ func GenerateToolbarForLocale(locale string, rules []models.Rule, currentPath st
 }
 
 func GatewayPortalHostLabel(rule models.HostRule, portalConfig models.GatewayPortalConfig) string {
-	if models.NormalizeGatewayPortalConfig(portalConfig).DisplayStyle == models.GatewayPortalDisplayStyleTitle {
+	return gatewayPortalHostLabel(rule, models.NormalizeGatewayPortalConfig(portalConfig))
+}
+
+func gatewayPortalHostLabel(rule models.HostRule, normalizedPortal models.GatewayPortalConfig) string {
+	if normalizedPortal.DisplayStyle == models.GatewayPortalDisplayStyleTitle {
 		if title := strings.TrimSpace(rule.Title); title != "" {
 			return title
 		}
@@ -822,18 +825,41 @@ func GatewayPortalHostLabel(rule models.HostRule, portalConfig models.GatewayPor
 }
 
 func GatewayPortalHostFavicon(rule models.HostRule, portalConfig models.GatewayPortalConfig) string {
-	if !models.NormalizeGatewayPortalConfig(portalConfig).ShowAppIcon {
+	return gatewayPortalHostFavicon(rule, models.NormalizeGatewayPortalConfig(portalConfig))
+}
+
+func gatewayPortalHostFavicon(rule models.HostRule, normalizedPortal models.GatewayPortalConfig) string {
+	if !normalizedPortal.ShowAppIcon {
 		return ""
 	}
 	favicon := strings.TrimSpace(rule.Favicon)
-	if !strings.HasPrefix(strings.ToLower(favicon), "data:image/") {
+	if !hasFoldASCIIPrefix(favicon, "data:image/") {
 		return ""
 	}
 	return favicon
 }
 
 func normalizeToolbarHost(host string) string {
-	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	value := strings.TrimSpace(host)
+	value = strings.TrimSuffix(value, ".")
+	return lowerASCIIString(value)
+}
+
+func toolbarHostMatchesNormalized(host string, normalized string) bool {
+	value := strings.TrimSpace(host)
+	value = strings.TrimSuffix(value, ".")
+	if len(value) != len(normalized) {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] >= 0x80 || normalized[i] >= 0x80 {
+			return strings.ToLower(value) == normalized
+		}
+		if lowerASCIIByte(value[i]) != normalized[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func isToolbarNavigableTarget(rawTarget string) bool {
@@ -842,43 +868,88 @@ func isToolbarNavigableTarget(rawTarget string) bool {
 		return true
 	}
 
-	parsed, err := url.Parse(target)
-	if err != nil || parsed.Hostname() == "" {
+	scheme, rest, ok := strings.Cut(target, "://")
+	if !ok {
+		return false
+	}
+	if !equalFoldASCIIString(scheme, "http") && !equalFoldASCIIString(scheme, "https") {
 		return false
 	}
 
-	switch strings.ToLower(parsed.Scheme) {
-	case "http", "https":
-		return true
-	default:
+	host := rest
+	if idx := strings.IndexAny(host, "/?#"); idx >= 0 {
+		host = host[:idx]
+	}
+	if host == "" || strings.ContainsAny(host, " \t\r\n") {
 		return false
 	}
+	if strings.HasPrefix(host, "[") {
+		return strings.IndexByte(host, ']') > 1
+	}
+	if strings.HasPrefix(host, ":") {
+		return false
+	}
+	if strings.Contains(host, "[") || strings.Contains(host, "]") {
+		return false
+	}
+	return true
 }
 
 func filterToolbarRules(rules []models.Rule) []models.Rule {
-	filtered := make([]models.Rule, 0, len(rules))
-	for _, rule := range rules {
-		if !isToolbarNavigableTarget(rule.Target) {
+	for i, rule := range rules {
+		if isToolbarNavigableTarget(rule.Target) {
 			continue
 		}
-		filtered = append(filtered, rule)
+		filtered := make([]models.Rule, 0, len(rules)-1)
+		filtered = append(filtered, rules[:i]...)
+		for _, candidate := range rules[i+1:] {
+			if isToolbarNavigableTarget(candidate.Target) {
+				filtered = append(filtered, candidate)
+			}
+		}
+		return filtered
 	}
-	return filtered
+	return rules
 }
 
 func filterToolbarHostRules(hostRules []models.HostRule, excludedHost string) []models.HostRule {
 	normalizedExcludedHost := normalizeToolbarHost(excludedHost)
-	filtered := make([]models.HostRule, 0, len(hostRules))
-	for _, rule := range hostRules {
-		if normalizedExcludedHost != "" && normalizeToolbarHost(rule.Host) == normalizedExcludedHost {
+	for i, rule := range hostRules {
+		excluded := normalizedExcludedHost != "" && toolbarHostMatchesNormalized(rule.Host, normalizedExcludedHost)
+		if !excluded && isToolbarNavigableTarget(rule.Target) {
 			continue
 		}
-		if !isToolbarNavigableTarget(rule.Target) {
-			continue
+		filtered := make([]models.HostRule, 0, len(hostRules)-1)
+		filtered = append(filtered, hostRules[:i]...)
+		for _, candidate := range hostRules[i+1:] {
+			if normalizedExcludedHost != "" && toolbarHostMatchesNormalized(candidate.Host, normalizedExcludedHost) {
+				continue
+			}
+			if !isToolbarNavigableTarget(candidate.Target) {
+				continue
+			}
+			filtered = append(filtered, candidate)
 		}
-		filtered = append(filtered, rule)
+		return filtered
 	}
-	return filtered
+	return hostRules
+}
+
+func filterToolbarHostRulesByHost(hostRules []models.HostRule, excludedHost string) []models.HostRule {
+	normalizedExcludedHost := normalizeToolbarHost(excludedHost)
+	if normalizedExcludedHost == "" {
+		return hostRules
+	}
+
+	for i, rule := range hostRules {
+		if toolbarHostMatchesNormalized(rule.Host, normalizedExcludedHost) {
+			filtered := make([]models.HostRule, 0, len(hostRules)-1)
+			filtered = append(filtered, hostRules[:i]...)
+			filtered = append(filtered, hostRules[i+1:]...)
+			return filtered
+		}
+	}
+	return hostRules
 }
 
 func GenerateToolbarWithHosts(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
@@ -892,41 +963,172 @@ func GenerateToolbarWithHostsForRequest(r *http.Request, rules []models.Rule, ho
 func GenerateToolbarWithHostsForLocale(locale string, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
 	filteredRules := filterToolbarRules(rules)
 	filteredHostRules := filterToolbarHostRules(hostRules, excludedHost)
+	return GenerateToolbarWithPrefilteredHostsForLocale(locale, filteredRules, filteredHostRules, currentPath, currentHost, "", portalConfig)
+}
+
+func GenerateToolbarWithPrefilteredHostsForRequest(r *http.Request, filteredRules []models.Rule, filteredHostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
+	return GenerateToolbarWithPrefilteredHostsForLocale(i18n.ResolveRequestLocale(r), filteredRules, filteredHostRules, currentPath, currentHost, excludedHost, portalConfig)
+}
+
+func GenerateToolbarWithPrefilteredHostsForLocale(locale string, filteredRules []models.Rule, filteredHostRules []models.HostRule, currentPath string, currentHost string, excludedHost string, portalConfig models.GatewayPortalConfig) string {
 	normalizedPortal := models.NormalizeGatewayPortalConfig(portalConfig)
 	if !normalizedPortal.Enabled {
 		return ""
 	}
+	normalizedExcludedHost := normalizeToolbarHost(excludedHost)
 
-	data := toolbarData{
-		Rules:       make([]toolbarRuleData, 0, len(filteredRules)),
-		HostRules:   make([]toolbarHostRuleData, 0, len(filteredHostRules)),
-		CurrentPath: currentPath,
-		CurrentHost: currentHost,
-		ShowAppIcon: normalizedPortal.ShowAppIcon,
-		Labels: map[string]string{
-			"logout":             i18n.T(locale, "gateway.logout"),
-			"logoutTitle":        i18n.T(locale, "gateway.logoutConfirmTitle"),
-			"logoutMessage":      i18n.T(locale, "gateway.logoutConfirmMessage"),
-			"cancel":             i18n.T(locale, "gateway.cancel"),
-			"confirm":            i18n.T(locale, "gateway.confirm"),
-			"go":                 i18n.T(locale, "gateway.go"),
-			"noRoutesConfigured": i18n.T(locale, "gateway.noRoutesConfigured"),
-		},
+	labels := toolbarLabels{
+		Logout:             i18n.T(locale, "gateway.logout"),
+		LogoutTitle:        i18n.T(locale, "gateway.logoutConfirmTitle"),
+		LogoutMessage:      i18n.T(locale, "gateway.logoutConfirmMessage"),
+		Cancel:             i18n.T(locale, "gateway.cancel"),
+		Confirm:            i18n.T(locale, "gateway.confirm"),
+		Go:                 i18n.T(locale, "gateway.go"),
+		NoRoutesConfigured: i18n.T(locale, "gateway.noRoutesConfigured"),
 	}
-	for _, rule := range filteredRules {
-		data.Rules = append(data.Rules, toolbarRuleData{Path: rule.Path})
-	}
-	for _, rule := range filteredHostRules {
-		data.HostRules = append(data.HostRules, toolbarHostRuleData{
-			Host:    rule.Host,
-			Label:   GatewayPortalHostLabel(rule, normalizedPortal),
-			Favicon: GatewayPortalHostFavicon(rule, normalizedPortal),
-		})
-	}
+	return renderToolbarTemplateData(filteredRules, filteredHostRules, currentPath, currentHost, normalizedExcludedHost, normalizedPortal, labels)
+}
 
-	payload, err := json.Marshal(data)
-	if err != nil {
-		payload = []byte(`{"rules":[],"host_rules":[],"current_path":"","current_host":""}`)
+func renderToolbarTemplateData(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, normalizedExcludedHost string, portalConfig models.GatewayPortalConfig, labels toolbarLabels) string {
+	var b strings.Builder
+	b.Grow(len(toolbarTemplatePrefix) + estimateToolbarPayloadSize(rules, hostRules, currentPath, currentHost, normalizedExcludedHost, portalConfig, labels) + len(toolbarTemplateSuffix))
+	b.WriteString(toolbarTemplatePrefix)
+	writeToolbarPayloadJSON(&b, rules, hostRules, currentPath, currentHost, normalizedExcludedHost, portalConfig, labels)
+	b.WriteString(toolbarTemplateSuffix)
+	return b.String()
+}
+
+func writeToolbarPayloadJSON(b *strings.Builder, rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, normalizedExcludedHost string, portalConfig models.GatewayPortalConfig, labels toolbarLabels) {
+	b.WriteString(`{"rules":[`)
+	for i, rule := range rules {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"path":`)
+		writeJSONString(b, rule.Path)
+		b.WriteByte('}')
 	}
-	return strings.Replace(toolbarTemplate, toolbarDataMarker, string(payload), 1)
+	b.WriteString(`],"host_rules":[`)
+	renderedHostRules := 0
+	for _, rule := range hostRules {
+		if toolbarHostMatchesExcludedNormalized(rule.Host, normalizedExcludedHost) {
+			continue
+		}
+		if renderedHostRules > 0 {
+			b.WriteByte(',')
+		}
+		label := gatewayPortalHostLabel(rule, portalConfig)
+		favicon := gatewayPortalHostFavicon(rule, portalConfig)
+		b.WriteString(`{"host":`)
+		writeJSONString(b, rule.Host)
+		if label != "" {
+			b.WriteString(`,"label":`)
+			writeJSONString(b, label)
+		}
+		if favicon != "" {
+			b.WriteString(`,"favicon":`)
+			writeJSONString(b, favicon)
+		}
+		b.WriteByte('}')
+		renderedHostRules++
+	}
+	b.WriteString(`],"current_path":`)
+	writeJSONString(b, currentPath)
+	b.WriteString(`,"current_host":`)
+	writeJSONString(b, currentHost)
+	if portalConfig.ShowAppIcon {
+		b.WriteString(`,"show_app_icon":true`)
+	}
+	b.WriteString(`,"labels":{"logout":`)
+	writeJSONString(b, labels.Logout)
+	b.WriteString(`,"logoutTitle":`)
+	writeJSONString(b, labels.LogoutTitle)
+	b.WriteString(`,"logoutMessage":`)
+	writeJSONString(b, labels.LogoutMessage)
+	b.WriteString(`,"cancel":`)
+	writeJSONString(b, labels.Cancel)
+	b.WriteString(`,"confirm":`)
+	writeJSONString(b, labels.Confirm)
+	b.WriteString(`,"go":`)
+	writeJSONString(b, labels.Go)
+	b.WriteString(`,"noRoutesConfigured":`)
+	writeJSONString(b, labels.NoRoutesConfigured)
+	b.WriteString(`}}`)
+}
+
+func estimateToolbarPayloadSize(rules []models.Rule, hostRules []models.HostRule, currentPath string, currentHost string, normalizedExcludedHost string, portalConfig models.GatewayPortalConfig, labels toolbarLabels) int {
+	size := 192 + len(currentPath) + len(currentHost) +
+		len(labels.Logout) + len(labels.LogoutTitle) + len(labels.LogoutMessage) +
+		len(labels.Cancel) + len(labels.Confirm) + len(labels.Go) + len(labels.NoRoutesConfigured)
+	for _, rule := range rules {
+		size += len(rule.Path) + 16
+	}
+	for _, rule := range hostRules {
+		if toolbarHostMatchesExcludedNormalized(rule.Host, normalizedExcludedHost) {
+			continue
+		}
+		size += len(rule.Host) + len(rule.Title) + len(rule.Favicon) + 36
+	}
+	return size
+}
+
+func toolbarHostMatchesExcludedNormalized(host string, normalizedExcludedHost string) bool {
+	return normalizedExcludedHost != "" && toolbarHostMatchesNormalized(host, normalizedExcludedHost)
+}
+
+func writeJSONString(b *strings.Builder, value string) {
+	const hex = "0123456789abcdef"
+	b.WriteByte('"')
+	start := 0
+	for i := 0; i < len(value); {
+		c := value[i]
+		if c < utf8.RuneSelf {
+			if c >= 0x20 && c != '\\' && c != '"' && c != '<' && c != '>' && c != '&' {
+				i++
+				continue
+			}
+			b.WriteString(value[start:i])
+			switch c {
+			case '\\', '"':
+				b.WriteByte('\\')
+				b.WriteByte(c)
+			case '\b':
+				b.WriteString(`\b`)
+			case '\f':
+				b.WriteString(`\f`)
+			case '\n':
+				b.WriteString(`\n`)
+			case '\r':
+				b.WriteString(`\r`)
+			case '\t':
+				b.WriteString(`\t`)
+			default:
+				b.WriteString(`\u00`)
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&0xf])
+			}
+			i++
+			start = i
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			b.WriteString(value[start:i])
+			b.WriteString(`\ufffd`)
+			i++
+			start = i
+			continue
+		}
+		if r == '\u2028' || r == '\u2029' {
+			b.WriteString(value[start:i])
+			b.WriteString(`\u202`)
+			b.WriteByte(hex[r&0xf])
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	b.WriteString(value[start:])
+	b.WriteByte('"')
 }

@@ -73,7 +73,7 @@ func publicRequestHostHeader(r *http.Request) string {
 		return ""
 	}
 
-	if forwardedHost := firstForwardedValue(r.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+	if forwardedHost := firstForwardedValue(canonicalHeaderValue(r.Header, "X-Forwarded-Host")); forwardedHost != "" {
 		return strings.TrimSpace(forwardedHost)
 	}
 
@@ -84,6 +84,10 @@ func splitRequestHostPort(host string) (string, string) {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return "", ""
+	}
+
+	if hostname, port, ok := splitRequestHostPortFast(host); ok {
+		return hostname, port
 	}
 
 	parsed, err := url.Parse("//" + host)
@@ -97,6 +101,46 @@ func splitRequestHostPort(host string) (string, string) {
 	}
 
 	return hostname, parsed.Port()
+}
+
+func splitRequestHostPortFast(host string) (string, string, bool) {
+	if strings.ContainsAny(host, "/?#@") {
+		return "", "", false
+	}
+
+	if strings.HasPrefix(host, "[") {
+		idx := strings.LastIndexByte(host, ']')
+		if idx <= 1 {
+			return "", "", false
+		}
+		hostname := host[1:idx]
+		if hostname == "" || strings.ContainsAny(hostname, "[]") {
+			return "", "", false
+		}
+		rest := host[idx+1:]
+		if rest == "" {
+			return hostname, "", true
+		}
+		if len(rest) > 1 && rest[0] == ':' && rest[1:] == strings.TrimSpace(rest[1:]) && isValidPort(rest[1:]) {
+			return hostname, rest[1:], true
+		}
+		return "", "", false
+	}
+
+	idx := strings.IndexByte(host, ':')
+	if idx == -1 {
+		return host, "", true
+	}
+	if idx == 0 || strings.IndexByte(host[idx+1:], ':') != -1 {
+		return "", "", false
+	}
+
+	hostname := host[:idx]
+	port := host[idx+1:]
+	if hostname != strings.TrimSpace(hostname) || port == "" || port != strings.TrimSpace(port) || !isValidPort(port) {
+		return "", "", false
+	}
+	return hostname, port, true
 }
 
 func resolvedPublicPort(r *http.Request, authConfig models.AuthConfig, scheme string, requestHostPort string) string {
@@ -120,22 +164,22 @@ func publicRequestScheme(r *http.Request) string {
 		return "http"
 	}
 
-	if proto := forwardedHeaderParam(r.Header.Get("Forwarded"), "proto"); proto != "" {
+	if proto := forwardedHeaderParam(canonicalHeaderValue(r.Header, "Forwarded"), "proto"); proto != "" {
 		return proto
 	}
-	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Forwarded-Proto"))); proto != "" {
+	if proto := normalizePublicSchemeValue(firstForwardedValue(canonicalHeaderValue(r.Header, "X-Forwarded-Proto"))); proto != "" {
 		return proto
 	}
-	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Forwarded-Scheme"))); proto != "" {
+	if proto := normalizePublicSchemeValue(firstForwardedValue(canonicalHeaderValue(r.Header, "X-Forwarded-Scheme"))); proto != "" {
 		return proto
 	}
-	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Original-Proto"))); proto != "" {
+	if proto := normalizePublicSchemeValue(firstForwardedValue(canonicalHeaderValue(r.Header, "X-Original-Proto"))); proto != "" {
 		return proto
 	}
-	if proto := normalizePublicSchemeValue(firstForwardedValue(r.Header.Get("X-Original-Scheme"))); proto != "" {
+	if proto := normalizePublicSchemeValue(firstForwardedValue(canonicalHeaderValue(r.Header, "X-Original-Scheme"))); proto != "" {
 		return proto
 	}
-	if proto := cloudflareVisitorScheme(r.Header.Get("CF-Visitor")); proto != "" {
+	if proto := cloudflareVisitorScheme(canonicalHeaderValue(r.Header, "Cf-Visitor")); proto != "" {
 		return proto
 	}
 	if r.TLS != nil {
@@ -144,19 +188,38 @@ func publicRequestScheme(r *http.Request) string {
 	return "http"
 }
 
+func canonicalHeaderValue(header http.Header, key string) string {
+	if len(header) == 0 {
+		return ""
+	}
+	values := header[key]
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
 func forwardedHeaderParam(value string, key string) string {
 	first := firstForwardedValue(value)
 	if first == "" {
 		return ""
 	}
-	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.TrimSpace(key)
 	if key == "" {
 		return ""
 	}
 
-	for _, segment := range strings.Split(first, ";") {
+	for first != "" {
+		segment := first
+		if before, after, ok := strings.Cut(first, ";"); ok {
+			segment = before
+			first = after
+		} else {
+			first = ""
+		}
+
 		name, rawValue, ok := strings.Cut(segment, "=")
-		if !ok || strings.ToLower(strings.TrimSpace(name)) != key {
+		if !ok || !equalFoldASCIIString(strings.TrimSpace(name), key) {
 			continue
 		}
 		normalized := normalizePublicSchemeValue(strings.Trim(strings.TrimSpace(rawValue), `"`))
@@ -172,6 +235,9 @@ func cloudflareVisitorScheme(value string) string {
 	if value == "" {
 		return ""
 	}
+	if scheme, ok := cloudflareVisitorSchemeFast(value); ok {
+		return scheme
+	}
 
 	var visitor struct {
 		Scheme string `json:"scheme"`
@@ -182,15 +248,61 @@ func cloudflareVisitorScheme(value string) string {
 	return normalizePublicSchemeValue(visitor.Scheme)
 }
 
-func normalizePublicSchemeValue(value string) string {
-	scheme := strings.ToLower(strings.TrimSpace(value))
-	scheme = strings.TrimSuffix(scheme, ":")
-	switch scheme {
-	case "http", "https":
-		return scheme
-	default:
-		return ""
+func cloudflareVisitorSchemeFast(value string) (string, bool) {
+	const key = `"scheme"`
+	for offset := 0; offset < len(value); {
+		idx := strings.Index(value[offset:], key)
+		if idx == -1 {
+			return "", false
+		}
+
+		i := offset + idx + len(key)
+		for i < len(value) && isASCIISpace(value[i]) {
+			i++
+		}
+		if i >= len(value) || value[i] != ':' {
+			offset += idx + len(key)
+			continue
+		}
+
+		i++
+		for i < len(value) && isASCIISpace(value[i]) {
+			i++
+		}
+		if i >= len(value) || value[i] != '"' {
+			return "", false
+		}
+
+		start := i + 1
+		for i = start; i < len(value); i++ {
+			switch value[i] {
+			case '\\':
+				return "", false
+			case '"':
+				return normalizePublicSchemeValue(value[start:i]), true
+			}
+		}
+		return "", false
 	}
+	return "", false
+}
+
+func normalizePublicSchemeValue(value string) string {
+	scheme := strings.TrimSpace(value)
+	if len(scheme) > 0 && scheme[len(scheme)-1] == ':' {
+		scheme = strings.TrimSpace(scheme[:len(scheme)-1])
+	}
+	switch len(scheme) {
+	case len("http"):
+		if equalFoldASCIIString(scheme, "http") {
+			return "http"
+		}
+	case len("https"):
+		if equalFoldASCIIString(scheme, "https") {
+			return "https"
+		}
+	}
+	return ""
 }
 
 func configuredPublicPort(authConfig models.AuthConfig, scheme string) string {
@@ -213,21 +325,77 @@ func configuredPublicPort(authConfig models.AuthConfig, scheme string) string {
 }
 
 func publicPortFromAuthBaseURL(rawBaseURL string, scheme string) string {
-	baseURL, err := url.Parse(strings.TrimSpace(rawBaseURL))
-	if err != nil || baseURL == nil {
+	baseURL := strings.TrimSpace(rawBaseURL)
+	rawScheme, rest, ok := strings.Cut(baseURL, "://")
+	if !ok || rawScheme == "" || !equalFoldASCIIString(rawScheme, strings.TrimSpace(scheme)) {
 		return ""
 	}
 
-	if !strings.EqualFold(baseURL.Scheme, strings.TrimSpace(scheme)) {
+	authority := rest
+	if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+		authority = authority[:end]
+	}
+	if authority == "" {
 		return ""
 	}
-
-	port := strings.TrimSpace(baseURL.Port())
-	if !isValidPort(port) {
-		return ""
+	if userinfoEnd := strings.LastIndexByte(authority, '@'); userinfoEnd >= 0 {
+		authority = authority[userinfoEnd+1:]
+		if authority == "" {
+			return ""
+		}
 	}
 
+	port, ok, invalid := urlAuthorityPort(authority)
+	if !ok || invalid {
+		return ""
+	}
 	return port
+}
+
+func urlAuthorityPort(authority string) (string, bool, bool) {
+	if authority == "" {
+		return "", false, false
+	}
+	if authority[0] == '[' {
+		closeBracket := strings.IndexByte(authority, ']')
+		if closeBracket < 0 {
+			return "", false, true
+		}
+		if len(authority) == closeBracket+1 {
+			return "", false, false
+		}
+		if authority[closeBracket+1] != ':' {
+			return "", false, true
+		}
+		return validateURLPort(authority[closeBracket+2:])
+	}
+
+	colon := strings.LastIndexByte(authority, ':')
+	if colon < 0 {
+		return "", false, false
+	}
+	return validateURLPort(authority[colon+1:])
+}
+
+func validateURLPort(port string) (string, bool, bool) {
+	if port == "" {
+		return "", false, false
+	}
+	value := 0
+	for i := 0; i < len(port); i++ {
+		c := port[i]
+		if c < '0' || c > '9' {
+			return "", false, true
+		}
+		value = value*10 + int(c-'0')
+		if value > 65535 {
+			return "", false, true
+		}
+	}
+	if value == 0 {
+		return "", false, true
+	}
+	return port, true, false
 }
 
 func forwardedRequestPort(r *http.Request) string {
@@ -235,7 +403,7 @@ func forwardedRequestPort(r *http.Request) string {
 		return ""
 	}
 
-	value := firstForwardedValue(r.Header.Get("X-Forwarded-Port"))
+	value := firstForwardedValue(canonicalHeaderValue(r.Header, "X-Forwarded-Port"))
 	if !isValidPort(value) {
 		return ""
 	}
@@ -301,6 +469,26 @@ func defaultPortForScheme(scheme string) string {
 }
 
 func isValidPort(value string) bool {
-	port, err := strconv.Atoi(strings.TrimSpace(value))
-	return err == nil && port > 0 && port <= 65535
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if value[0] == '+' {
+		value = value[1:]
+	}
+	if value == "" || len(value) > 5 {
+		return false
+	}
+	port := 0
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+		port = port*10 + int(c-'0')
+		if port > 65535 {
+			return false
+		}
+	}
+	return port > 0
 }

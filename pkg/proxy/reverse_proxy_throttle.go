@@ -3,6 +3,7 @@ package proxy
 import (
 	"go-reauth-proxy/pkg/models"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -238,18 +239,38 @@ func normalizeClientIP(value string) string {
 }
 
 func firstForwardedClientIP(value string) string {
-	for _, part := range strings.Split(value, ",") {
+	for {
+		part, rest, found := strings.Cut(value, ",")
 		if ip := normalizeIPAddress(part); ip != "" {
 			return ip
 		}
+		if !found {
+			return ""
+		}
+		value = rest
 	}
-	return ""
 }
 
 func normalizeIPAddress(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
+	}
+
+	if isCanonicalIPv4(value) {
+		return value
+	}
+
+	if host, ok := canonicalIPv4HostPort(value); ok {
+		return host
+	}
+
+	if ip, ok := parseNetipAddrString(value); ok {
+		return ip
+	}
+
+	if addrPort, err := netip.ParseAddrPort(value); err == nil {
+		return netipAddrString(addrPort.Addr())
 	}
 
 	if ip := net.ParseIP(value); ip != nil {
@@ -275,4 +296,61 @@ func normalizeIPAddress(value string) string {
 	}
 
 	return ""
+}
+
+func isCanonicalIPv4(value string) bool {
+	octets := 0
+	start := 0
+	for i := 0; i <= len(value); i++ {
+		if i < len(value) && value[i] != '.' {
+			continue
+		}
+		if i == start || i-start > 3 {
+			return false
+		}
+		if i-start > 1 && value[start] == '0' {
+			return false
+		}
+		n := 0
+		for j := start; j < i; j++ {
+			c := value[j]
+			if c < '0' || c > '9' {
+				return false
+			}
+			n = n*10 + int(c-'0')
+		}
+		if n > 255 {
+			return false
+		}
+		octets++
+		start = i + 1
+	}
+	return octets == 4
+}
+
+func canonicalIPv4HostPort(value string) (string, bool) {
+	idx := strings.IndexByte(value, ':')
+	if idx <= 0 || strings.IndexByte(value[idx+1:], ':') != -1 {
+		return "", false
+	}
+	host := value[:idx]
+	if !isCanonicalIPv4(host) {
+		return "", false
+	}
+	return host, true
+}
+
+func parseNetipAddrString(value string) (string, bool) {
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return "", false
+	}
+	return netipAddrString(addr), true
+}
+
+func netipAddrString(addr netip.Addr) string {
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return addr.String()
 }

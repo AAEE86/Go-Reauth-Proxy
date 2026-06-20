@@ -1,12 +1,10 @@
 package response
 
 import (
-	"encoding/json"
 	"go-reauth-proxy/pkg/i18n"
 	"html/template"
 	"net/http"
 	"strconv"
-	"strings"
 )
 
 type WAFBlockPageOptions struct {
@@ -50,17 +48,8 @@ func WAFBlocked(w http.ResponseWriter, r *http.Request, opts WAFBlockPageOptions
 	if wantsJSON(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(struct {
-			Success bool   `json:"success"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			TraceID string `json:"trace_id"`
-		}{
-			Success: false,
-			Code:    "WAF_BLOCKED",
-			Message: i18n.T(locale, "gateway.wafBlockedJson"),
-			TraceID: opts.TraceID,
-		})
+		var stack [512]byte
+		_, _ = w.Write(appendWAFBlockedJSON(stack[:0], i18n.T(locale, "gateway.wafBlockedJson"), opts.TraceID))
 		return
 	}
 
@@ -81,6 +70,18 @@ func wantsJSON(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	accept := strings.ToLower(r.Header.Get("Accept"))
-	return strings.Contains(accept, "application/json") && !strings.Contains(accept, "text/html")
+	accept := r.Header.Get("Accept")
+	return containsFoldASCIIString(accept, "application/json") && !containsFoldASCIIString(accept, "text/html")
+}
+
+func appendWAFBlockedJSON(buf []byte, message string, traceID string) []byte {
+	if cap(buf) == 0 {
+		buf = make([]byte, 0, len(message)+len(traceID)+80)
+	}
+	buf = append(buf, `{"success":false,"code":"WAF_BLOCKED","message":`...)
+	buf = appendJSONString(buf, message)
+	buf = append(buf, `,"trace_id":`...)
+	buf = appendJSONString(buf, traceID)
+	buf = append(buf, "}\n"...)
+	return buf
 }
