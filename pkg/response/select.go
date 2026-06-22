@@ -18,41 +18,123 @@ var htmlFuncMap = template.FuncMap{
 		return path
 	},
 	"hostDisplayLabel": GatewayPortalHostLabel,
-	"hostFavicon":      GatewayPortalHostFavicon,
+	"hostFaviconURL": func(rule models.HostRule, portalConfig models.GatewayPortalConfig) template.URL {
+		return template.URL(GatewayPortalHostFavicon(rule, portalConfig))
+	},
 }
 
 const selectStyle = `
 <style>
   :root {
-    --background: hsl(0 0% 100%);
-    --foreground: hsl(0 0% 3.9%);
-    --card: hsl(0 0% 100%);
-    --card-foreground: hsl(0 0% 3.9%);
-    --muted: hsl(0 0% 96.1%);
-    --muted-foreground: hsl(0 0% 45.1%);
-    --border: hsl(0 0% 89.8%);
-    --ring: hsl(0 0% 3.9%);
-    --radius: 0.75rem;
+    --foreground: hsl(220 35% 13%);
+    --card: rgba(255, 255, 255, 0.74);
+    --card-strong: rgba(255, 255, 255, 0.86);
+    --muted: rgba(255, 255, 255, 0.52);
+    --muted-foreground: hsl(218 13% 42%);
+    --border: rgba(255, 255, 255, 0.72);
+    --line: rgba(32, 50, 79, 0.11);
+    --shadow: 0 22px 60px rgba(39, 55, 85, 0.14);
+    --radius: 8px;
     --destructive: hsl(0 84.2% 60.2%);
     --destructive-foreground: hsl(0 0% 98%);
-    --primary: hsl(0 0% 9%);
-    --primary-foreground: hsl(0 0% 98%);
-    --secondary: hsl(0 0% 96.1%);
-    --secondary-foreground: hsl(0 0% 9%);
+    --secondary: rgba(243, 247, 250, 0.82);
+    --secondary-foreground: hsl(220 35% 13%);
   }
 
   body.select-page {
-    background: var(--muted);
+    --page-padding-x: clamp(1rem, 4vw, 3rem);
+    --page-padding-top: clamp(1.5rem, 4vw, 4.5rem);
+    --page-padding-bottom: clamp(1.75rem, 5vw, 4.5rem);
+    background: #eef5fb;
+    color: var(--foreground);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    height: auto;
     min-height: 100vh;
+    min-height: 100dvh;
+    width: 100%;
     display: flex;
-    align-items: flex-start;
-    justify-content: center;
-    padding: 3rem 1rem;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    overflow-x: hidden;
+    padding: var(--page-padding-top) var(--page-padding-x) var(--page-padding-bottom);
+    padding-top: calc(var(--page-padding-top) + constant(safe-area-inset-top));
+    padding-right: calc(var(--page-padding-x) + constant(safe-area-inset-right));
+    padding-bottom: calc(var(--page-padding-bottom) + constant(safe-area-inset-bottom));
+    padding-left: calc(var(--page-padding-x) + constant(safe-area-inset-left));
+    padding-top: calc(var(--page-padding-top) + env(safe-area-inset-top, 0px));
+    padding-right: calc(var(--page-padding-x) + env(safe-area-inset-right, 0px));
+    padding-bottom: calc(var(--page-padding-bottom) + env(safe-area-inset-bottom, 0px));
+    padding-left: calc(var(--page-padding-x) + env(safe-area-inset-left, 0px));
+    position: relative;
+    isolation: isolate;
+  }
+
+  body.select-page::before {
+    content: "";
+    position: fixed;
+    inset: -18vmax;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      linear-gradient(118deg,
+        rgba(87, 172, 236, 0.92) 0%,
+        rgba(126, 224, 188, 0.88) 29%,
+        rgba(255, 205, 154, 0.86) 55%,
+        rgba(205, 187, 255, 0.78) 78%,
+        rgba(95, 201, 224, 0.9) 100%);
+    background-size: 220% 220%;
+    filter: blur(46px) saturate(1.12);
+    opacity: 0.9;
+    transform: translate3d(0, 0, 0) scale(1.02);
+    animation: selectGradientShift 18s ease-in-out infinite alternate;
+  }
+
+  body.select-page::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      linear-gradient(180deg,
+        rgba(255, 255, 255, 0.8) 0%,
+        rgba(255, 255, 255, 0.58) 45%,
+        rgba(255, 255, 255, 0.76) 100%);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+
+  @keyframes selectGradientShift {
+    0% {
+      background-position: 0% 35%;
+      transform: translate3d(-1.5%, -1%, 0) scale(1.02);
+    }
+    50% {
+      background-position: 85% 55%;
+    }
+    100% {
+      background-position: 100% 68%;
+      transform: translate3d(1.5%, 1%, 0) scale(1.05);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    body.select-page::before {
+      animation: none;
+    }
   }
 
   .select-container {
+    position: relative;
+    z-index: 1;
     width: 100%;
-    max-width: 640px;
+    max-width: 1180px;
+    margin: 0 auto;
+    min-height: 0;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
   }
 
   /* Header card */
@@ -60,9 +142,11 @@ const selectStyle = `
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 2rem;
-    margin-bottom: 1.5rem;
-    box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.04);
+    padding: clamp(1.25rem, 3vw, 2rem);
+    margin-bottom: 1rem;
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
   }
   .header-top {
     display: flex;
@@ -70,9 +154,29 @@ const selectStyle = `
     justify-content: space-between;
     gap: 1rem;
   }
+  .header-brand {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 1rem;
+  }
+  .header-logo {
+    width: 52px;
+    height: 52px;
+    border-radius: var(--radius);
+    flex-shrink: 0;
+    box-shadow: 0 10px 24px rgba(39, 55, 85, 0.12);
+  }
+  .header-kicker {
+    margin-bottom: 0.25rem;
+    color: hsl(205 38% 33%);
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
   .header-title {
     font-size: 1.75rem;
-    letter-spacing: -0.025em;
     color: var(--foreground);
     line-height: 1.2;
     margin: 0;
@@ -82,6 +186,7 @@ const selectStyle = `
     color: var(--muted-foreground);
     margin-top: 0.5rem;
     line-height: 1.5;
+    max-width: 42rem;
   }
 
   /* Logout button */
@@ -94,7 +199,7 @@ const selectStyle = `
     font-weight: 500;
     border-radius: calc(var(--radius) - 2px);
     border: 1px solid var(--border);
-    background: var(--card);
+    background: var(--card-strong);
     color: var(--muted-foreground);
     cursor: pointer;
     transition: all 0.15s ease;
@@ -103,9 +208,10 @@ const selectStyle = `
     line-height: 1.5;
   }
   .btn-logout:hover {
-    background: var(--muted);
+    background: rgba(255, 255, 255, 0.96);
     color: var(--foreground);
-    border-color: hsl(0 0% 80%);
+    border-color: rgba(32, 50, 79, 0.18);
+    box-shadow: 0 10px 24px rgba(39, 55, 85, 0.1);
   }
   .btn-logout svg {
     width: 14px;
@@ -115,45 +221,66 @@ const selectStyle = `
 
   /* Route cards */
   .routes-grid {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 17.5rem), 1fr));
+    gap: 1rem;
+    align-items: stretch;
   }
 
   .route-card {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 1rem;
-    padding: 1.25rem 1.5rem;
+    min-height: 7.5rem;
+    padding: 1.125rem;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     text-decoration: none;
     color: inherit;
     transition: all 0.2s ease;
-    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.03);
+    box-shadow: 0 14px 34px rgba(39, 55, 85, 0.1);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
   }
   .route-card:hover {
-    border-color: hsl(0 0% 78%);
-    box-shadow: 0 4px 12px 0 rgb(0 0 0 / 0.08);
-    transform: translateY(-1px);
+    background: rgba(255, 255, 255, 0.9);
+    border-color: rgba(32, 50, 79, 0.17);
+    box-shadow: 0 20px 42px rgba(39, 55, 85, 0.16);
+    transform: translateY(-2px);
   }
   .route-main {
     display: flex;
+    flex: 1 1 auto;
     min-width: 0;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.875rem;
   }
-  .route-icon {
-    width: 34px;
-    height: 34px;
+  .route-icon-shell {
+    width: 42px;
+    height: 42px;
     flex-shrink: 0;
-    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: rgba(255, 255, 255, 0.62);
+  }
+  .route-icon-img {
+    width: 100%;
+    height: 100%;
+    padding: 5px;
     object-fit: contain;
-    background: var(--muted);
+  }
+  .route-icon-fallback {
+    width: 20px;
+    height: 20px;
+    color: hsl(205 32% 34%);
   }
   .route-copy {
+    flex: 1 1 auto;
     min-width: 0;
   }
   .route-path {
@@ -161,10 +288,13 @@ const selectStyle = `
     font-weight: 600;
     color: var(--foreground);
     margin-bottom: 0.25rem;
+    overflow-wrap: anywhere;
   }
   .route-target {
     font-size: 0.8125rem;
     color: var(--muted-foreground);
+    line-height: 1.45;
+    overflow-wrap: anywhere;
   }
   .route-arrow {
     color: var(--muted-foreground);
@@ -185,6 +315,9 @@ const selectStyle = `
     text-align: center;
     color: var(--muted-foreground);
     font-size: 0.875rem;
+    box-shadow: var(--shadow);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
   }
   .empty-icon {
     width: 48px;
@@ -196,15 +329,15 @@ const selectStyle = `
   /* Footer */
   .select-footer {
     text-align: center;
-    margin-top: 2rem;
-    padding-top: 1.5rem;
+    margin-top: auto;
+    padding-top: 2rem;
   }
   .select-footer p {
     font-size: 0.75rem;
-    color: var(--muted-foreground);
+    color: hsl(218 13% 38%);
   }
   .select-footer a {
-    color: hsl(0 0% 40%);
+    color: hsl(205 35% 30%);
     text-decoration: none;
     transition: color 0.15s;
   }
@@ -232,7 +365,7 @@ const selectStyle = `
     pointer-events: auto;
   }
   .modal-content {
-    background-color: var(--card);
+    background-color: rgba(255, 255, 255, 0.94);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 1.5rem;
@@ -289,9 +422,17 @@ const selectStyle = `
     background: hsl(0 84.2% 55%);
   }
 
+  @media (min-width: 860px) {
+    .routes-grid {
+      grid-template-columns: repeat(auto-fit, minmax(18.5rem, 1fr));
+    }
+  }
+
   @media (max-width: 480px) {
     body.select-page {
-      padding: 1.5rem 0.75rem;
+      --page-padding-x: 0.75rem;
+      --page-padding-top: 1.5rem;
+      --page-padding-bottom: 1.25rem;
     }
     .header-card {
       padding: 1.25rem;
@@ -300,11 +441,23 @@ const selectStyle = `
       flex-direction: column;
       gap: 0.75rem;
     }
+    .header-brand {
+      align-items: flex-start;
+    }
+    .header-logo {
+      width: 44px;
+      height: 44px;
+    }
     .header-title {
       font-size: 1.375rem;
     }
+    .btn-logout {
+      width: 100%;
+      justify-content: center;
+    }
     .route-card {
       padding: 1rem 1.25rem;
+      min-height: auto;
     }
     .modal-content {
       margin: 0 1rem;
@@ -319,12 +472,13 @@ const selectContent = `
 <div class="select-container">
 	<div class="header-card">
 		<div class="header-top">
-			<div style="display:flex;align-items:center;gap:1rem;">
-				<img src="/android-chrome-512x512.png" alt="Logo" style="width:50px;height:50px;border-radius:8px;flex-shrink:0;">
+			<div class="header-brand">
+				<img class="header-logo" src="/android-chrome-512x512.png" alt="Logo">
 				<div>
-				<h1 class="header-title">Go Reauth Proxy</h1>
-				<p class="header-desc">{{index .Labels "selectDescription"}}</p>
-			</div>
+					<div class="header-kicker">{{.Title}}</div>
+					<h1 class="header-title">Go Reauth Proxy</h1>
+					<p class="header-desc">{{index .Labels "selectDescription"}}</p>
+				</div>
 			</div>
 			<button onclick="document.getElementById('logout-modal').classList.add('active')" class="btn-logout">
 				<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -342,8 +496,17 @@ const selectContent = `
 			{{range .HostRules}}
 			<a href="/" data-host="{{.Host}}" class="route-card host-route-card">
 				<div class="route-main">
-					{{with hostFavicon . $.GatewayPortal}}
-					<img class="route-icon" src="{{.}}" alt="">
+					{{with hostFaviconURL . $.GatewayPortal}}
+					<span class="route-icon-shell"><img class="route-icon-img" src="{{.}}" alt=""></span>
+					{{else}}
+					<span class="route-icon-shell">
+						<svg class="route-icon-fallback" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+							<circle cx="12" cy="12" r="10"/>
+							<path d="M2 12h20"/>
+							<path d="M12 2a15.3 15.3 0 0 1 0 20"/>
+							<path d="M12 2a15.3 15.3 0 0 0 0 20"/>
+						</svg>
+					</span>
 					{{end}}
 					<div class="route-copy">
 					<div class="route-path">{{hostDisplayLabel . $.GatewayPortal}}</div>
@@ -358,9 +521,17 @@ const selectContent = `
 		{{else if .Rules}}
 			{{range .Rules}}
 			<a href="{{ensureSlash .Path}}" class="route-card">
-				<div>
+				<div class="route-main">
+					<span class="route-icon-shell">
+						<svg class="route-icon-fallback" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+							<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+							<path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+						</svg>
+					</span>
+					<div class="route-copy">
 					<div class="route-path">{{.Path}}</div>
 					<div class="route-target">{{.Target}}</div>
+					</div>
 				</div>
 				<svg class="route-arrow" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<polyline points="9 18 15 12 9 6"/>

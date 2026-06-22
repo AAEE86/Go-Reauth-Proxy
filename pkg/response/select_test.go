@@ -91,3 +91,25 @@ func TestSelectPageFiltersWebSocketPathRules(t *testing.T) {
 		t.Fatalf("select page included WebSocket path rule: %s", body)
 	}
 }
+
+func TestSelectPageRendersConfiguredHostFavicon(t *testing.T) {
+	const icon = "data:image/png;base64,AAAA"
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.example.com/__select__", nil)
+	rec := httptest.NewRecorder()
+
+	SelectPage(
+		rec,
+		req,
+		nil,
+		[]models.HostRule{{Host: "app.example.com", Target: "https://127.0.0.1:3000", Favicon: icon}},
+		models.GatewayPortalConfig{DisplayStyle: models.GatewayPortalDisplayStyleTitle, ShowAppIcon: true},
+	)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `class="route-icon-img" src="`+icon+`"`) {
+		t.Fatalf("select page did not render configured host favicon: %s", body)
+	}
+	if strings.Contains(body, "#ZgotmplZ") {
+		t.Fatalf("select page rendered sanitized placeholder instead of favicon: %s", body)
+	}
+}
