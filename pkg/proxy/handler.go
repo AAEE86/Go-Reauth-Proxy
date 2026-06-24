@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"go-reauth-proxy/pkg/config"
@@ -112,15 +113,33 @@ type reverseProxyTargetRuntime struct {
 }
 
 type preflightDecision struct {
-	deny             bool
-	redirectLocation string
+	deny               bool
+	redirectLocation   string
+	accessDeniedReason string
+	credentialIdentity authCredentialIdentity
+}
+
+type authCredentialIdentity struct {
+	credentialID     string
+	credentialName   string
+	credentialMethod string
+	linkedTOTPID     string
+	linkedTOTPName   string
+}
+
+func (identity authCredentialIdentity) hasCredential() bool {
+	return strings.TrimSpace(identity.credentialID) != "" ||
+		strings.TrimSpace(identity.linkedTOTPID) != ""
 }
 
 type authCheckResult struct {
-	allowed         bool
-	authenticated   bool
-	suppressToolbar bool
-	decision        string
+	allowed               bool
+	authenticated         bool
+	suppressToolbar       bool
+	decision              string
+	subdomainAccessCustom bool
+	allowedSubdomainHosts map[string]struct{}
+	credentialIdentity    authCredentialIdentity
 }
 
 func debugProxyEvent(eventName string, requestID string) *zerolog.Event {
@@ -418,10 +437,103 @@ const localServiceURLPrefix = "http://127.0.0.1:"
 const localServiceHostPrefix = "127.0.0.1:"
 
 const (
-	internalPreflightHeader  = "X-Reauth-Internal-Preflight"
-	preflightTimeout         = 1200 * time.Millisecond
-	preflightFailureCooldown = 3 * time.Second
+	internalPreflightHeader           = "X-Reauth-Internal-Preflight"
+	reauthAccessDeniedHeader          = "X-Reauth-Access-Denied"
+	reauthScopeDeniedReason           = "scope"
+	reauthSubdomainAccessHeader       = "X-Reauth-Subdomain-Access"
+	reauthAllowedSubdomainHostsHeader = "X-Reauth-Allowed-Subdomain-Hosts"
+	reauthCredentialIDHeader          = "X-Reauth-Credential-Id"
+	reauthCredentialNameHeader        = "X-Reauth-Credential-Name"
+	reauthCredentialMethodHeader      = "X-Reauth-Credential-Method"
+	reauthLinkedTOTPIDHeader          = "X-Reauth-Linked-Totp-Id"
+	reauthLinkedTOTPNameHeader        = "X-Reauth-Linked-Totp-Name"
+	reauthSubdomainAccessCustom       = "custom"
+	reauthCredentialHeaderB64Prefix   = "b64:"
+	maxReauthCredentialHeaderRunes    = 256
+	preflightTimeout                  = 1200 * time.Millisecond
+	preflightFailureCooldown          = 3 * time.Second
 )
+
+func normalizeReauthAccessDeniedReason(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), reauthScopeDeniedReason) {
+		return reauthScopeDeniedReason
+	}
+	return ""
+}
+
+func parseAllowedSubdomainHosts(headers http.Header) (bool, map[string]struct{}) {
+	if !strings.EqualFold(strings.TrimSpace(headers.Get(reauthSubdomainAccessHeader)), reauthSubdomainAccessCustom) {
+		return false, nil
+	}
+	allowed := make(map[string]struct{})
+	for _, rawValue := range headers.Values(reauthAllowedSubdomainHostsHeader) {
+		for _, rawHost := range strings.Split(rawValue, ",") {
+			host := normalizeRequestHost(rawHost)
+			if host == "" {
+				continue
+			}
+			allowed[host] = struct{}{}
+		}
+	}
+	return true, allowed
+}
+
+func reauthHeaderValue(headers http.Header, name string) string {
+	return truncateRunes(decodeReauthHeaderValue(strings.TrimSpace(headers.Get(name))), maxReauthCredentialHeaderRunes)
+}
+
+func decodeReauthHeaderValue(value string) string {
+	encoded, ok := strings.CutPrefix(value, reauthCredentialHeaderB64Prefix)
+	if !ok {
+		return value
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(encoded)
+	}
+	if err != nil {
+		return ""
+	}
+	return string(decoded)
+}
+
+func truncateRunes(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	count := 0
+	for index := range value {
+		if count == maxRunes {
+			return value[:index]
+		}
+		count++
+	}
+	return value
+}
+
+func parseAuthCredentialIdentity(headers http.Header) authCredentialIdentity {
+	return authCredentialIdentity{
+		credentialID:     reauthHeaderValue(headers, reauthCredentialIDHeader),
+		credentialName:   reauthHeaderValue(headers, reauthCredentialNameHeader),
+		credentialMethod: reauthHeaderValue(headers, reauthCredentialMethodHeader),
+		linkedTOTPID:     reauthHeaderValue(headers, reauthLinkedTOTPIDHeader),
+		linkedTOTPName:   reauthHeaderValue(headers, reauthLinkedTOTPNameHeader),
+	}
+}
+
+func applyAuthCredentialIdentityToLogEntry(entry *gatewaylog.Entry, identity authCredentialIdentity) {
+	entry.AuthCredentialID = identity.credentialID
+	entry.AuthCredentialName = identity.credentialName
+	entry.AuthCredentialMethod = identity.credentialMethod
+	entry.AuthLinkedTOTPID = identity.linkedTOTPID
+	entry.AuthLinkedTOTPName = identity.linkedTOTPName
+}
+
+func applyAuthResultToLogEntry(entry *gatewaylog.Entry, result authCheckResult) {
+	entry.LoggedIn = result.authenticated
+	entry.AuthDecision = result.decision
+	applyAuthCredentialIdentityToLogEntry(entry, result.credentialIdentity)
+}
 
 func localServiceBaseURL(port int) string {
 	var stack [len(localServiceURLPrefix) + 20]byte
@@ -747,8 +859,10 @@ func (h *Handler) performPreflight(r *http.Request, authConfig models.AuthConfig
 	defer resp.Body.Close()
 
 	decision := preflightDecision{
-		deny: strings.EqualFold(resp.Header.Get("X-Option"), "deny"),
+		deny:               strings.EqualFold(resp.Header.Get("X-Option"), "deny"),
+		credentialIdentity: parseAuthCredentialIdentity(resp.Header),
 	}
+	decision.accessDeniedReason = normalizeReauthAccessDeniedReason(resp.Header.Get(reauthAccessDeniedHeader))
 	if location := strings.TrimSpace(resp.Header.Get("X-Reauth-Redirect-Location")); location != "" {
 		if strings.HasPrefix(location, "/") || strings.HasPrefix(location, "http://") || strings.HasPrefix(location, "https://") {
 			decision.redirectLocation = location
@@ -757,6 +871,7 @@ func (h *Handler) performPreflight(r *http.Request, authConfig models.AuthConfig
 	if event := debugProxyEvent("preflight_request_end", requestID); event != nil {
 		event.Int("status", resp.StatusCode).
 			Bool("deny", decision.deny).
+			Str("access_denied_reason", logger.SanitizeLogString(decision.accessDeniedReason)).
 			Str("redirect_location", logger.SanitizeURL(decision.redirectLocation)).
 			Int64("duration_ms", time.Since(start).Milliseconds()).
 			Interface("response_headers", logger.SanitizeHeader(resp.Header)).
@@ -2056,11 +2171,11 @@ func (h *Handler) GetLogDates() (gatewaylog.DatesResult, error) {
 	return h.gatewayLogManager.GetDates()
 }
 
-func (h *Handler) QueryLogEntries(date string, page int, limit int, search string, status string, loggedIn string, cursor string, pagination string) (gatewaylog.QueryResult, error) {
+func (h *Handler) QueryLogEntries(date string, page int, limit int, search string, status string, loggedIn string, credential string, cursor string, pagination string) (gatewaylog.QueryResult, error) {
 	if h.gatewayLogManager == nil {
 		return gatewaylog.QueryResult{}, nil
 	}
-	return h.gatewayLogManager.Query(date, page, limit, search, status, loggedIn, cursor, pagination)
+	return h.gatewayLogManager.Query(date, page, limit, search, status, loggedIn, credential, cursor, pagination)
 }
 
 func (h *Handler) DeleteLogDate(date string) (gatewaylog.DeleteResult, error) {
@@ -3620,6 +3735,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	accessEntry.Matched = isMatch
 	accessEntry.AccessMode = accessMode
 	preflight := h.runPreflight(r, snapshot.authConfig, clientIP, isMatch, accessMode, requestID)
+	if preflight.accessDeniedReason != "" {
+		if isAuthRoute {
+			if event := debugProxyEvent("preflight_access_denied_ignored_auth_route", requestID); event != nil {
+				event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+					Str("reason", logger.SanitizeLogString(preflight.accessDeniedReason)).
+					Str("path", logger.SanitizeLogString(r.URL.Path)).
+					Send()
+			}
+		} else {
+			accessEntry.RouteType = "preflight"
+			accessEntry.AuthDecision = "access_denied"
+			accessEntry.LoggedIn = preflight.credentialIdentity.hasCredential()
+			applyAuthCredentialIdentityToLogEntry(&accessEntry, preflight.credentialIdentity)
+			loggedStatusCode = http.StatusForbidden
+			if event := debugProxyEvent("preflight_access_denied", requestID); event != nil {
+				event.Str("client_ip", logger.SanitizeLogString(clientIP)).
+					Str("reason", logger.SanitizeLogString(preflight.accessDeniedReason)).
+					Str("credential_id", logger.SanitizeLogString(preflight.credentialIdentity.credentialID)).
+					Str("linked_totp_id", logger.SanitizeLogString(preflight.credentialIdentity.linkedTOTPID)).
+					Bool("matched", isMatch).
+					Str("access_mode", accessMode).
+					Send()
+			}
+			response.AccessDenied(w, r)
+			return
+		}
+	}
 	if preflight.deny {
 		accessEntry.RouteType = "preflight"
 		accessEntry.AuthDecision = "denied"
@@ -3669,8 +3811,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessEntry.RouteKey = r.URL.Path
 		accessEntry.AuthRequired = snapshot.authConfig.AuthURL != ""
 		authResult := h.handleSelectRoute(w, r, snapshot, clientIP, requestID)
-		accessEntry.LoggedIn = authResult.authenticated
-		accessEntry.AuthDecision = authResult.decision
+		applyAuthResultToLogEntry(&accessEntry, authResult)
 		if event := debugProxyEvent("select_route_served", requestID); event != nil {
 			event.Bool("auth_required", accessEntry.AuthRequired).
 				Bool("authenticated", authResult.authenticated).
@@ -3716,8 +3857,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		authResult := authCheckResult{allowed: true, decision: "not_required"}
 		if accessEntry.AuthRequired {
 			authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, matchedHostRule.AccessMode, authUpstreamTarget, requestID)
-			accessEntry.LoggedIn = authResult.authenticated
-			accessEntry.AuthDecision = authResult.decision
+			applyAuthResultToLogEntry(&accessEntry, authResult)
 			if !authResult.allowed {
 				if authResult.decision == "denied" {
 					loggedStatusCode = 499
@@ -3731,11 +3871,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else if !matchedHostRule.SuppressToolbar && snapshotReverseProxyTargetSupportsHTMLFeatures(snapshot, toolbarProbeTarget) && shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
 			authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
-			accessEntry.AuthDecision = authResult.decision
+			applyAuthResultToLogEntry(&accessEntry, authResult)
 		} else {
 			accessEntry.AuthDecision = authResult.decision
 		}
-		accessEntry.LoggedIn = authResult.authenticated
+		applyAuthResultToLogEntry(&accessEntry, authResult)
 		if matchedHostLocation != nil {
 			if event := debugProxyEvent("host_location_selected", requestID); event != nil {
 				event.Str("route_key", logger.SanitizeLogString(hostLocationRouteKey(matchedHostRule, matchedHostLocation))).
@@ -3797,8 +3937,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authResult := authCheckResult{allowed: true, decision: "not_required"}
 	if accessEntry.AuthRequired {
 		authResult = h.checkAuth(w, r, snapshot.authConfig, clientIP, "", matchedRule.Target, requestID)
-		accessEntry.LoggedIn = authResult.authenticated
-		accessEntry.AuthDecision = authResult.decision
+		applyAuthResultToLogEntry(&accessEntry, authResult)
 		if !authResult.allowed {
 			if authResult.decision == "denied" {
 				loggedStatusCode = 499
@@ -3812,11 +3951,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if snapshotReverseProxyTargetSupportsHTMLFeatures(snapshot, matchedRule.Target) && shouldProbeAuthForToolbar(r, snapshot.authConfig, snapshot.gatewayPortal) {
 		authResult = h.checkAuthForToolbar(w, r, snapshot.authConfig, clientIP, requestID)
-		accessEntry.AuthDecision = authResult.decision
+		applyAuthResultToLogEntry(&accessEntry, authResult)
 	} else {
 		accessEntry.AuthDecision = authResult.decision
 	}
-	accessEntry.LoggedIn = authResult.authenticated
+	applyAuthResultToLogEntry(&accessEntry, authResult)
 	if event := debugProxyEvent("path_rule_selected", requestID); event != nil {
 		event.Str("path_rule", logger.SanitizeLogString(matchedRule.Path)).
 			Str("upstream", logger.SanitizeURL(matchedRule.Target)).
@@ -3828,13 +3967,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxyToRuleTarget(w, r, snapshot, *matchedRule, clientIP, authResult, requestID)
 }
 
+func filterSelectHostRulesByAuthScope(hostRules []models.HostRule, authResult authCheckResult) []models.HostRule {
+	if !authResult.subdomainAccessCustom {
+		return hostRules
+	}
+	if len(hostRules) == 0 || len(authResult.allowedSubdomainHosts) == 0 {
+		return nil
+	}
+	filtered := make([]models.HostRule, 0, len(hostRules))
+	for _, rule := range hostRules {
+		host := normalizeRequestHost(rule.Host)
+		if host == "" {
+			continue
+		}
+		if _, ok := authResult.allowedSubdomainHosts[host]; ok {
+			filtered = append(filtered, rule)
+		}
+	}
+	return filtered
+}
+
 func (h *Handler) handleSelectRoute(w http.ResponseWriter, r *http.Request, snapshot requestSnapshot, clientIP string, requestID string) authCheckResult {
 	if snapshot.authConfig.AuthURL != "" {
 		authResult := h.checkAuth(w, r, snapshot.authConfig, clientIP, "", "", requestID)
 		if !authResult.allowed {
 			return authResult
 		}
-		response.SelectPageWithPrefilteredRoutes(w, r, snapshot.toolbarRules, snapshot.toolbarHostRules, snapshot.gatewayPortal)
+		response.SelectPageWithPrefilteredRoutes(
+			w,
+			r,
+			snapshot.toolbarRules,
+			filterSelectHostRulesByAuthScope(snapshot.toolbarHostRules, authResult),
+			snapshot.gatewayPortal,
+		)
 		return authResult
 	}
 	response.SelectPageWithPrefilteredRoutes(w, r, snapshot.toolbarRules, snapshot.toolbarHostRules, snapshot.gatewayPortal)
@@ -4840,11 +5005,12 @@ type authCheckErrorPage struct {
 }
 
 type authCheckPlan struct {
-	result           authCheckResult
-	setCookies       []string
-	redirectLocation string
-	abortConnection  bool
-	errorPage        *authCheckErrorPage
+	result             authCheckResult
+	setCookies         []string
+	redirectLocation   string
+	abortConnection    bool
+	accessDeniedReason string
+	errorPage          *authCheckErrorPage
 }
 
 type authCheckExecution struct {
@@ -4977,11 +5143,18 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 		}
 	}
 	if authResponse.Success {
+		subdomainAccessCustom, allowedSubdomainHosts := parseAllowedSubdomainHosts(resp.Header)
+		credentialIdentity := parseAuthCredentialIdentity(resp.Header)
 		if event := debugProxyEvent("auth_check_end", requestID); event != nil {
 			event.Int("status", resp.StatusCode).
 				Bool("success", true).
 				Str("decision", "passed").
+				Str("credential_method", logger.SanitizeLogString(credentialIdentity.credentialMethod)).
+				Str("credential_id", logger.SanitizeLogString(credentialIdentity.credentialID)).
+				Str("linked_totp_id", logger.SanitizeLogString(credentialIdentity.linkedTOTPID)).
 				Bool("suppress_toolbar", strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share")).
+				Bool("subdomain_access_custom", subdomainAccessCustom).
+				Int("allowed_subdomain_hosts", len(allowedSubdomainHosts)).
 				Int("set_cookie_count", len(setCookies)).
 				Int64("duration_ms", time.Since(start).Milliseconds()).
 				Interface("response_headers", logger.SanitizeHeader(resp.Header)).
@@ -4989,15 +5162,38 @@ func (h *Handler) performAuthCheck(r *http.Request, authConfig models.AuthConfig
 		}
 		return authCheckPlan{
 			result: authCheckResult{
-				allowed:         true,
-				authenticated:   true,
-				suppressToolbar: strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share"),
-				decision:        "passed",
+				allowed:               true,
+				authenticated:         true,
+				suppressToolbar:       strings.EqualFold(resp.Header.Get("X-Reauth-Access-Mode"), "fnos-share"),
+				decision:              "passed",
+				subdomainAccessCustom: subdomainAccessCustom,
+				allowedSubdomainHosts: allowedSubdomainHosts,
+				credentialIdentity:    credentialIdentity,
 			},
 			setCookies: setCookies,
 		}
 	}
 	log.Printf("Auth failed: %s", authResponse.Message)
+	if accessDeniedReason := normalizeReauthAccessDeniedReason(resp.Header.Get(reauthAccessDeniedHeader)); accessDeniedReason != "" {
+		credentialIdentity := parseAuthCredentialIdentity(resp.Header)
+		if event := debugProxyEvent("auth_check_end", requestID); event != nil {
+			event.Int("status", resp.StatusCode).
+				Bool("success", false).
+				Str("decision", "access_denied").
+				Str("reason", logger.SanitizeLogString(accessDeniedReason)).
+				Str("credential_id", logger.SanitizeLogString(credentialIdentity.credentialID)).
+				Str("linked_totp_id", logger.SanitizeLogString(credentialIdentity.linkedTOTPID)).
+				Str("message", logger.SanitizeLogString(authResponse.Message)).
+				Int("set_cookie_count", len(setCookies)).
+				Int64("duration_ms", time.Since(start).Milliseconds()).
+				Send()
+		}
+		return authCheckPlan{
+			result:             authCheckResult{authenticated: credentialIdentity.hasCredential(), decision: "access_denied", credentialIdentity: credentialIdentity},
+			setCookies:         setCookies,
+			accessDeniedReason: accessDeniedReason,
+		}
+	}
 	if accessMode == "strict_whitelist" {
 		if event := debugProxyEvent("auth_check_end", requestID); event != nil {
 			event.Int("status", resp.StatusCode).
@@ -5084,6 +5280,11 @@ func (h *Handler) applyAuthCheckPlan(w http.ResponseWriter, r *http.Request, pla
 
 	if plan.result.allowed {
 		h.markLoggedInActive(r, clientIP, time.Now())
+		return plan.result
+	}
+
+	if plan.accessDeniedReason != "" || plan.result.decision == "access_denied" {
+		response.AccessDenied(w, r)
 		return plan.result
 	}
 

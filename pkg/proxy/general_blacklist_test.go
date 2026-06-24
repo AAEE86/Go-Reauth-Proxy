@@ -164,7 +164,7 @@ func TestGeneralBlacklistBlockedRequestIsLogged(t *testing.T) {
 
 	handler.ServeHTTP(rec, req)
 
-	result, err := handler.QueryLogEntries("", 1, 20, "general_blacklist_blocked", "", "", "", "page")
+	result, err := handler.QueryLogEntries("", 1, 20, "general_blacklist_blocked", "", "", "", "", "page")
 	if err != nil {
 		t.Fatalf("QueryLogEntries failed: %v", err)
 	}

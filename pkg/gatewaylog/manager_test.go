@@ -88,7 +88,7 @@ func makeSparseStatusLogEntries(count int) []Entry {
 
 func TestQueryEntriesStreamingReturnsLatestPageInOnePassWindow(t *testing.T) {
 	logPath := writeLogEntries(t, makeLogEntries(30))
-	filter, err := newQueryFilter("", "", "")
+	filter, err := newQueryFilter("", "", "", "")
 	if err != nil {
 		t.Fatalf("new query filter: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestQueryEntriesStreamingReturnsLatestPageInOnePassWindow(t *testing.T) {
 
 func TestQueryEntriesStreamingPreservesFilters(t *testing.T) {
 	logPath := writeLogEntries(t, makeLogEntries(12))
-	filter, err := newQueryFilter("ITEM-1", "5xx", "all")
+	filter, err := newQueryFilter("ITEM-1", "5xx", "all", "")
 	if err != nil {
 		t.Fatalf("new query filter: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestQueryEntriesStreamingPreservesFilters(t *testing.T) {
 
 func TestQueryEntriesStreamingPreservesLoggedInFilter(t *testing.T) {
 	logPath := writeLogEntries(t, makeLogEntries(9))
-	filter, err := newQueryFilter("", "", "true")
+	filter, err := newQueryFilter("", "", "true", "")
 	if err != nil {
 		t.Fatalf("new query filter: %v", err)
 	}
@@ -178,13 +178,130 @@ func TestQueryEntriesStreamingPreservesLoggedInFilter(t *testing.T) {
 	}
 }
 
+func TestQueryEntriesStreamingFiltersByCredential(t *testing.T) {
+	logPath := writeLogEntries(t, []Entry{
+		{
+			Method:               "GET",
+			Path:                 "/direct-totp",
+			Status:               200,
+			LoggedIn:             true,
+			AuthCredentialID:     "totp-alpha",
+			AuthCredentialMethod: "TOTP",
+		},
+		{
+			Method:               "GET",
+			Path:                 "/other-totp",
+			Status:               200,
+			LoggedIn:             true,
+			AuthCredentialID:     "totp-beta",
+			AuthCredentialMethod: "TOTP",
+		},
+		{
+			Method:               "GET",
+			Path:                 "/bound-passkey",
+			Status:               200,
+			LoggedIn:             true,
+			AuthCredentialID:     "passkey-alpha",
+			AuthCredentialMethod: "PASSKEY",
+			AuthLinkedTOTPID:     "totp-alpha",
+		},
+		{
+			Method:   "GET",
+			Path:     "/anonymous",
+			Status:   200,
+			LoggedIn: false,
+		},
+		{
+			Method:       "GET",
+			Path:         "/legacy-logged-in",
+			Status:       200,
+			LoggedIn:     true,
+			AuthDecision: "passed",
+		},
+	})
+	filter, err := newQueryFilter("", "", "all", "totp-alpha")
+	if err != nil {
+		t.Fatalf("new query filter: %v", err)
+	}
+
+	items, total, hasMore, err := queryEntries(logPath, filter, 1, 10)
+	if err != nil {
+		t.Fatalf("query credential entries: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("total = %d, want 2", total)
+	}
+	if hasMore {
+		t.Fatalf("hasMore = true, want false")
+	}
+	wantPaths := []string{"/bound-passkey", "/direct-totp"}
+	for i, want := range wantPaths {
+		if items[i].Path != want {
+			t.Fatalf("item %d path = %q, want %q", i, items[i].Path, want)
+		}
+	}
+}
+
+func TestQueryEntriesStreamingFiltersUnrecordedCredential(t *testing.T) {
+	logPath := writeLogEntries(t, []Entry{
+		{
+			Method:               "GET",
+			Path:                 "/recorded",
+			Status:               200,
+			LoggedIn:             true,
+			AuthCredentialID:     "totp-alpha",
+			AuthCredentialMethod: "TOTP",
+		},
+		{
+			Method:       "GET",
+			Path:         "/legacy-logged-in",
+			Status:       200,
+			LoggedIn:     true,
+			AuthDecision: "passed",
+		},
+		{
+			Method:       "GET",
+			Path:         "/legacy-denied",
+			Status:       403,
+			AuthDecision: "access_denied",
+		},
+		{
+			Method:   "GET",
+			Path:     "/anonymous",
+			Status:   200,
+			LoggedIn: false,
+		},
+	})
+	filter, err := newQueryFilter("", "", "all", unrecordedCredentialFilter)
+	if err != nil {
+		t.Fatalf("new query filter: %v", err)
+	}
+
+	items, total, hasMore, err := queryEntries(logPath, filter, 1, 10)
+	if err != nil {
+		t.Fatalf("query unrecorded credential entries: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("total = %d, want 2", total)
+	}
+	if hasMore {
+		t.Fatalf("hasMore = true, want false")
+	}
+	wantPaths := []string{"/legacy-denied", "/legacy-logged-in"}
+	for i, want := range wantPaths {
+		if items[i].Path != want {
+			t.Fatalf("item %d path = %q, want %q", i, items[i].Path, want)
+		}
+	}
+}
+
 func TestQueryEntriesStreamingRawTailFiltersTopLevelFieldsOnly(t *testing.T) {
 	logPath := writeLogLines(t, []string{
 		`{"method":"GET","path":"/nested-status","extra":{"status":500},"status":200,"logged_in":false}`,
 		`{"method":"GET","path":"/nested-login","extra":{"logged_in":true},"status":200,"logged_in":false}`,
 		`{"method":"GET","path":"/real-match","status":500,"logged_in":true}`,
 	})
-	filter, err := newQueryFilter("", "5xx", "true")
+	filter, err := newQueryFilter("", "5xx", "true", "")
 	if err != nil {
 		t.Fatalf("new query filter: %v", err)
 	}
@@ -211,7 +328,7 @@ func TestQueryEntriesStreamingRawTailSkipsMalformedJSON(t *testing.T) {
 		`[]`,
 		`{"method":"GET","path":"/second","status":200}`,
 	})
-	filter, err := newQueryFilter("", "", "")
+	filter, err := newQueryFilter("", "", "", "")
 	if err != nil {
 		t.Fatalf("new query filter: %v", err)
 	}
@@ -236,7 +353,7 @@ func TestQueryEntriesStreamingRawTailSkipsMalformedJSON(t *testing.T) {
 
 func TestQueryEntriesByCursorPreservesFilters(t *testing.T) {
 	logPath := writeLogEntries(t, makeLogEntries(12))
-	filter, err := newQueryFilter("", "5xx", "true")
+	filter, err := newQueryFilter("", "5xx", "true", "")
 	if err != nil {
 		t.Fatalf("new query filter: %v", err)
 	}
@@ -318,7 +435,7 @@ func TestScanLinesBackwardHandlesLinesAcrossChunks(t *testing.T) {
 
 func BenchmarkQueryEntriesFirstPage(b *testing.B) {
 	logPath := writeLogEntries(b, makeLogEntries(2000))
-	filter, err := newQueryFilter("", "", "")
+	filter, err := newQueryFilter("", "", "", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}
@@ -338,7 +455,7 @@ func BenchmarkQueryEntriesFirstPage(b *testing.B) {
 
 func BenchmarkQueryEntriesFirstPageSearch(b *testing.B) {
 	logPath := writeLogEntries(b, makeLogEntries(2000))
-	filter, err := newQueryFilter("ITEM-1", "", "")
+	filter, err := newQueryFilter("ITEM-1", "", "", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}
@@ -358,7 +475,7 @@ func BenchmarkQueryEntriesFirstPageSearch(b *testing.B) {
 
 func BenchmarkQueryEntriesFirstPageStatusFilter(b *testing.B) {
 	logPath := writeLogEntries(b, makeLogEntries(2000))
-	filter, err := newQueryFilter("", "5xx", "")
+	filter, err := newQueryFilter("", "5xx", "", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}
@@ -378,7 +495,7 @@ func BenchmarkQueryEntriesFirstPageStatusFilter(b *testing.B) {
 
 func BenchmarkQueryEntriesFirstPageLoggedInFilter(b *testing.B) {
 	logPath := writeLogEntries(b, makeLogEntries(2000))
-	filter, err := newQueryFilter("", "", "true")
+	filter, err := newQueryFilter("", "", "true", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}
@@ -398,7 +515,7 @@ func BenchmarkQueryEntriesFirstPageLoggedInFilter(b *testing.B) {
 
 func BenchmarkQueryEntriesFirstPageTwoPass(b *testing.B) {
 	logPath := writeLogEntries(b, makeLogEntries(2000))
-	filter, err := newQueryFilter("", "", "")
+	filter, err := newQueryFilter("", "", "", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}
@@ -418,7 +535,7 @@ func BenchmarkQueryEntriesFirstPageTwoPass(b *testing.B) {
 
 func BenchmarkQueryEntriesByCursorSparseStatusFilter(b *testing.B) {
 	logPath := writeLogEntries(b, makeSparseStatusLogEntries(4000))
-	filter, err := newQueryFilter("", "500", "")
+	filter, err := newQueryFilter("", "500", "", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}
@@ -441,7 +558,7 @@ func BenchmarkQueryEntriesByCursorSparseStatusFilter(b *testing.B) {
 
 func BenchmarkQueryEntriesByCursorSparseStatusFilterOld(b *testing.B) {
 	logPath := writeLogEntries(b, makeSparseStatusLogEntries(4000))
-	filter, err := newQueryFilter("", "500", "")
+	filter, err := newQueryFilter("", "500", "", "")
 	if err != nil {
 		b.Fatalf("new query filter: %v", err)
 	}

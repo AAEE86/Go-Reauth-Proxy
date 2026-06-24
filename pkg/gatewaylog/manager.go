@@ -27,6 +27,7 @@ const (
 	maxScanToken                  = 8 * 1024 * 1024
 	cursorChunkSize               = 64 * 1024
 	pageQueryTailWindowMaxEntries = 10000
+	unrecordedCredentialFilter    = "__unrecorded__"
 )
 
 var errStopScan = errors.New("stop scan")
@@ -50,6 +51,11 @@ type Entry struct {
 	LoggedIn                bool   `json:"logged_in"`
 	AuthRequired            bool   `json:"auth_required"`
 	AuthDecision            string `json:"auth_decision,omitempty"`
+	AuthCredentialID        string `json:"auth_credential_id,omitempty"`
+	AuthCredentialName      string `json:"auth_credential_name,omitempty"`
+	AuthCredentialMethod    string `json:"auth_credential_method,omitempty"`
+	AuthLinkedTOTPID        string `json:"auth_linked_totp_id,omitempty"`
+	AuthLinkedTOTPName      string `json:"auth_linked_totp_name,omitempty"`
 	AccessMode              string `json:"access_mode,omitempty"`
 	RouteType               string `json:"route_type,omitempty"`
 	RouteKey                string `json:"route_key,omitempty"`
@@ -108,6 +114,7 @@ type queryFilter struct {
 	exactStatuses map[int]struct{}
 	statusClasses map[int]struct{}
 	loggedIn      *bool
+	credential    string
 }
 
 type DeleteResult struct {
@@ -347,6 +354,11 @@ func (m *Manager) Log(entry Entry) {
 		Bool("logged_in", entry.LoggedIn).
 		Bool("auth_required", entry.AuthRequired).
 		Str("auth_decision", entry.AuthDecision).
+		Str("auth_credential_id", entry.AuthCredentialID).
+		Str("auth_credential_name", entry.AuthCredentialName).
+		Str("auth_credential_method", entry.AuthCredentialMethod).
+		Str("auth_linked_totp_id", entry.AuthLinkedTOTPID).
+		Str("auth_linked_totp_name", entry.AuthLinkedTOTPName).
 		Str("access_mode", entry.AccessMode).
 		Str("route_type", entry.RouteType).
 		Str("route_key", entry.RouteKey).
@@ -383,7 +395,7 @@ func (m *Manager) GetDates() (DatesResult, error) {
 	}, nil
 }
 
-func (m *Manager) Query(date string, page int, limit int, search string, status string, loggedIn string, cursor string, pagination string) (QueryResult, error) {
+func (m *Manager) Query(date string, page int, limit int, search string, status string, loggedIn string, credential string, cursor string, pagination string) (QueryResult, error) {
 	selectedDate, err := normalizeDate(date)
 	if err != nil {
 		return QueryResult{}, err
@@ -400,7 +412,7 @@ func (m *Manager) Query(date string, page int, limit int, search string, status 
 	}
 
 	logPath := filepath.Join(m.logsDir, selectedDate+fileExtension)
-	filter, err := newQueryFilter(search, status, loggedIn)
+	filter, err := newQueryFilter(search, status, loggedIn, credential)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -556,9 +568,10 @@ func reverseEntries(items []Entry) {
 	}
 }
 
-func newQueryFilter(search string, status string, loggedIn string) (queryFilter, error) {
+func newQueryFilter(search string, status string, loggedIn string, credential string) (queryFilter, error) {
 	filter := queryFilter{
-		search: strings.ToLower(strings.TrimSpace(search)),
+		search:     strings.ToLower(strings.TrimSpace(search)),
+		credential: normalizeCredentialFilter(credential),
 	}
 	filter.searchASCII = isASCIIString(filter.search)
 
@@ -597,6 +610,18 @@ func newQueryFilter(search string, status string, loggedIn string) (queryFilter,
 	}
 
 	return filter, nil
+}
+
+func normalizeCredentialFilter(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.EqualFold(value, "all") {
+		return ""
+	}
+	switch strings.ToLower(value) {
+	case unrecordedCredentialFilter, "unrecorded", "unknown", "missing":
+		return unrecordedCredentialFilter
+	}
+	return value
 }
 
 func (f queryFilter) matchLine(line string) bool {
@@ -715,6 +740,43 @@ func (f queryFilter) matchLoggedIn(loggedIn bool) bool {
 		return true
 	}
 	return *f.loggedIn == loggedIn
+}
+
+func (f queryFilter) matchCredential(entry Entry) bool {
+	if f.credential == "" {
+		return true
+	}
+	if f.credential == unrecordedCredentialFilter {
+		return !entryHasRecordedCredential(entry) && entryNeedsCredentialContext(entry)
+	}
+	for _, value := range []string{entry.AuthCredentialID, entry.AuthLinkedTOTPID} {
+		if strings.EqualFold(strings.TrimSpace(value), f.credential) {
+			return true
+		}
+	}
+	return false
+}
+
+func entryHasRecordedCredential(entry Entry) bool {
+	return strings.TrimSpace(entry.AuthCredentialID) != "" ||
+		strings.TrimSpace(entry.AuthLinkedTOTPID) != ""
+}
+
+func entryNeedsCredentialContext(entry Entry) bool {
+	if entry.LoggedIn {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(entry.AuthDecision), "access_denied")
+}
+
+func (f queryFilter) matchEntry(entry Entry) bool {
+	return f.matchStatus(entry.Status) &&
+		f.matchLoggedIn(entry.LoggedIn) &&
+		f.matchCredential(entry)
+}
+
+func (f queryFilter) needsDecodedEntryFilter() bool {
+	return f.credential != ""
 }
 
 var (
@@ -1015,7 +1077,7 @@ func queryEntriesByCursor(logPath string, filter queryFilter, cursor string, lim
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return true, nil
 		}
-		if !filter.matchStatus(entry.Status) || !filter.matchLoggedIn(entry.LoggedIn) {
+		if !filter.matchEntry(entry) {
 			return true, nil
 		}
 
@@ -1076,7 +1138,15 @@ func scanMatchingRawLinesToTail(logPath string, filter queryFilter, tail *rawLin
 		if !jsonLogLineLooksLikeEntryObject(line) || !filter.matchRawEntryFields(line) {
 			continue
 		}
-		if !json.Valid(line) {
+		if filter.needsDecodedEntryFilter() {
+			var entry Entry
+			if err := json.Unmarshal(line, &entry); err != nil {
+				continue
+			}
+			if !filter.matchEntry(entry) {
+				continue
+			}
+		} else if !json.Valid(line) {
 			continue
 		}
 
@@ -1122,10 +1192,7 @@ func scanMatchingEntries(logPath string, filter queryFilter, onMatch func(entry 
 		if err := json.Unmarshal(line, &entry); err != nil {
 			continue
 		}
-		if !filter.matchStatus(entry.Status) {
-			continue
-		}
-		if !filter.matchLoggedIn(entry.LoggedIn) {
+		if !filter.matchEntry(entry) {
 			continue
 		}
 

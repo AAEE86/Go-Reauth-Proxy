@@ -1185,6 +1185,7 @@ func (s *Server) handleGetLoggingEntries(w http.ResponseWriter, r *http.Request)
 		r.URL.Query().Get("search"),
 		r.URL.Query().Get("status"),
 		r.URL.Query().Get("logged_in"),
+		r.URL.Query().Get("credential"),
 		r.URL.Query().Get("cursor"),
 		paginationMode,
 	)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go-reauth-proxy/pkg/models"
+	"go-reauth-proxy/pkg/response"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -799,6 +800,11 @@ func (h *Handler) applyAuthCacheEntry(w http.ResponseWriter, r *http.Request, en
 
 	if entry.result.allowed && entry.result.authenticated {
 		h.markLoggedInActive(r, clientIP, time.Now())
+		return entry.result
+	}
+
+	if entry.result.decision == "access_denied" {
+		response.AccessDenied(w, r)
 		return entry.result
 	}
 
