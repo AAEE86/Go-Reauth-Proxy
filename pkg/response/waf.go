@@ -15,7 +15,7 @@ type WAFBlockPageOptions struct {
 const wafBlockedContent = `
 {{define "content"}}
 <div class="text-center px-5 max-w-md">
-	<img src="/android-chrome-512x512.png" alt="Logo" style="width:64px;height:64px;margin:0 auto 1.25rem;display:block;border-radius:16px;">
+	<img src="/__assets__/favicon/android-chrome-512x512.png" alt="Logo" style="width:64px;height:64px;margin:0 auto 1.25rem;display:block;border-radius:16px;">
 	<h1 class="text-4xl font-semibold tracking-tight mb-4">{{.Title}}</h1>
 	<p class="text-lg text-gray-600 mb-8">{{.Message}}</p>
 	<div style="margin:0 auto 2rem;max-width:28rem;text-align:left;border:1px solid #e5e7eb;padding:1rem 1.25rem;background:#fafafa;">

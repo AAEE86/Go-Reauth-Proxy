@@ -473,7 +473,7 @@ const selectContent = `
 	<div class="header-card">
 		<div class="header-top">
 			<div class="header-brand">
-				<img class="header-logo" src="/android-chrome-512x512.png" alt="Logo">
+				<img class="header-logo" src="/__assets__/favicon/android-chrome-512x512.png" alt="Logo">
 				<div>
 					<div class="header-kicker">{{.Title}}</div>
 					<h1 class="header-title">Go Reauth Proxy</h1>

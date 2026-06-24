@@ -14,12 +14,12 @@ var faviconFS embed.FS
 
 // faviconFiles maps URL paths to embedded file paths
 var faviconFiles = map[string]string{
-	"/favicon-16x16.png":          "static/favicon/favicon-16x16.png",
-	"/favicon-32x32.png":          "static/favicon/favicon-32x32.png",
-	"/apple-touch-icon.png":       "static/favicon/apple-touch-icon.png",
-	"/android-chrome-192x192.png": "static/favicon/android-chrome-192x192.png",
-	"/android-chrome-512x512.png": "static/favicon/android-chrome-512x512.png",
-	"/site.webmanifest":           "static/favicon/site.webmanifest",
+	"/__assets__/favicon/favicon-16x16.png":          "static/favicon/favicon-16x16.png",
+	"/__assets__/favicon/favicon-32x32.png":          "static/favicon/favicon-32x32.png",
+	"/__assets__/favicon/apple-touch-icon.png":       "static/favicon/apple-touch-icon.png",
+	"/__assets__/favicon/android-chrome-192x192.png": "static/favicon/android-chrome-192x192.png",
+	"/__assets__/favicon/android-chrome-512x512.png": "static/favicon/android-chrome-512x512.png",
+	"/__assets__/favicon/site.webmanifest":           "static/favicon/site.webmanifest",
 }
 
 // IsFaviconPath checks if the given URL path is a favicon-related static file.

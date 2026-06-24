@@ -769,7 +769,7 @@ func (m *Manager) applyBaseRules(table string) error {
 	if err := m.runTable(table, "-A", m.Chain, "-i", "lo", "-j", "ACCEPT"); err != nil {
 		return err
 	}
-	if err := m.runTable(table, "-A", m.Chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"); err != nil {
+	if err := m.appendEstablishedRelatedRule(table); err != nil {
 		return err
 	}
 
@@ -810,6 +810,34 @@ func (m *Manager) applyBaseRules(table string) error {
 		return err
 	}
 	return nil
+}
+
+func (m *Manager) appendEstablishedRelatedRule(table string) error {
+	err := m.runTable(table, "-A", m.Chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+	if err == nil {
+		return nil
+	}
+	if !isStateMatchUnavailableError(err) {
+		return err
+	}
+	return m.runTable(table, "-A", m.Chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+}
+
+func isStateMatchUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "state") {
+		return false
+	}
+	if strings.Contains(message, "couldn't load match") ||
+		strings.Contains(message, "could not load match") ||
+		strings.Contains(message, "can't load match") ||
+		strings.Contains(message, "cannot load match") {
+		return strings.Contains(message, "no such file or directory")
+	}
+	return false
 }
 
 func (m *Manager) Destroy() error {
