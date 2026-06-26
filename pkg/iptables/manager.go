@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const DefaultSSHFirewallChain = "FN-KNOCK-SSH"
@@ -64,11 +65,13 @@ func (r execRunner) CombinedOutputWithInput(input string, command string, args .
 }
 
 type Manager struct {
-	Chain        string
-	ParentChains []string
-	ExemptPorts  []string
-	tables       []string
-	runner       commandRunner
+	Chain                         string
+	ParentChains                  []string
+	ExemptPorts                   []string
+	tables                        []string
+	runner                        commandRunner
+	establishedRelatedMu          sync.RWMutex
+	establishedRelatedRuleSkipped map[string]bool
 }
 
 type TCPPortAccessPolicy struct {
@@ -166,11 +169,12 @@ func NewManager(opts Options) *Manager {
 	}
 
 	return &Manager{
-		Chain:        chain,
-		ParentChains: parents,
-		ExemptPorts:  opts.ExemptPorts,
-		tables:       tables,
-		runner:       execRunner{useSudo: shouldUseSudo()},
+		Chain:                         chain,
+		ParentChains:                  parents,
+		ExemptPorts:                   opts.ExemptPorts,
+		tables:                        tables,
+		runner:                        execRunner{useSudo: shouldUseSudo()},
+		establishedRelatedRuleSkipped: make(map[string]bool),
 	}
 }
 
@@ -755,7 +759,11 @@ func (m *Manager) ClearTCPPortAccessPolicy(chain string, parents []string) error
 }
 
 func (m *Manager) baseRuleCountForTable(table string) int {
-	count := 2
+	count := 1
+	// ESTABLISHED,RELATED 规则在部分精简内核上可能无法添加，插入位置必须按实际基础规则数计算。
+	if !m.isEstablishedRelatedRuleSkipped(table) {
+		count++
+	}
 	count += len(m.localCIDRsForTable(table))
 	count++
 	if len(m.ExemptPorts) > 0 {
@@ -815,20 +823,53 @@ func (m *Manager) applyBaseRules(table string) error {
 func (m *Manager) appendEstablishedRelatedRule(table string) error {
 	err := m.runTable(table, "-A", m.Chain, "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT")
 	if err == nil {
+		m.setEstablishedRelatedRuleSkipped(table, false)
 		return nil
 	}
-	if !isStateMatchUnavailableError(err) {
+	if !isMatchUnavailableError(err, "state") {
 		return err
 	}
-	return m.runTable(table, "-A", m.Chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+	// state match 不可用，降级尝试 conntrack
+	err = m.runTable(table, "-A", m.Chain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+	if err == nil {
+		m.setEstablishedRelatedRuleSkipped(table, false)
+		return nil
+	}
+	if !isMatchUnavailableError(err, "conntrack") {
+		return err
+	}
+	// state 和 conntrack 均不可用（如 nftables 后端未加载相应模块）
+	// 跳过该规则后，后续业务规则插入位置会按少一条基础规则计算。
+	m.setEstablishedRelatedRuleSkipped(table, true)
+	if event := logger.DebugEvent("iptables", "state_conntrack_unavailable"); event != nil {
+		event.Str("table", table).
+			Str("chain", m.Chain).
+			Msg("conntrack/state match not supported, skipping ESTABLISHED,RELATED rule")
+	}
+	return nil
 }
 
-func isStateMatchUnavailableError(err error) bool {
+func (m *Manager) isEstablishedRelatedRuleSkipped(table string) bool {
+	m.establishedRelatedMu.RLock()
+	defer m.establishedRelatedMu.RUnlock()
+	return m.establishedRelatedRuleSkipped != nil && m.establishedRelatedRuleSkipped[table]
+}
+
+func (m *Manager) setEstablishedRelatedRuleSkipped(table string, skipped bool) {
+	m.establishedRelatedMu.Lock()
+	defer m.establishedRelatedMu.Unlock()
+	if m.establishedRelatedRuleSkipped == nil {
+		m.establishedRelatedRuleSkipped = make(map[string]bool)
+	}
+	m.establishedRelatedRuleSkipped[table] = skipped
+}
+
+func isMatchUnavailableError(err error, matchName string) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	if !strings.Contains(message, "state") {
+	if !strings.Contains(message, matchName) {
 		return false
 	}
 	if strings.Contains(message, "couldn't load match") ||

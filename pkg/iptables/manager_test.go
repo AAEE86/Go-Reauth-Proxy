@@ -29,16 +29,24 @@ func (r parseRulesRunner) CombinedOutputWithInput(input string, command string, 
 }
 
 type baseRuleRunner struct {
-	stateOutput string
-	stateErr    error
-	calls       [][]string
+	stateOutput     string
+	stateErr        error
+	conntrackOutput string
+	conntrackErr    error
+	calls           [][]string
 }
 
 func (r *baseRuleRunner) CombinedOutput(command string, args ...string) ([]byte, error) {
 	call := append([]string{command}, args...)
 	r.calls = append(r.calls, call)
+	if len(args) > 0 && args[0] == "-D" {
+		return []byte("iptables: Bad rule (does a matching rule exist in that chain?)\n"), errors.New("exit status 1")
+	}
 	if isStateEstablishedRelatedCall(args) && r.stateErr != nil {
 		return []byte(r.stateOutput), r.stateErr
+	}
+	if isConntrackEstablishedRelatedCall(args) && r.conntrackErr != nil {
+		return []byte(r.conntrackOutput), r.conntrackErr
 	}
 	return []byte("ok"), nil
 }
@@ -52,6 +60,11 @@ func isStateEstablishedRelatedCall(args []string) bool {
 	return reflect.DeepEqual(args, want)
 }
 
+func isConntrackEstablishedRelatedCall(args []string) bool {
+	want := []string{"-A", "REAUTH_FW", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"}
+	return reflect.DeepEqual(args, want)
+}
+
 func callContains(calls [][]string, parts ...string) bool {
 	for _, call := range calls {
 		if reflect.DeepEqual(call[1:], parts) {
@@ -59,6 +72,40 @@ func callContains(calls [][]string, parts ...string) bool {
 		}
 	}
 	return false
+}
+
+func managerWithSkippedEstablishedRelatedRule(t *testing.T) (*Manager, *baseRuleRunner) {
+	t.Helper()
+
+	runner := &baseRuleRunner{
+		stateOutput:     "iptables v1.8.10 (nf_tables): Couldn't load match `state': No such file or directory\n",
+		stateErr:        errors.New("exit status 2"),
+		conntrackOutput: "iptables v1.8.10 (nf_tables): Couldn't load match `conntrack':No such file or directory\n",
+		conntrackErr:    errors.New("exit status 2"),
+	}
+	manager := NewManager(Options{ChainName: "REAUTH_FW", Tables: []string{"iptables"}})
+	manager.runner = runner
+
+	if err := manager.applyBaseRules("iptables"); err != nil {
+		t.Fatalf("applyBaseRules returned error when both matches unavailable: %v", err)
+	}
+	return manager, runner
+}
+
+func managerWithConntrackEstablishedRelatedRule(t *testing.T) (*Manager, *baseRuleRunner) {
+	t.Helper()
+
+	runner := &baseRuleRunner{
+		stateOutput: "iptables v1.8.10 (nf_tables): Couldn't load match `state': No such file or directory\n",
+		stateErr:    errors.New("exit status 2"),
+	}
+	manager := NewManager(Options{ChainName: "REAUTH_FW", Tables: []string{"iptables"}})
+	manager.runner = runner
+
+	if err := manager.applyBaseRules("iptables"); err != nil {
+		t.Fatalf("applyBaseRules returned error when conntrack fallback is available: %v", err)
+	}
+	return manager, runner
 }
 
 func TestAppendEstablishedRelatedRuleUsesStateFirst(t *testing.T) {
@@ -97,6 +144,63 @@ func TestApplyBaseRulesFallsBackToConntrackWhenStateMatchIsUnavailable(t *testin
 	}
 	if !callContains(runner.calls, "-A", "REAUTH_FW", "-j", "DROP") {
 		t.Fatalf("applyBaseRules did not continue through default DROP: %#v", runner.calls)
+	}
+}
+
+func TestApplyBaseRulesFallsBackGracefullyWhenStateAndConntrackBothUnavailable(t *testing.T) {
+	_, runner := managerWithSkippedEstablishedRelatedRule(t)
+	if !callContains(runner.calls, "-A", "REAUTH_FW", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT") {
+		t.Fatalf("state rule was not attempted: %#v", runner.calls)
+	}
+	if !callContains(runner.calls, "-A", "REAUTH_FW", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT") {
+		t.Fatalf("conntrack fallback was not attempted: %#v", runner.calls)
+	}
+	if !callContains(runner.calls, "-A", "REAUTH_FW", "-j", "DROP") {
+		t.Fatalf("applyBaseRules did not continue through default DROP: %#v", runner.calls)
+	}
+}
+
+func TestAllowIPUsesAdjustedInsertPositionWhenEstablishedRelatedRuleIsSkipped(t *testing.T) {
+	manager, runner := managerWithSkippedEstablishedRelatedRule(t)
+
+	if err := manager.AllowIP("203.0.113.10"); err != nil {
+		t.Fatalf("AllowIP returned error: %v", err)
+	}
+	if !callContains(runner.calls, "-I", "REAUTH_FW", "8", "-s", "203.0.113.10", "-j", "ACCEPT") {
+		t.Fatalf("AllowIP did not insert before default DROP after skipped state rule: %#v", runner.calls)
+	}
+}
+
+func TestAllowIPKeepsOriginalInsertPositionWhenConntrackFallbackSucceeds(t *testing.T) {
+	manager, runner := managerWithConntrackEstablishedRelatedRule(t)
+
+	if err := manager.AllowIP("203.0.113.10"); err != nil {
+		t.Fatalf("AllowIP returned error: %v", err)
+	}
+	if !callContains(runner.calls, "-I", "REAUTH_FW", "9", "-s", "203.0.113.10", "-j", "ACCEPT") {
+		t.Fatalf("AllowIP did not keep original insert position after conntrack fallback: %#v", runner.calls)
+	}
+}
+
+func TestBlockIPUsesAdjustedInsertPositionWhenEstablishedRelatedRuleIsSkipped(t *testing.T) {
+	manager, runner := managerWithSkippedEstablishedRelatedRule(t)
+
+	if err := manager.BlockIP("203.0.113.10"); err != nil {
+		t.Fatalf("BlockIP returned error: %v", err)
+	}
+	if !callContains(runner.calls, "-I", "REAUTH_FW", "8", "-s", "203.0.113.10", "-j", "DROP") {
+		t.Fatalf("BlockIP did not insert before default DROP after skipped state rule: %#v", runner.calls)
+	}
+}
+
+func TestBlockTCPPortForIPUsesAdjustedInsertPositionWhenEstablishedRelatedRuleIsSkipped(t *testing.T) {
+	manager, runner := managerWithSkippedEstablishedRelatedRule(t)
+
+	if err := manager.BlockTCPPortForIP("203.0.113.10", 8443); err != nil {
+		t.Fatalf("BlockTCPPortForIP returned error: %v", err)
+	}
+	if !callContains(runner.calls, "-I", "REAUTH_FW", "8", "-s", "203.0.113.10", "-p", "tcp", "--dport", "8443", "-j", "DROP") {
+		t.Fatalf("BlockTCPPortForIP did not insert before default DROP after skipped state rule: %#v", runner.calls)
 	}
 }
 
